@@ -7,6 +7,14 @@ repository = "https://github.com/Zelenov/clipscribe"
 license = "MIT"
 keywords = ["video", "claude", "anthropic", "description", "gstreamer"]
 categories = ["multimedia::video", "command-line-utilities"]
+readme = "README.md"
+# The crate is the code; the test clips and CI scripts stay in the repository.
+include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "version.md"]
+
+# docs.rs: the library with `describe`, without the command line.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["frames"]
 
 [features]
 default = ["cli", "frames"]

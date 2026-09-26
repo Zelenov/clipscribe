@@ -1,0 +1,234 @@
+name: Release
+run-name: Release - ${{ github.ref_name }}
+
+# A push that changes version.md releases: on main a GitHub release and the crate on crates.io,
+# on any other branch a draft GitHub release (and a crates.io dry run).
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+    paths: ["version.md"]
+
+env:
+  CARGO_TERM_COLOR: always
+  # The official GStreamer package the Windows build links against: as ci.yml.
+  GST_VERSION: 1.28.7
+  GST_SHA256: 032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      version: ${{ steps.vars.outputs.version }}
+      name: ${{ steps.vars.outputs.name }}
+      draft: ${{ steps.vars.outputs.draft }}
+      should_build: ${{ steps.vars.outputs.should_build }}
+      publish_crate: ${{ steps.vars.outputs.publish_crate }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute variables
+        id: vars
+        run: |
+          VERSION=$(sed -n '1s/^#[[:space:]]*//p' version.md | tr -d '[:space:]')
+          [ -z "$VERSION" ] && { echo "::error::version.md first line must be '# VERSION'"; exit 1; }
+          CARGO_VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::version.md says $VERSION, Cargo.toml says $CARGO_VERSION"; exit 1
+          fi
+          BRANCH="${{ github.ref_name }}"
+          SAFE=$(echo "$BRANCH" | sed 's/\//-/g;s/[^a-zA-Z0-9._-]/-/g;s/-*$//')
+          [ -z "$SAFE" ] && SAFE=branch
+          if [ "$BRANCH" = main ] || [ "$BRANCH" = master ]; then
+            TAG="v$VERSION"; NAME="clipscribe v$VERSION"; DRAFT=false
+          else
+            TAG="v$VERSION-$SAFE"; NAME="clipscribe v$VERSION - $SAFE"; DRAFT=true
+          fi
+
+          if gh release view "$TAG" --repo ${{ github.repository }} 2>/dev/null; then
+            EXISTS=true
+          else
+            EXISTS=false
+          fi
+
+          if [ "$DRAFT" = true ] || [ "$EXISTS" = false ]; then SHOULD_BUILD=true; else SHOULD_BUILD=false; fi
+
+          # A crates.io version can never be replaced: publish it once, from main only.
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -A "clipscribe release (${{ github.repository }})" \
+            "https://crates.io/api/v1/crates/clipscribe/$VERSION")
+          if [ "$DRAFT" = false ] && [ "$STATUS" != 200 ]; then PUBLISH_CRATE=true; else PUBLISH_CRATE=false; fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "publish_crate=$PUBLISH_CRATE" >> "$GITHUB_OUTPUT"
+
+          awk '/^# / { if (found) exit; found=1 } found' version.md > release-notes.md
+          [ -s release-notes.md ] || echo "See version.md" > release-notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/upload-artifact@v4
+        if: steps.vars.outputs.should_build == 'true'
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true' || needs.prepare.outputs.publish_crate == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x64
+            exe: clipscribe.exe
+          - os: ubuntu-22.04
+            platform: linux-x64
+            exe: clipscribe
+          - os: macos-14
+            platform: macos-arm64
+            exe: clipscribe
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: Install GStreamer (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+
+      - name: Install GStreamer (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkgconf gstreamer
+
+      - uses: actions/cache@v4
+        if: runner.os == 'Windows'
+        with:
+          path: C:\gst-download
+          key: gstreamer-msvc-x86_64-${{ env.GST_VERSION }}
+
+      - name: Install GStreamer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/install-gstreamer.ps1 -Version $env:GST_VERSION -Sha256 $env:GST_SHA256 -Dir C:\gstreamer -Download C:\gst-download
+
+      - name: Test
+        shell: bash
+        run: cargo test --release --locked
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked
+
+      # Builds the crate as crates.io would get it, from the packaged files only.
+      - name: Package the crate
+        if: runner.os == 'Linux'
+        run: cargo publish --dry-run --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          NAME="clipscribe-${{ matrix.platform }}-v${{ needs.prepare.outputs.version }}"
+          mkdir -p "dist/$NAME"
+          cp "target/release/${{ matrix.exe }}" README.md LICENSE "dist/$NAME/"
+          cd dist
+          if [ "${{ runner.os }}" = Windows ]; then
+            7z a -tzip "$NAME.zip" "./$NAME/*" > /dev/null
+          else
+            tar -czf "$NAME.tar.gz" -C "$NAME" .
+          fi
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipscribe-${{ matrix.platform }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+
+  # crates.io before the GitHub release: a published crate version cannot be taken back.
+  publish-crate:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish_crate == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release:
+    needs: [prepare, build, publish-crate]
+    # publish-crate is skipped for drafts and for a crate version already on crates.io.
+    if: >-
+      !cancelled() && needs.prepare.outputs.should_build == 'true'
+      && needs.build.result == 'success'
+      && (needs.publish-crate.result == 'success' || needs.publish-crate.result == 'skipped')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Remove existing draft and tag
+        if: needs.prepare.outputs.draft == 'true'
+        uses: ClementTsang/delete-tag-and-release@v0.3.1
+        continue-on-error: true
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          delete_release: true
+          repo: ${{ github.repository }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.name }}
+          body_path: artifacts/release-notes.md
+          draft: ${{ needs.prepare.outputs.draft }}
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

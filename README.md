@@ -15,6 +15,20 @@ market.mp4  1:24 · 42 frames · $0.0112
   0:41–1:24  The tourists buy saffron; the vendor weighs it on a scale.
 ```
 
+## Download
+
+Get the build for your system from [Releases](https://github.com/Zelenov/clipscribe/releases/latest):
+
+| System | File |
+|---|---|
+| Windows x64 | `clipscribe-windows-x64-vX.Y.Z.zip` |
+| Linux x64 | `clipscribe-linux-x64-vX.Y.Z.tar.gz` |
+| macOS (Apple Silicon) | `clipscribe-macos-arm64-vX.Y.Z.tar.gz` |
+
+Unpack it and put `clipscribe` / `clipscribe.exe` anywhere on `PATH`. GStreamer is not inside:
+install its runtime (see [Building](#building); on Windows the official MSVC *runtime* package,
+with its `bin` on `PATH`). Or build it with `cargo install clipscribe`.
+
 ## How it works
 
 - Frames are read with GStreamer: one every 2 s, at most 60 per clip (a longer clip is sampled
@@ -54,7 +68,7 @@ code is 1 when a video failed.
 
 ```toml
 [dependencies]
-clipscribe = { git = "https://github.com/Zelenov/clipscribe", default-features = false, features = ["frames"] }
+clipscribe = { version = "0.1", default-features = false, features = ["frames"] }
 ```
 
 ```rust
@@ -107,6 +121,14 @@ cargo test              # the frame tests decode tests/clips on Linux
 ```
 
 `CLIPSCRIBE_LIVE_API_KEY` makes `cargo test` send one real request (about $0.01).
+
+## Releasing
+
+Bump the version in `Cargo.toml` and put it as the first heading of `version.md`, with the
+changes under it. A push that changes `version.md` runs `.github/workflows/release.yml`: on
+`main` it publishes the crate to crates.io (the `CARGO_REGISTRY_TOKEN` secret) and a GitHub
+release `vX.Y.Z` with the three builds; on any other branch, a draft release
+`vX.Y.Z-<branch>` and a crates.io dry run.
 
 ## License
 
