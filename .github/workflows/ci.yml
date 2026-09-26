@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The official GStreamer package the Windows job builds against.
+  GST_VERSION: 1.28.7
+  GST_SHA256: 032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf
+
+jobs:
+  linux:
+    name: ci-linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # Every way the crate is used: the command line, a library with frames, a bare library.
+      - name: Clippy
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --locked --no-default-features --features frames -- -D warnings
+          cargo clippy --locked --no-default-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+        env:
+          # A real request to Claude when the secret is set; skipped otherwise.
+          CLIPSCRIBE_LIVE_API_KEY: ${{ secrets.CLIPSCRIBE_LIVE_API_KEY }}
+
+  windows:
+    name: ci-windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The official package, pinned; the installer (~500 MB) is cached, not the install.
+      - uses: actions/cache@v4
+        with:
+          path: C:\gst-download
+          key: gstreamer-msvc-x86_64-${{ env.GST_VERSION }}
+
+      - name: Install GStreamer
+        shell: pwsh
+        run: scripts/install-gstreamer.ps1 -Version $env:GST_VERSION -Sha256 $env:GST_SHA256 -Dir C:\gstreamer -Download C:\gst-download
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked

@@ -1,0 +1,8 @@
+# Clips the frame tests decode on Linux, one path per line.
+tests/clips/file_example_MP4_480_1_5MG.mp4
+tests/clips/file_example_MOV_480_700kB.mov
+tests/clips/Short.Travel.Health.Views.file_example_WEBM_480_900KB.webm
+# rotated-90.mp4: the first 6 s of the MP4 above with a 90° display rotation tag, as a phone
+# stores a portrait clip; frames must come out upright. Made with
+# ffmpeg -display_rotation 90 -i tests/clips/file_example_MP4_480_1_5MG.mp4 -t 6 -c copy -an tests/clips/rotated-90.mp4
+tests/clips/rotated-90.mp4

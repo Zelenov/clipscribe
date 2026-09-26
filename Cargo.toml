@@ -1,0 +1,45 @@
+[package]
+name = "clipscribe"
+version = "0.1.0"
+edition = "2021"
+description = "Describe what happens in video clips, and when, with Claude: a video file (and its subtitles) in, a summary and time-ranged key moments out."
+repository = "https://github.com/Zelenov/clipscribe"
+license = "MIT"
+keywords = ["video", "claude", "anthropic", "description", "gstreamer"]
+categories = ["multimedia::video", "command-line-utilities"]
+
+[features]
+default = ["cli", "frames"]
+# The `clipscribe` command line. Programs using clipscribe as a library turn it off
+# (`default-features = false`) and build neither clap nor ctrlc.
+cli = ["frames", "dep:clap", "dep:ctrlc"]
+# Reading frames from video files with GStreamer, and `describe` itself. Without it the crate
+# still has the models, the request and answer, the estimate and the Anthropic client.
+frames = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:image", "dep:url"]
+
+[[bin]]
+name = "clipscribe"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+log = "0.4"
+serde_json = "1"
+# HTTP to the Anthropic API, trusting the OS certificate store (corporate TLS-inspecting
+# proxies need it).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+base64 = "0.22"
+
+gstreamer = { version = "0.23", optional = true }
+gstreamer-app = { version = "0.23", optional = true }
+gstreamer-video = { version = "0.23", optional = true }
+image = { version = "0.25", optional = true }
+url = { version = "2.5", optional = true }
+
+clap = { version = "4", features = ["derive", "env"], optional = true }
+ctrlc = { version = "3", optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
