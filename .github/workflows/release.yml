@@ -89,7 +89,8 @@ jobs:
           - os: windows-2022
             platform: windows-x64
             exe: clipscribe.exe
-          - os: ubuntu-22.04
+          # 22.04's libunwind-14-dev conflicts with GStreamer's libunwind-dev; ci.yml uses 24.04 too.
+          - os: ubuntu-24.04
             platform: linux-x64
             exe: clipscribe
           - os: macos-14
@@ -171,7 +172,7 @@ jobs:
   publish-crate:
     needs: [prepare, build]
     if: needs.prepare.outputs.publish_crate == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
