@@ -35,6 +35,13 @@ jobs:
         run: |
           VERSION=$(sed -n '1s/^#[[:space:]]*//p' version.md | tr -d '[:space:]')
           [ -z "$VERSION" ] && { echo "::error::version.md first line must be '# VERSION'"; exit 1; }
+          # A feature branch keeps '# NEXT' until the version is set at merge time: nothing to release.
+          if [ "$VERSION" = NEXT ]; then
+            echo "version.md starts with '# NEXT': no release."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "publish_crate=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           CARGO_VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "$VERSION" != "$CARGO_VERSION" ]; then
             echo "::error::version.md says $VERSION, Cargo.toml says $CARGO_VERSION"; exit 1
