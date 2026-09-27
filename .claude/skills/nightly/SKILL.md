@@ -230,8 +230,7 @@ cargo build --release --locked
 
 CI here means the checks `ci-linux` and `ci-windows`. A push that changes `version.md` on the
 branch also starts `release.yml` (a draft release and a crates.io dry run): while the heading is
-`# NEXT` that run fails on the version check by design and is ignored; once step 7 sets the
-version it must pass.
+`# NEXT` that run skips itself (no release); once step 7 sets the version it must pass.
 
 ## Owner review (not converged: implemented, not released)
 
