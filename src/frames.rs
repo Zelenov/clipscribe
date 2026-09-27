@@ -14,7 +14,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::describe::{frame_size, sample_times, Frame, FRAME_LONG_SIDE};
+use crate::describe::{
+    candidate_times, frame_count, frame_size, sample_times, select_key_frames, Frame,
+    FrameSampling, FRAME_LONG_SIDE,
+};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -201,22 +204,31 @@ impl Clip {
         Ok((pts, to_image(&sample)?))
     }
 
-    /// The frames of the whole clip (see [`sample_times`]), as JPEG. Stops with `Ok(None)`
-    /// when `cancel` is set between two frames. `on_frame(done, total)` follows along.
+    /// The frames of the whole clip, as JPEG: [`sample_times`] with `Interval`, or the frames
+    /// [`select_key_frames`] keeps out of [`candidate_times`] with `KeyFrames` (see
+    /// `describe::FrameSampling`) — skipped in favour of `sample_times` when the frame budget
+    /// ([`frame_count`]) is 0 or 1, since there is then no window to choose a frame within.
+    /// Stops with `Ok(None)` when `cancel` is set between two frames. `on_frame(done, total)`
+    /// follows along.
     pub fn sample(
         &self,
         duration_s: f64,
+        sampling: FrameSampling,
         cancel: &AtomicBool,
         mut on_frame: impl FnMut(usize, usize),
     ) -> Result<Option<Vec<Frame>>, String> {
-        let mut frames: Vec<Frame> = Vec::new();
+        let times = match sampling {
+            FrameSampling::Interval => sample_times(duration_s),
+            FrameSampling::KeyFrames if frame_count(duration_s) <= 1 => sample_times(duration_s),
+            FrameSampling::KeyFrames => candidate_times(duration_s),
+        };
         let orientation = self.orientation();
-        let times = sample_times(duration_s);
         let interval = match times.as_slice() {
             [a, b, ..] => b - a,
             _ => duration_s,
         };
         let total = times.len();
+        let mut candidates: Vec<(f64, image::RgbImage)> = Vec::new();
         for (i, time_s) in times.into_iter().enumerate() {
             on_frame(i, total);
             if cancel.load(Ordering::Relaxed) {
@@ -227,27 +239,78 @@ impl Clip {
                 Ok(frame) => frame,
                 // Past the end of the picture (the sound runs longer): the frames so far are
                 // the whole picture.
-                Err(_) if !frames.is_empty() => break,
+                Err(_) if !candidates.is_empty() => break,
                 Err(e) => return Err(e),
             };
-            let last = frames.last().map(|f| f.time_s);
+            let last = candidates.last().map(|(t, _)| *t);
             if needs_exact(pts, time_s, last, interval) {
                 (pts, image) = match self.frame_at(time_s, gst::SeekFlags::ACCURATE) {
                     Ok(frame) => frame,
-                    Err(_) if !frames.is_empty() => break,
+                    Err(_) if !candidates.is_empty() => break,
                     Err(e) => return Err(e),
                 };
                 if last.is_some_and(|last| pts <= last + 1e-3) {
                     continue;
                 }
             }
-            frames.push(Frame {
-                time_s: pts,
-                jpeg: to_jpeg(orient(image, orientation.as_deref()))?,
-            });
+            candidates.push((pts, image));
         }
-        Ok(Some(frames))
+        let chosen: Vec<usize> = match sampling {
+            FrameSampling::Interval => (0..candidates.len()).collect(),
+            FrameSampling::KeyFrames if frame_count(duration_s) <= 1 => {
+                (0..candidates.len()).collect()
+            }
+            FrameSampling::KeyFrames => {
+                let fingerprints: Vec<(f64, Vec<u8>)> = candidates
+                    .iter()
+                    .map(|(t, image)| (*t, fingerprint(image)))
+                    .collect();
+                select_key_frames(&fingerprints, frame_count(duration_s))
+            }
+        };
+        chosen
+            .into_iter()
+            .map(|i| {
+                let (time_s, image) = candidates[i].clone();
+                Ok(Frame {
+                    time_s,
+                    jpeg: to_jpeg(orient(image, orientation.as_deref()))?,
+                })
+            })
+            .collect::<Result<Vec<Frame>, String>>()
+            .map(Some)
     }
+}
+
+/// A small grid of average luma values (Rec. 601 weights), cheap to compare between frames: how
+/// much the picture changed between two candidates is [`describe::select_key_frames`]'s job, on
+/// the byte differences of what this returns.
+const FINGERPRINT_GRID: (u32, u32) = (8, 8);
+
+fn fingerprint(image: &image::RgbImage) -> Vec<u8> {
+    let (gw, gh) = FINGERPRINT_GRID;
+    let (w, h) = image.dimensions();
+    (0..gh)
+        .flat_map(|gy| (0..gw).map(move |gx| (gx, gy)))
+        .map(|(gx, gy)| {
+            let x0 = gx * w / gw;
+            let x1 = ((gx + 1) * w / gw).max(x0 + 1).min(w);
+            let y0 = gy * h / gh;
+            let y1 = ((gy + 1) * h / gh).max(y0 + 1).min(h);
+            let mut sum: u64 = 0;
+            let mut count: u64 = 0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = image.get_pixel(x, y);
+                    sum += u64::from(
+                        u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114,
+                    );
+                    count += 1;
+                }
+            }
+            (sum / count.max(1) / 1000) as u8
+        })
+        .collect()
 }
 
 /// Whether a keyframe seek to `target` that landed on `snapped` must be redone exactly:
@@ -361,7 +424,12 @@ mod tests {
             let duration = clip.duration_s().expect("duration");
             let started = std::time::Instant::now();
             let frames = clip
-                .sample(duration, &AtomicBool::new(false), |_, _| {})
+                .sample(
+                    duration,
+                    FrameSampling::KeyFrames,
+                    &AtomicBool::new(false),
+                    |_, _| {},
+                )
                 .expect("frames")
                 .expect("not cancelled");
             let expected = sample_times(duration).len();
@@ -405,6 +473,7 @@ mod tests {
         let frames = clip
             .sample(
                 clip.duration_s().expect("duration"),
+                FrameSampling::KeyFrames,
                 &AtomicBool::new(false),
                 |_, _| {},
             )
@@ -420,9 +489,78 @@ mod tests {
         let clip = Clip::open(&ci_clips()[0], Duration::from_secs(20)).expect("opens");
         let duration = clip.duration_s().expect("duration");
         assert!(clip
-            .sample(duration, &AtomicBool::new(true), |_, _| {})
+            .sample(
+                duration,
+                FrameSampling::KeyFrames,
+                &AtomicBool::new(true),
+                |_, _| {}
+            )
             .expect("ok")
             .is_none());
+    }
+
+    /// `Interval` reproduces today's fixed-interval timestamps exactly, frame for frame.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interval_sampling_matches_sample_times() {
+        for path in ci_clips() {
+            let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+            let duration = clip.duration_s().expect("duration");
+            let frames = clip
+                .sample(
+                    duration,
+                    FrameSampling::Interval,
+                    &AtomicBool::new(false),
+                    |_, _| {},
+                )
+                .expect("frames")
+                .expect("not cancelled");
+            let times: Vec<f64> = frames.iter().map(|f| f.time_s).collect();
+            let expected = sample_times(duration);
+            assert_eq!(times.len(), expected.len(), "{}", path.display());
+            for (got, want) in times.iter().zip(&expected) {
+                assert!(
+                    (got - want).abs() <= 1.0,
+                    "{}: {got} vs {want}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Key frames never exceed the same budget `Interval` uses, on real clips (not just the
+    /// synthetic fingerprints `describe::select_key_frames` is unit-tested with).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn key_frames_stay_within_the_interval_budget() {
+        for path in ci_clips() {
+            let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+            let duration = clip.duration_s().expect("duration");
+            let key_frames = clip
+                .sample(
+                    duration,
+                    FrameSampling::KeyFrames,
+                    &AtomicBool::new(false),
+                    |_, _| {},
+                )
+                .expect("frames")
+                .expect("not cancelled");
+            let interval_times = sample_times(duration);
+            eprintln!(
+                "{}: keyframes {:.1?}\n{}: interval  {:.1?}",
+                path.display(),
+                key_frames.iter().map(|f| f.time_s).collect::<Vec<_>>(),
+                path.display(),
+                interval_times
+            );
+            assert!(
+                key_frames.len() <= interval_times.len(),
+                "{}: {} key frames vs {} interval frames",
+                path.display(),
+                key_frames.len(),
+                interval_times.len()
+            );
+        }
     }
 
     /// A clip whose sound runs longer than its picture gives the frames of the picture.
@@ -464,7 +602,12 @@ mod tests {
         let clip = Clip::open(&clip_path, Duration::from_secs(20)).expect("opens");
         let duration = clip.duration_s().expect("duration");
         let frames = clip
-            .sample(duration, &AtomicBool::new(false), |_, _| {})
+            .sample(
+                duration,
+                FrameSampling::KeyFrames,
+                &AtomicBool::new(false),
+                |_, _| {},
+            )
             .expect("the picture's frames")
             .expect("not cancelled");
         assert!(!frames.is_empty());
@@ -553,5 +696,41 @@ mod tests {
     fn large_frames_are_scaled_down_on_encode() {
         let jpeg = to_jpeg(image::RgbImage::new(1080, 1920)).expect("jpeg");
         assert_eq!(jpeg_size(&jpeg), (288, 512));
+    }
+
+    #[test]
+    fn a_solid_frame_fingerprints_to_one_flat_value() {
+        let mut white = image::RgbImage::new(16, 16);
+        white
+            .pixels_mut()
+            .for_each(|p| *p = image::Rgb([255, 255, 255]));
+        let fp = fingerprint(&white);
+        assert_eq!(fp.len(), 64);
+        assert!(fp.iter().all(|&v| v == 255), "{fp:?}");
+
+        let black = image::RgbImage::new(16, 16);
+        assert!(fingerprint(&black).iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn a_split_frame_fingerprints_differently_on_each_side() {
+        let mut split = image::RgbImage::new(16, 16);
+        for (x, _y, p) in split.enumerate_pixels_mut() {
+            *p = if x < 8 {
+                image::Rgb([0, 0, 0])
+            } else {
+                image::Rgb([255, 255, 255])
+            };
+        }
+        let fp = fingerprint(&split);
+        // The 8x8 grid's left half comes from the black side, the right half from the white one.
+        for gy in 0..8 {
+            for gx in 0..4 {
+                assert_eq!(fp[gy * 8 + gx], 0);
+            }
+            for gx in 4..8 {
+                assert_eq!(fp[gy * 8 + gx], 255);
+            }
+        }
     }
 }

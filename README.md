@@ -31,9 +31,12 @@ with its `bin` on `PATH`). Or build it with `cargo install clipscribe`.
 
 ## How it works
 
-- Frames are read with GStreamer: one every 2 s, at most 60 per clip (a longer clip is sampled
-  evenly), 512 px on the long side, turned upright if the clip has a rotation tag, and encoded
-  as JPEG in memory. Nothing is written to disk.
+- Frames are read with GStreamer, at most 60 per clip, 512 px on the long side, turned upright if
+  the clip has a rotation tag, and encoded as JPEG in memory. Nothing is written to disk. By
+  default they are **key frames**: the clip is split into as many equal windows as the frame
+  budget, and the one frame kept from each is wherever the picture changes the most in it, so a
+  static shot spends no more of the budget than a clip that keeps cutting to something new.
+  `--frames interval` goes back to one frame every 2 s, spread evenly on a longer clip.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
   description knows what is said.
 - One request goes to the Anthropic Messages API; the answer is structured JSON, and moments
@@ -55,6 +58,7 @@ clipscribe footage/ --estimate         # what it would cost; nothing is sent
 |---|---|
 | `--model haiku\|sonnet\|opus` | Claude Haiku 4.5 (default; about $10 per 1000 one-minute clips), Sonnet 5 or Opus 5 (notice more, cost more). |
 | `--language` | `subtitles` (default: the subtitles' language, English if none), `en`, `ru`, `uk`, `de`, `es`, `fr`. |
+| `--frames keyframes\|interval` | `keyframes` (default: one per window of the clip where the picture changes the most) or `interval` (one every 2 s, spread evenly on a longer clip). |
 | `--no-subtitles` | Do not send the `.srt`. |
 | `--json` | One JSON array: `file`, `duration_s`, `frames`, `summary`, `moments[{start_s, end_s, description}]`, `model`, `usage`, `cost_usd`. |
 | `--estimate` | Price the videos from their lengths only. |
@@ -73,13 +77,14 @@ clipscribe = { version = "0.1", default-features = false, features = ["frames"] 
 
 ```rust
 use std::sync::atomic::AtomicBool;
-use clipscribe::{describe, srt, Options, SummaryLanguage, MODELS};
+use clipscribe::{describe, srt, FrameSampling, Options, SummaryLanguage, MODELS};
 
 let video = std::path::Path::new("clip.mp4");
 let options = Options {
     api_key: std::env::var("ANTHROPIC_API_KEY")?,
     model: MODELS[0],
     language: SummaryLanguage::English,
+    frame_sampling: FrameSampling::KeyFrames,
 };
 let subtitles = srt::load_for(video)?;
 let described = describe(video, &subtitles, &options, &AtomicBool::new(false), |stage| {

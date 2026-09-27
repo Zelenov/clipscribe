@@ -53,10 +53,13 @@ new dependency.
 count, evenly spread when a clip is long) but 4× denser and 4× the cap: one candidate every 0.5 s
 (down from 2 s), up to 240 (`MAX_FRAMES * 4`, down from unbounded only by the same "spread evenly"
 rule). `frames.rs` decodes every candidate exactly as it does today's samples (same fast/accurate
-reseek logic in `Clip::sample`), computing a fingerprint and the JPEG for each. Oversampling by 4
-means roughly 4× the seeks of today for the same clip length — still bounded (≤240 total,
-`MAX_DURATION_S` unchanged) and, on the four test clips, well under a second of extra work; there
-is no separate cheap pre-pass, so the CPU cost is "today's per-frame seek cost, four times".
+reseek logic in `Clip::sample`), computing a fingerprint from each decoded frame and keeping its
+pixels only until selection runs; JPEG encoding (and the orientation fix-up) then happens once,
+on the chosen frames only, so oversampling does not multiply the encode cost, only the seeks.
+Oversampling by 4 means roughly 4× the seeks of today for the same clip length — still bounded
+(≤240 total, `MAX_DURATION_S` unchanged) and, on the four test clips, well under a second of extra
+work; there is no separate cheap pre-pass, so the CPU cost is "today's per-frame seek cost, four
+times".
 
 ### Selection
 
