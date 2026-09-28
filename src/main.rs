@@ -96,13 +96,10 @@ struct Cli {
     cache_dir: Option<PathBuf>,
 
     /// Group similar footage: videos, and stretches within them, that look like the same shot
-    /// (duplicates, re-exports, a clip stored sideways, a camera that did not move) or whose
-    /// descriptions share enough words (the same subject or activity, even after the camera moved
-    /// or zoomed; also, sometimes, the same place with something else happening, and unrelated
-    /// videos described in similar everyday words, like "a woman in a bright room"). On a large
-    /// folder from one shoot these links can chain several groups into one: check groups before
-    /// relying on them. Each group gets a short label. Computed from the frames and descriptions
-    /// already there; nothing extra is sent.
+    /// (duplicates, re-exports, a clip stored sideways) or whose descriptions share many words
+    /// (the same subject, even after the camera moved). Word matches are rough: unrelated videos
+    /// described in similar everyday words can be joined, and groups can chain together on a
+    /// large folder — check them. Each group gets a short label; nothing extra is sent.
     #[arg(long)]
     groups: bool,
 
@@ -546,9 +543,9 @@ fn budget_stop_message(
 ) -> String {
     let why = match next_usd {
         Some(next) if next > max_usd => format!(
-            " {} spent; the next video could cost up to {} (its answer counted at full length, \
-             though it usually costs a fraction of that): more than the whole cap. Each video \
-             needs that much room before it is sent.",
+            " {} spent; the next video could cost up to {}, more than the whole cap (that is its \
+             worst case; it usually costs a fraction of it). Each video needs that much room \
+             before it is sent.",
             dollars(spent_usd),
             dollars(next)
         ),

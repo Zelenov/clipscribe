@@ -522,7 +522,7 @@ pub(crate) fn text_similarity(a: &str, b: &str) -> f64 {
 /// The picture signal between `a` and `b` (the words are not looked at): the smallest
 /// [`shot_distance`] between a stretch of one and a stretch of the other (`None` when either has
 /// no stretch with a signature). For measuring [`SAME_SHOT`] on real clips.
-#[cfg(test)]
+#[cfg(all(test, feature = "frames", target_os = "linux"))]
 pub(crate) fn clip_distance(a: &DescribedClip, b: &DescribedClip) -> Option<f64> {
     let signatures = |clip: &DescribedClip| -> Vec<Turns> {
         stretches_of(clip)
