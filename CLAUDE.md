@@ -72,11 +72,16 @@ frename (`Zelenov/frename`) uses clipscribe as a library, pinned by commit (`rev
   minor version and is described in `version.md` (`## Changed`, what callers must change) so
   frename can follow.
 - The library with `frames` and without default features must keep building: CI checks both.
-- After a release that frename must follow (a breaking change, or a fix frename needs), open an
-  issue in `Zelenov/frename` labelled `feature`, body `🤖 agent:` with the version, what changed and
-  what frename must do (frename's pipeline takes it once the owner labels it `approved`); link
-  it from the PR. If frename need not change, write "frename: no change
-  needed" in the PR body instead. The pin itself is moved in frename, never from here.
+- Per the owner: every release moves frename's pin, not just the ones with a breaking change —
+  do it in the same session as the release, not gated on an `approved` label. Move the pin
+  (`Cargo.toml` and `crates/frename-core/Cargo.toml`) to the new version/commit, make whatever
+  code change `version.md`'s `## Changed` requires (nothing, for an additive release), build and
+  run frename's test suite, then commit (`Cargo.toml` + `Cargo.lock`, plus any adapted call site)
+  and open a PR there, following frename's own nightly/review-gate process for it like any other
+  change; link it from this release's PR. If frename's repo is outside this session's access,
+  file the issue as before (labelled `feature`, body `🤖 agent:`, the version, what changed, what
+  frename must do) instead, so the next session with access can do the pin move without
+  re-deriving anything.
 
 ## Labels
 
