@@ -12,11 +12,11 @@ use std::sync::Mutex;
 
 use clap::{ArgGroup, Parser, ValueEnum};
 use clipscribe::{
-    cache_path, describe_folder, describe_moment, estimate_tags_usage, estimate_usage, find_videos,
-    format_time, frames, group_clips, parse_vocabulary, srt, AiUsage, Budget, Cache, ClipGroups,
-    ClipOutcome, ClipRecord, DescribedMoment, Error, FolderEvent, FrameSampling, Grouping, Model,
-    MomentsMode, Options, Provider, RunOptions, Stage, Stop, SummaryLanguage, Tag, DEFAULT_JOBS,
-    MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
+    cache_path, cached_clip, describe_folder, describe_moment, estimate_tags_usage, estimate_usage,
+    find_videos, format_time, frames, group_clips, parse_vocabulary, srt, AiUsage, Budget, Cache,
+    ClipGroups, ClipOutcome, ClipRecord, DescribedMoment, Error, FolderEvent, FrameSampling,
+    Grouping, Model, MomentsMode, Options, Provider, RunOptions, Stage, Stop, SummaryLanguage, Tag,
+    DEFAULT_JOBS, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
 };
 use serde_json::json;
 
@@ -71,7 +71,9 @@ struct Cli {
     #[arg(long)]
     no_subtitles: bool,
 
-    /// Print JSON (an array with one object per video) instead of text.
+    /// Print JSON (an array with one object per video) instead of text. A video from the cache
+    /// (`"cached": true`) shows the `usage` and `cost_usd` of when it was described, not what
+    /// this run spent: the usage line on stderr counts only this run.
     #[arg(long)]
     json: bool,
 
@@ -408,11 +410,28 @@ fn main() -> ExitCode {
     let mut total = AiUsage::default();
     let mut stopped = None;
     for (cache, range) in &batches {
-        if stopped.is_some() {
-            outcomes.extend(range.clone().map(|_| ClipOutcome::NotStarted));
+        let offset = range.start;
+        if let Some(stop) = &stopped {
+            // Stopped for the budget or a rejected key: what the cache has still costs nothing.
+            // A cancel takes nothing more up.
+            for index in range.clone() {
+                let outcome = cache
+                    .as_ref()
+                    .filter(|_| *stop != Stop::Cancelled)
+                    .and_then(|cache| cached_clip(&videos[index], cache, &run, &options))
+                    .map_or(ClipOutcome::NotStarted, ClipOutcome::Cached);
+                lock(&status).on_event(
+                    0,
+                    FolderEvent::Finished {
+                        index,
+                        video: &videos[index],
+                        outcome: &outcome,
+                    },
+                );
+                outcomes.push(outcome);
+            }
             continue;
         }
-        let offset = range.start;
         let folder_run = describe_folder(
             &videos[range.clone()],
             cache.as_ref(),
@@ -465,11 +484,22 @@ fn main() -> ExitCode {
 
     let not_done = outcomes.iter().filter(|o| o.record().is_none()).count();
     match &stopped {
-        Some(Stop::OverBudget) => eprintln!(
-            "{} {not_done} of {} videos not described.",
-            Stop::OverBudget,
-            videos.len()
-        ),
+        Some(Stop::OverBudget) => {
+            let described_now = outcomes
+                .iter()
+                .filter(|o| matches!(o, ClipOutcome::Described(_)))
+                .count();
+            eprintln!(
+                "{}",
+                budget_stop_message(
+                    budget.max_usd().unwrap_or_default(),
+                    not_done,
+                    videos.len(),
+                    described_now,
+                    caching,
+                )
+            );
+        }
         Some(stop @ Stop::Job(_)) => eprintln!("{stop}"),
         // Each cancelled video is said as it stops.
         Some(Stop::Cancelled) | None => {}
@@ -488,6 +518,30 @@ fn main() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// What to say when a run stopped at `--max-cost`, and what to do next: `not_done` of `total`
+/// videos are left, `described_now` were described (and paid for) by this run, and `caching`
+/// says whether they were saved to the cache (`--resume` or `--force`) for the next run to skip.
+fn budget_stop_message(
+    max_usd: f64,
+    not_done: usize,
+    total: usize,
+    described_now: usize,
+    caching: bool,
+) -> String {
+    let stopped =
+        format!("Stopped at --max-cost ${max_usd:.2}: {not_done} of {total} videos not described.");
+    if caching {
+        format!("{stopped} Raise --max-cost and run again with --resume to continue.")
+    } else if described_now > 0 {
+        format!(
+            "{stopped} The {described_now} described in this run were not saved (no --resume), \
+             so running again pays for them again too: raise --max-cost and add --resume."
+        )
+    } else {
+        format!("{stopped} Raise --max-cost, and add --resume to save each video as it is done.")
     }
 }
 
@@ -755,7 +809,8 @@ fn print_groups(videos: &[&Path], grouping: &Grouping) {
 }
 
 /// A described clip as JSON; `tags` and `new_tag_ideas` only when a vocabulary was used,
-/// `cached` only when it came from the cache, and with --groups (`groups`: the whole grouping and
+/// `cached` only when it came from the cache (its `usage` and `cost_usd` are then what it cost when
+/// it was described, not anything this run spent), and with --groups (`groups`: the whole grouping and
 /// this clip's part of it) `group`, `group_label`, `stretches` and each moment's `group`.
 fn clip_to_json(
     video: &Path,
@@ -1193,6 +1248,29 @@ mod tests {
             );
             assert_eq!(*range, want);
         }
+    }
+
+    /// Printed with `cargo test --bin clipscribe budget_stop -- --nocapture`, for the PR's sample
+    /// output.
+    #[test]
+    fn a_budget_stop_says_what_to_do_and_whether_anything_was_saved() {
+        let resumable = budget_stop_message(5.0, 120, 400, 280, true);
+        eprintln!("{resumable}");
+        assert_eq!(
+            resumable,
+            "Stopped at --max-cost $5.00: 120 of 400 videos not described. Raise --max-cost and \
+             run again with --resume to continue."
+        );
+        let unsaved = budget_stop_message(5.0, 120, 400, 280, false);
+        eprintln!("{unsaved}");
+        assert!(
+            unsaved.contains("The 280 described in this run were not saved"),
+            "{unsaved}"
+        );
+        assert!(unsaved.contains("add --resume"), "{unsaved}");
+        let nothing = budget_stop_message(0.01, 4, 4, 0, false);
+        eprintln!("{nothing}");
+        assert!(nothing.contains("Raise --max-cost"), "{nothing}");
     }
 
     #[test]
