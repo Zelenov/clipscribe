@@ -21,6 +21,8 @@ pub struct OpenAi {
     base_url: String,
     retry: RetryPolicy,
     client: reqwest::blocking::Client,
+    /// Shared with the other clients of a folder run; see [`provider::RateGate`].
+    gate: Option<std::sync::Arc<provider::RateGate>>,
 }
 
 impl OpenAi {
@@ -43,7 +45,14 @@ impl OpenAi {
             base_url,
             retry,
             client,
+            gate: None,
         })
+    }
+
+    /// This client, pausing together with every other client sharing `gate`.
+    pub(crate) fn with_rate_gate(mut self, gate: std::sync::Arc<provider::RateGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Fails (even in a release build, unlike a `debug_assert!`) if `request.effort` is set: no
@@ -87,9 +96,13 @@ impl OpenAi {
 impl AiProvider for OpenAi {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError> {
         let body = Self::body(request)?.to_string();
-        provider::retry_loop(&self.retry, Provider::OpenAi.label(), cancel, || {
-            self.attempt(&body)
-        })
+        provider::retry_loop(
+            &self.retry,
+            Provider::OpenAi.label(),
+            self.gate.as_deref(),
+            cancel,
+            || self.attempt(&body),
+        )
     }
 }
 

@@ -217,8 +217,23 @@ impl Clip {
         duration_s: f64,
         sampling: FrameSampling,
         cancel: &AtomicBool,
-        mut on_frame: impl FnMut(usize, usize),
+        on_frame: impl FnMut(usize, usize),
     ) -> Result<Option<Vec<Frame>>, String> {
+        Ok(self
+            .sample_with_fingerprints(duration_s, sampling, cancel, on_frame)?
+            .map(|(frames, _)| frames))
+    }
+
+    /// [`Self::sample`], with each frame's fingerprint (an 8×8 grid of average luma of the upright
+    /// frame, see [`crate::FrameFingerprint`]) for grouping similar footage.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn sample_with_fingerprints(
+        &self,
+        duration_s: f64,
+        sampling: FrameSampling,
+        cancel: &AtomicBool,
+        mut on_frame: impl FnMut(usize, usize),
+    ) -> Result<Option<(Vec<Frame>, Vec<Vec<u8>>)>, String> {
         // Below two frames' worth of budget there is no window to choose a frame within, so
         // `KeyFrames` has nothing to add over `Interval`.
         let key_frames = sampling == FrameSampling::KeyFrames && frame_count(duration_s) > 1;
@@ -276,17 +291,18 @@ impl Clip {
         } else {
             (0..candidates.len()).collect()
         };
-        chosen
-            .into_iter()
-            .map(|i| {
-                let (time_s, image) = candidates[i].clone();
-                Ok(Frame {
-                    time_s,
-                    jpeg: to_jpeg(orient(image, orientation.as_deref()))?,
-                })
-            })
-            .collect::<Result<Vec<Frame>, String>>()
-            .map(Some)
+        let mut frames = Vec::with_capacity(chosen.len());
+        let mut fingerprints = Vec::with_capacity(chosen.len());
+        for i in chosen {
+            let (time_s, image) = candidates[i].clone();
+            let upright = orient(image, orientation.as_deref());
+            fingerprints.push(fingerprint(&upright));
+            frames.push(Frame {
+                time_s,
+                jpeg: to_jpeg(upright)?,
+            });
+        }
+        Ok(Some((frames, fingerprints)))
     }
 
     /// The frame at `at_s`, plus one on each side `window_s` away — for [`describe_moment`],

@@ -359,9 +359,9 @@ fn change_scores(candidates: &[(f64, Vec<u8>)]) -> Vec<f64> {
 }
 
 /// Mean absolute difference between two same-length byte fingerprints, normalised to 0.0–1.0.
-/// `0.0` when they differ in length or are empty (nothing to compare).
-#[cfg(feature = "frames")]
-fn fingerprint_diff(a: &[u8], b: &[u8]) -> f64 {
+/// `0.0` when they differ in length or are empty (nothing to compare). Also how much the level
+/// of light changes between two frames for [`crate::group_clips`]'s cuts.
+pub(crate) fn fingerprint_diff(a: &[u8], b: &[u8]) -> f64 {
     if a.is_empty() || a.len() != b.len() {
         return 0.0;
     }

@@ -31,9 +31,12 @@
 //! the estimate and the Anthropic client remain.
 
 pub mod anthropic;
+mod cache;
 mod describe;
+mod folder;
 #[cfg(feature = "frames")]
 pub mod frames;
+mod groups;
 mod moment;
 pub mod openai;
 pub mod provider;
@@ -42,7 +45,10 @@ mod tags;
 
 use std::time::Duration;
 
+pub use cache::*;
 pub use describe::*;
+pub use folder::*;
+pub use groups::*;
 pub use moment::*;
 pub use provider::{AiError, AiProvider, AiUsage, Provider};
 pub use tags::*;
@@ -148,6 +154,57 @@ fn provider_for(options: &Options) -> Result<Box<dyn provider::AiProvider>, Erro
     }
 }
 
+/// The client for `options.model`'s provider, pausing together with every other client sharing
+/// `gate` (the workers of one folder run).
+#[cfg(feature = "frames")]
+fn gated_provider_for(
+    options: &Options,
+    gate: std::sync::Arc<provider::RateGate>,
+) -> Result<Box<dyn provider::AiProvider>, Error> {
+    match options.model.provider {
+        Provider::Anthropic => Ok(Box::new(
+            anthropic::Anthropic::new(options.api_key.clone())
+                .map_err(Error::Ai)?
+                .with_rate_gate(gate),
+        )),
+        Provider::OpenAi => Ok(Box::new(
+            openai::OpenAi::new(options.api_key.clone())
+                .map_err(Error::Ai)?
+                .with_rate_gate(gate),
+        )),
+    }
+}
+
+/// The frames a whole-clip description is made from, with the length of the clip and each
+/// frame's fingerprint (see [`FrameFingerprint`]): shared by [`describe`], [`describe_with_tags`]
+/// and [`describe_clip`].
+#[cfg(feature = "frames")]
+#[allow(clippy::type_complexity)]
+fn read_frames(
+    video: &std::path::Path,
+    sampling: FrameSampling,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_stage: &mut impl FnMut(Stage),
+) -> Result<(f64, Vec<Frame>, Vec<Vec<u8>>), Error> {
+    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
+    let duration_s = clip
+        .duration_s()
+        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
+    if duration_s > MAX_DURATION_S {
+        return Err(Error::TooLong(duration_s));
+    }
+    match clip.sample_with_fingerprints(duration_s, sampling, cancel, |done, total| {
+        on_stage(Stage::Frame { done, total })
+    }) {
+        Ok(Some((frames, fingerprints))) if !frames.is_empty() => {
+            Ok((duration_s, frames, fingerprints))
+        }
+        Ok(Some(_)) => Err(Error::Unreadable("no frames".to_string())),
+        Ok(None) => Err(Error::Cancelled),
+        Err(e) => Err(Error::Unreadable(e)),
+    }
+}
+
 /// Describe the video at `video`, with its `subtitles` (empty when it has none). `cancel` is
 /// checked between frames and while waiting for the answer; `on_stage` follows along.
 #[cfg(feature = "frames")]
@@ -158,22 +215,8 @@ pub fn describe(
     cancel: &std::sync::atomic::AtomicBool,
     mut on_stage: impl FnMut(Stage),
 ) -> Result<Described, Error> {
-    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
-    let duration_s = clip
-        .duration_s()
-        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
-    if duration_s > MAX_DURATION_S {
-        return Err(Error::TooLong(duration_s));
-    }
-    let frames = match clip.sample(duration_s, options.frame_sampling, cancel, |done, total| {
-        on_stage(Stage::Frame { done, total })
-    }) {
-        Ok(Some(frames)) if !frames.is_empty() => frames,
-        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
-        Ok(None) => return Err(Error::Cancelled),
-        Err(e) => return Err(Error::Unreadable(e)),
-    };
-    drop(clip);
+    let (duration_s, frames, _) =
+        read_frames(video, options.frame_sampling, cancel, &mut on_stage)?;
     let request = build_request(
         options.model,
         &frames,
@@ -225,22 +268,8 @@ pub fn describe_with_tags(
     cancel: &std::sync::atomic::AtomicBool,
     mut on_stage: impl FnMut(Stage),
 ) -> Result<DescribedWithTags, Error> {
-    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
-    let duration_s = clip
-        .duration_s()
-        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
-    if duration_s > MAX_DURATION_S {
-        return Err(Error::TooLong(duration_s));
-    }
-    let frames = match clip.sample(duration_s, options.frame_sampling, cancel, |done, total| {
-        on_stage(Stage::Frame { done, total })
-    }) {
-        Ok(Some(frames)) if !frames.is_empty() => frames,
-        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
-        Ok(None) => return Err(Error::Cancelled),
-        Err(e) => return Err(Error::Unreadable(e)),
-    };
-    drop(clip);
+    let (duration_s, frames, _) =
+        read_frames(video, options.frame_sampling, cancel, &mut on_stage)?;
     let request = build_combined_request(
         options.model,
         &frames,
