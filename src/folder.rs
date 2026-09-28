@@ -474,8 +474,9 @@ pub fn cached_clip(
 /// each is looked up in `cache` ([`cached_clip`]: nothing is sent) and served
 /// ([`ClipOutcome::Cached`]) when it is there, else left [`ClipOutcome::NotStarted`]; `on_event`
 /// gets `Started` for a cached one and `Finished` for each, in the order given, so a display
-/// showing clips in order can move past them. After [`Stop::Cancelled`] every one is
-/// `NotStarted`, with no lookup and no event: Ctrl+C means stop now.
+/// showing clips in order can move past them. After [`Stop::Cancelled`], or from the moment
+/// `cancel` is set, every one (left) is `NotStarted`, with no lookup and no event: Ctrl+C means
+/// stop now, even while serving a folder of thousands from its cache.
 ///
 /// [`describe_folder`] does this for its own clips; a program running several folders one after
 /// another (each with its own cache, one [`Budget`]) calls it for the folders after the one that
@@ -486,12 +487,13 @@ pub fn serve_after_stop<'v>(
     run: &RunOptions,
     options: &crate::Options,
     stop: &Stop,
+    cancel: &AtomicBool,
     on_event: &dyn Fn(FolderEvent<'_>),
 ) -> Vec<ClipOutcome> {
     videos
         .into_iter()
         .map(|(index, video)| {
-            if *stop == Stop::Cancelled {
+            if *stop == Stop::Cancelled || cancel.load(Ordering::Relaxed) {
                 return ClipOutcome::NotStarted;
             }
             let outcome = cache
@@ -552,7 +554,7 @@ mod run {
         cancel: &AtomicBool,
         on_stage: impl FnMut(Stage),
     ) -> Result<Option<DescribedClip>, Error> {
-        let provider = crate::provider_for(options)?;
+        let provider = crate::provider_for(options, None)?;
         let worker = Worker {
             provider: provider.as_ref(),
             options,
@@ -742,7 +744,7 @@ mod run {
     ) -> FolderRun {
         let gate = Arc::new(RateGate::default());
         let make_provider = || -> Result<Box<dyn AiProvider>, Error> {
-            crate::gated_provider_for(options, gate.clone())
+            crate::provider_for(options, Some(gate.clone()))
         };
         Runner {
             cache,
@@ -778,10 +780,16 @@ mod run {
             let halt = AtomicBool::new(false);
             let stopped: Mutex<Option<Stop>> = Mutex::new(None);
             let usage = Mutex::new(AiUsage::default());
+            // The first reason wins, except that a cancel overrides any other: Ctrl+C means stop
+            // now, whatever stopped the run first.
             let stop = |why: Stop| {
                 halt.store(true, Ordering::Relaxed);
                 let mut stopped = stopped.lock().unwrap_or_else(|e| e.into_inner());
-                stopped.get_or_insert(why);
+                if why == Stop::Cancelled {
+                    *stopped = Some(why);
+                } else {
+                    stopped.get_or_insert(why);
+                }
             };
             let jobs = self.run.jobs.clamp(1, videos.len().max(1));
             std::thread::scope(|scope| {
@@ -836,7 +844,7 @@ mod run {
             if self.cancel.load(Ordering::Relaxed) {
                 stop(Stop::Cancelled);
             }
-            let stopped = stopped.into_inner().unwrap_or_else(|e| e.into_inner());
+            let mut stopped = stopped.into_inner().unwrap_or_else(|e| e.into_inner());
             let mut clips: Vec<Option<ClipOutcome>> = outcomes
                 .into_iter()
                 .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
@@ -849,11 +857,16 @@ mod run {
                     self.run,
                     self.options,
                     why,
+                    self.cancel,
                     on_event,
                 );
                 for (i, outcome) in left.into_iter().zip(served) {
                     clips[i] = Some(outcome);
                 }
+            }
+            if self.cancel.load(Ordering::Relaxed) {
+                // Ctrl+C while the clips left were served from the cache.
+                stopped = Some(Stop::Cancelled);
             }
             let clips: Vec<ClipOutcome> = clips
                 .into_iter()
@@ -1054,7 +1067,8 @@ mod tests {
     }
 
     /// After a budget stop every clip left is finished (not started, with no cache to serve it
-    /// from), in order, so a display can move past them; after a cancel nothing more happens.
+    /// from), in order, so a display can move past them; after a cancel nothing more happens, and
+    /// a Ctrl+C while they are served stops serving at once.
     #[test]
     fn after_a_stop_the_clips_left_are_finished_in_order_unless_cancelled() {
         let videos = [PathBuf::from("a.mp4"), PathBuf::from("b.mp4")];
@@ -1073,15 +1087,54 @@ mod tests {
         };
         let left = || videos.iter().enumerate().map(|(i, v)| (i + 3, v.as_path()));
         let run = RunOptions::default();
-        let served = serve_after_stop(left(), None, &run, &options, &Stop::OverBudget, &on_event);
+        let cancel = AtomicBool::new(false);
+        let served = serve_after_stop(
+            left(),
+            None,
+            &run,
+            &options,
+            &Stop::OverBudget,
+            &cancel,
+            &on_event,
+        );
         assert_eq!(served, [ClipOutcome::NotStarted, ClipOutcome::NotStarted]);
         assert_eq!(*finished.lock().expect("lock"), [3, 4]);
-        let served = serve_after_stop(left(), None, &run, &options, &Stop::Cancelled, &on_event);
+        let served = serve_after_stop(
+            left(),
+            None,
+            &run,
+            &options,
+            &Stop::Cancelled,
+            &cancel,
+            &on_event,
+        );
         assert_eq!(served.len(), 2);
         assert_eq!(
             finished.lock().expect("lock").len(),
             2,
             "no event after a cancel"
+        );
+
+        // Ctrl+C while the first clip left is served: the second is not even looked up.
+        finished.lock().expect("lock").clear();
+        let cancel_on_first = |event: FolderEvent<'_>| {
+            on_event(event);
+            cancel.store(true, Ordering::Relaxed);
+        };
+        let served = serve_after_stop(
+            left(),
+            None,
+            &run,
+            &options,
+            &Stop::OverBudget,
+            &cancel,
+            &cancel_on_first,
+        );
+        assert_eq!(served, [ClipOutcome::NotStarted, ClipOutcome::NotStarted]);
+        assert_eq!(
+            *finished.lock().expect("lock"),
+            [3],
+            "nothing after the cancel"
         );
     }
 
@@ -1329,7 +1382,7 @@ mod tests {
                 Ok(Box::new(
                     Anthropic::with_endpoint("k".to_string(), url.clone(), fast)
                         .map_err(Error::Ai)?
-                        .with_rate_gate(gate.clone()),
+                        .with_rate_gate(Some(gate.clone())),
                 ))
             };
             Runner {
@@ -2054,8 +2107,9 @@ mod tests {
             assert!(closest_picture > SAME_SHOT, "{closest_picture}");
             // The hybrid end to end: the re-framed footage joins the originals by its words, and
             // no pattern joins them. (Between patterns the words can join two different ones —
-            // the pinwheel and the rings are both "black and white" around "the centre": the
-            // word signal's false positive, printed above and in the design notes.)
+            // the pinwheel and the rings are both "black and white" around "the centre", and the
+            // white ball on black shares "black" and "white" with both: the word signal's false
+            // positives, printed above and in the design notes.)
             let grouping = group_clips(&clips.iter().collect::<Vec<_>>());
             let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
             eprintln!("groups: {ids:?}");

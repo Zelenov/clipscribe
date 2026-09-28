@@ -98,9 +98,11 @@ struct Cli {
     /// Group similar footage: videos, and stretches within them, that look like the same shot
     /// (duplicates, re-exports, a clip stored sideways, a camera that did not move) or whose
     /// descriptions share enough words (the same subject or activity, even after the camera moved
-    /// or zoomed; also, sometimes, the same place with something else happening). Each group gets
-    /// a short label. Computed from the frames and descriptions already there; nothing extra is
-    /// sent.
+    /// or zoomed; also, sometimes, the same place with something else happening, and unrelated
+    /// videos described in similar everyday words, like "a woman in a bright room"). On a large
+    /// folder from one shoot these links can chain several groups into one: check groups before
+    /// relying on them. Each group gets a short label. Computed from the frames and descriptions
+    /// already there; nothing extra is sent.
     #[arg(long)]
     groups: bool,
 
@@ -111,7 +113,7 @@ struct Cli {
     /// Stop before a request could take this run's spending past this many US dollars (videos
     /// found in the cache cost nothing). Each request sets aside several times its likely cost
     /// (its answer counted at full length) before it is sent, so a cap close to --estimate's
-    /// total can still stop a video or two early.
+    /// total can stop several videos early.
     #[arg(long, value_parser = parse_cost)]
     max_cost: Option<f64>,
 
@@ -428,6 +430,7 @@ fn main() -> ExitCode {
                 &run,
                 &options,
                 stop,
+                &CANCEL,
                 &|event| lock(&status).on_event(offset, event),
             ));
             continue;
@@ -444,6 +447,10 @@ fn main() -> ExitCode {
         total += folder_run.usage;
         stopped = folder_run.stopped;
         outcomes.extend(folder_run.clips);
+    }
+    if CANCEL.load(Ordering::Relaxed) {
+        // Ctrl+C overrides whatever stopped the run first, as in `describe_folder`.
+        stopped = Some(Stop::Cancelled);
     }
     lock(&status).clear();
 
@@ -538,11 +545,18 @@ fn budget_stop_message(
     caching: bool,
 ) -> String {
     let why = match next_usd {
+        Some(next) if next > max_usd => format!(
+            " {} spent; the next video could cost up to {} (its answer counted at full length, \
+             though it usually costs a fraction of that): more than the whole cap. Each video \
+             needs that much room before it is sent.",
+            dollars(spent_usd),
+            dollars(next)
+        ),
         Some(next) => format!(
             " {} spent; the next video could cost up to {} (its answer counted at full length, \
              though it usually costs a fraction of that), which would pass the cap. Each video \
-             needs that much room before it is sent, so a cap close to --estimate's total can \
-             stop a video or two early.",
+             needs several times its usual cost set aside before it is sent, so a cap close to \
+             --estimate's total can stop several videos early.",
             dollars(spent_usd),
             dollars(next)
         ),
@@ -1300,9 +1314,9 @@ mod tests {
             near_estimate,
             "Stopped at --max-cost $0.03: 2 of 4 videos not described. $0.0143 spent; the next \
              video could cost up to $0.0231 (its answer counted at full length, though it usually \
-             costs a fraction of that), which would pass the cap. Each video needs that much room \
-             before it is sent, so a cap close to --estimate's total can stop a video or two \
-             early. Raise --max-cost and run again with --resume to continue."
+             costs a fraction of that), which would pass the cap. Each video needs several times \
+             its usual cost set aside before it is sent, so a cap close to --estimate's total can \
+             stop several videos early. Raise --max-cost and run again with --resume to continue."
         );
         let unsaved = budget_stop_message(5.0, 4.98, Some(0.09), 120, 400, 280, false);
         eprintln!("{unsaved}");
@@ -1318,6 +1332,11 @@ mod tests {
         let nothing = budget_stop_message(0.01, 0.0, Some(0.0231), 4, 4, 0, false);
         eprintln!("{nothing}");
         assert!(nothing.contains("$0.00 spent"), "{nothing}");
+        assert!(nothing.contains("more than the whole cap"), "{nothing}");
+        assert!(
+            !nothing.contains("--estimate"),
+            "not about being close: {nothing}"
+        );
         assert!(nothing.contains("Raise --max-cost"), "{nothing}");
     }
 

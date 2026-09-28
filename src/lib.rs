@@ -152,33 +152,21 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The client for `options.model`'s provider.
-fn provider_for(options: &Options) -> Result<Box<dyn provider::AiProvider>, Error> {
-    match options.model.provider {
-        Provider::Anthropic => Ok(Box::new(
-            anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?,
-        )),
-        Provider::OpenAi => Ok(Box::new(
-            openai::OpenAi::new(options.api_key.clone()).map_err(Error::Ai)?,
-        )),
-    }
-}
-
-/// The client for `options.model`'s provider, pausing together with every other client sharing
-/// `gate` (the workers of one folder run).
-#[cfg(feature = "frames")]
-fn gated_provider_for(
+/// The client for `options.model`'s provider; with a `gate`, pausing together with every other
+/// client sharing it (the workers of one folder run).
+fn provider_for(
     options: &Options,
-    gate: std::sync::Arc<provider::RateGate>,
+    gate: Option<std::sync::Arc<provider::RateGate>>,
 ) -> Result<Box<dyn provider::AiProvider>, Error> {
+    let key = options.api_key.clone();
     match options.model.provider {
         Provider::Anthropic => Ok(Box::new(
-            anthropic::Anthropic::new(options.api_key.clone())
+            anthropic::Anthropic::new(key)
                 .map_err(Error::Ai)?
                 .with_rate_gate(gate),
         )),
         Provider::OpenAi => Ok(Box::new(
-            openai::OpenAi::new(options.api_key.clone())
+            openai::OpenAi::new(key)
                 .map_err(Error::Ai)?
                 .with_rate_gate(gate),
         )),
@@ -284,7 +272,7 @@ pub fn suggest_tags(
         vocabulary,
         duration_s,
     );
-    let provider = provider_for(options)?;
+    let provider = provider_for(options, None)?;
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
@@ -334,7 +322,7 @@ pub fn describe_moment(
         window_s,
         options.language,
     );
-    let provider = provider_for(options)?;
+    let provider = provider_for(options, None)?;
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
