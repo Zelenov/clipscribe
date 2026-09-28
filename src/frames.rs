@@ -304,6 +304,7 @@ impl Clip {
     ) -> Result<Option<Vec<Frame>>, String> {
         let duration_s = self.duration_s().unwrap_or(at_s).max(0.0);
         let at_s = at_s.clamp(0.0, duration_s);
+        let window_s = window_s.max(0.0);
         let mut times = vec![
             (at_s - window_s).max(0.0),
             at_s,
@@ -632,6 +633,25 @@ mod tests {
             .expect("not cancelled");
         assert!(!near_zero.is_empty());
         assert!(near_zero.iter().all(|f| f.time_s >= 0.0));
+    }
+
+    /// A negative `window_s` (never produced by the CLI or the library's own default, but not
+    /// ruled out by the type) clamps to zero instead of reading nonsensical times.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sample_moment_clamps_a_negative_window_to_zero() {
+        let path = ci_clips().into_iter().next().expect("at least one clip");
+        let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+        let duration = clip.duration_s().expect("duration");
+        let at = duration / 2.0;
+        let frames = clip
+            .sample_moment(at, -5.0, &AtomicBool::new(false))
+            .expect("frames")
+            .expect("not cancelled");
+        assert!(!frames.is_empty());
+        for frame in &frames {
+            assert!((frame.time_s - at).abs() < 1e-2, "{}", frame.time_s);
+        }
     }
 
     /// Key frames never exceed the same budget `Interval` uses, on real clips (not just the
