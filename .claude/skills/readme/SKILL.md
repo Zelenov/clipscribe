@@ -8,20 +8,24 @@ description: >
 
 # README for users
 
-The README has two readers: people running the `clipscribe` command on their clips, and Rust
-developers using the crate (frename is one). It is also the crate's page on crates.io.
+The README documents clipscribe as a Rust library: it is the crate's page on crates.io, read by
+Rust developers deciding whether to depend on it and then calling it (frename is one). Per the
+owner: a crate's README describes the code, not a CLI bundled with it — the `clipscribe` binary's
+own `--help` is that tool's documentation, not the README. Never add a command-line section, an
+options table, or a CLI usage example here; when a change is CLI-only (a new flag, a changed
+default with no library-side equivalent), the README does not mention it at all.
 
 ## Rules
 
-- Plain language, short sentences, second person. Command-line sections use no internal types or
-  implementation details; the library section names only public items.
-- Organised by what the reader does (download, describe clips, price a batch, use it as a library,
-  build), not by code modules.
-- Every command-line option is in the options table, with its default; nothing is listed that
-  the binary lacks. Prices and model names match `MODELS`.
-- The opening example and the library example must match real output and compile against the
-  current API (`lib.rs` doc example too).
-- A new feature gets one or two sentences, or a row in a table, where a reader would look for it.
+- Plain language, short sentences, second person. The library section names only public items.
+- Organised by what the reader does (what it does, use it as a library, build), not by code
+  modules.
+- Prices and model names match `MODELS`.
+- The library example must match real output and compile against the current API (`lib.rs` doc
+  example too).
+- A new feature gets one or two sentences, or a row in a table, where a reader would look for it —
+  only if it is visible from the library (a new `Options` field, a new function, a new `MODELS`
+  entry); a CLI-only addition is not documented here.
 - Keep it compact: when adding, check whether an older paragraph can be shortened or removed.
   Target: README stays under ~200 lines.
 - Technical details that are still worth keeping go to `docs/` or doc comments.
