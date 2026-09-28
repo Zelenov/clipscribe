@@ -178,7 +178,12 @@ pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
                 .map(|segment| {
                     stretches
                         .iter()
-                        .map(|s| (s.group, overlap(s.start_s, s.end_s, segment.start_s, segment.end_s)))
+                        .map(|s| {
+                            (
+                                s.group,
+                                overlap(s.start_s, s.end_s, segment.start_s, segment.end_s),
+                            )
+                        })
                         .filter(|(_, overlap)| *overlap > 0.0)
                         .fold(None, |best: Option<(usize, f64)>, (g, o)| match best {
                             Some((_, best_o)) if best_o >= o => best,
@@ -231,10 +236,13 @@ fn label_for(clip: &DescribedClip, start_s: f64, end_s: f64) -> String {
         .iter()
         .map(|s| (s, overlap(start_s, end_s, s.start_s, s.end_s)))
         .filter(|(_, o)| *o >= LABEL_COVERAGE * length)
-        .fold(None, |best: Option<(&crate::Segment, f64)>, (s, o)| match best {
-            Some((_, best_o)) if best_o >= o => best,
-            _ => Some((s, o)),
-        })
+        .fold(
+            None,
+            |best: Option<(&crate::Segment, f64)>, (s, o)| match best {
+                Some((_, best_o)) if best_o >= o => best,
+                _ => Some((s, o)),
+            },
+        )
         .map_or_else(
             || clip.description.summary.clone(),
             |(s, _)| s.description.clone(),
@@ -451,14 +459,21 @@ mod tests {
         );
         // The same set-up filmed brighter, then stored sideways.
         let brighter = clip("The same lamp.", 4.0, vec![(0.0, scene(1, 1, 90))]);
-        let sideways = clip("The lamp, sideways.", 4.0, vec![(0.0, turned(&scene(1, 1, 20)))]);
+        let sideways = clip(
+            "The lamp, sideways.",
+            4.0,
+            vec![(0.0, turned(&scene(1, 1, 20)))],
+        );
         let other = clip("A gradient.", 4.0, vec![(0.0, ramp())]);
         let grouping = group_clips(&[&a, &brighter, &sideways, &other]);
         let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
         assert_eq!(ids, vec![1, 1, 1, 2]);
         assert_eq!(grouping.groups.len(), 2);
         assert_eq!(grouping.groups[0].stretches, 3);
-        assert_eq!(grouping.group(2).map(|g| g.label.as_str()), Some("A gradient."));
+        assert_eq!(
+            grouping.group(2).map(|g| g.label.as_str()),
+            Some("A gradient.")
+        );
     }
 
     #[test]
@@ -467,7 +482,10 @@ mod tests {
         let also_black = clip("Also black.", 2.0, vec![(0.0, vec![1; 64])]);
         let grouping = group_clips(&[&black, &also_black]);
         assert_eq!(grouping.clips[0].group, 1);
-        assert_eq!(grouping.clips[1].group, 2, "nothing to compare: never matched");
+        assert_eq!(
+            grouping.clips[1].group, 2,
+            "nothing to compare: never matched"
+        );
     }
 
     #[test]
@@ -508,9 +526,15 @@ mod tests {
         assert_eq!((stretches[1].start_s, stretches[1].end_s), (6.0, 10.0));
         assert_eq!(stretches[0].group, 1);
         assert_eq!(stretches[1].group, 2);
-        assert_eq!(grouping.clips[1].group, 2, "the gradient clip joins the cut's second part");
+        assert_eq!(
+            grouping.clips[1].group, 2,
+            "the gradient clip joins the cut's second part"
+        );
         assert_eq!(grouping.clips[0].segments, vec![1, 2]);
-        assert_eq!(grouping.clips[0].group, 1, "the lamp covers more of the clip");
+        assert_eq!(
+            grouping.clips[0].group, 1,
+            "the lamp covers more of the clip"
+        );
         assert_eq!(grouping.groups[0].label, "The lamp is switched on.");
     }
 
@@ -555,7 +579,10 @@ mod tests {
         let a = normalise(&scene(1, 1, 20)).expect("structure");
         assert!(scene_distance(&a, &a).abs() < 1e-9);
         let negative: Vec<f64> = a.iter().map(|v| -v).collect();
-        assert!((1.0 - correlation(&a, &negative) - 2.0).abs() < 1e-9, "the negative: 2.0");
+        assert!(
+            (1.0 - correlation(&a, &negative) - 2.0).abs() < 1e-9,
+            "the negative: 2.0"
+        );
         let other = normalise(&ramp()).expect("structure");
         let d = scene_distance(&a, &other);
         assert!((SAME_SCENE..=2.0).contains(&d), "{d}");

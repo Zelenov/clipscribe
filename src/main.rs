@@ -1,26 +1,33 @@
-//! Command line: describes each input video with [`clipscribe::describe`] and prints its
+//! Command line: describes the input videos with [`clipscribe::describe_folder`] (several at
+//! once, optionally resuming from a cache and grouping similar footage) and prints each one's
 //! summary and key moments, or only what it would cost.
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use clipscribe::{
-    describe, describe_moment, describe_with_tags, estimate_tags_usage, estimate_usage,
-    format_time, frames, parse_vocabulary, srt, AiUsage, Described, DescribedMoment,
-    DescribedWithTags, Error, FrameSampling, Model, MomentsMode, Options, Provider, Stage,
-    SummaryLanguage, Tag, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
+    cache_path, describe_folder, describe_moment, estimate_tags_usage, estimate_usage, find_videos,
+    format_time, frames, group_clips, parse_vocabulary, srt, AiUsage, Budget, Cache, ClipGroups,
+    ClipOutcome, ClipRecord, DescribedMoment, Error, FolderEvent, FrameSampling, Grouping, Model,
+    MomentsMode, Options, Provider, RunOptions, Stage, Stop, SummaryLanguage, Tag, DEFAULT_JOBS,
+    MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
 };
 use serde_json::json;
 
 /// Describe what happens in video clips, and when, with Claude.
 ///
 /// Sends frames (key frames by default, at most 60) and the `.srt` next to each video, if there
-/// is one, and prints a one-sentence summary and time-ranged key moments.
+/// is one, and prints a one-sentence summary and time-ranged key moments. Several videos are
+/// described at once (--jobs); results print in input order.
 #[derive(Parser, Debug)]
 #[command(name = "clipscribe", version)]
+#[command(group(ArgGroup::new("cache").args(["resume", "force"])))]
 struct Cli {
     /// Video files or folders (a folder means the videos in it).
     #[arg(required = true)]
@@ -69,12 +76,47 @@ struct Cli {
     json: bool,
 
     /// Only print what describing the videos would cost; nothing is sent.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = FOLDER_RUN_ARGS)]
     estimate: bool,
+
+    /// Skip videos already described with the same settings in the cache
+    /// (`.clipscribe-cache.jsonl` next to them), and add each newly described one to it as soon
+    /// as it is done, so a stopped run picks up where it left off.
+    #[arg(long)]
+    resume: bool,
+
+    /// Describe every video again, even those in the cache, and write the new results to it.
+    #[arg(long)]
+    force: bool,
+
+    /// Keep the cache (see --resume) in this directory instead of next to the videos.
+    #[arg(long, requires = "cache")]
+    cache_dir: Option<PathBuf>,
+
+    /// Group similar footage: videos, and stretches within them, that show the same scene, each
+    /// group with a short label. Computed from the frames already read; nothing extra is sent.
+    #[arg(long)]
+    groups: bool,
+
+    /// How many videos are in work at once.
+    #[arg(long, default_value_t = DEFAULT_JOBS as u16, value_parser = clap::value_parser!(u16).range(1..))]
+    jobs: u16,
+
+    /// Stop before a request could take this run's spending past this many US dollars (videos
+    /// found in the cache cost nothing).
+    #[arg(long, value_parser = parse_cost)]
+    max_cost: Option<f64>,
 
     /// Name and describe the moment at this time (m:ss.f, h:mm:ss.f or plain seconds) in one
     /// video, instead of describing the whole clip. Fast and cheap: one small request.
-    #[arg(long, value_parser = parse_at, conflicts_with_all = ["tags", "estimate", "frames", "moments"])]
+    #[arg(
+        long,
+        value_parser = parse_at,
+        conflicts_with_all = [
+            "tags", "estimate", "frames", "moments",
+            "resume", "force", "cache_dir", "groups", "jobs", "max_cost",
+        ],
+    )]
     at: Option<f64>,
 
     /// How far around --at to read frames and nearby subtitles from, in seconds each way.
@@ -82,6 +124,19 @@ struct Cli {
     /// far enough to show which way it is moving.
     #[arg(long, requires = "at")]
     window: Option<f64>,
+}
+
+/// The options of a run over whole clips, which neither --at nor --estimate takes.
+const FOLDER_RUN_ARGS: [&str; 6] = ["resume", "force", "cache_dir", "groups", "jobs", "max_cost"];
+
+/// A --max-cost amount: US dollars, more than zero.
+fn parse_cost(text: &str) -> Result<f64, String> {
+    match text.trim().trim_start_matches('$').parse::<f64>() {
+        Ok(usd) if usd.is_finite() && usd > 0.0 => Ok(usd),
+        _ => Err(format!(
+            "unusable amount {text:?}: use US dollars above zero, e.g. 5 or 0.50"
+        )),
+    }
 }
 
 /// A timestamp: `h:mm:ss.f`, `m:ss.f`, or plain seconds, all with the fraction optional.
@@ -253,17 +308,12 @@ fn parse_language(name: &str) -> Result<SummaryLanguage, String> {
         })
 }
 
-/// Extensions of the files a folder input contributes.
-const VIDEO_EXTENSIONS: [&str; 12] = [
-    "mp4", "mov", "m4v", "mkv", "webm", "avi", "mts", "m2ts", "wmv", "mpg", "mpeg", "3gp",
-];
-
-/// Set by Ctrl+C: the video in work stops at its next frame or while waiting for the answer.
+/// Set by Ctrl+C: the videos in work stop at their next frame or while waiting for the answer.
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let videos = match videos(&cli.inputs) {
+    let videos = match find_videos(&cli.inputs) {
         Ok(videos) if !videos.is_empty() => videos,
         Ok(_) => {
             eprintln!("error: no videos in the inputs");
@@ -332,94 +382,149 @@ fn main() -> ExitCode {
         );
     }
 
-    let mut results = Vec::new();
-    let mut total = AiUsage::default();
-    let mut failed = false;
-    for video in &videos {
-        if CANCEL.load(Ordering::Relaxed) {
-            break;
-        }
-        let subtitles = if cli.no_subtitles {
-            Vec::new()
-        } else {
-            srt::load_for(video).unwrap_or_else(|e| {
-                eprintln!("warning: {}: subtitles not read: {e}", video.display());
-                Vec::new()
-            })
-        };
-        let progress = Progress::new(video);
-        let error = if let Some(vocabulary) = &vocabulary {
-            let result =
-                describe_with_tags(video, &subtitles, vocabulary, &options, &CANCEL, |stage| {
-                    progress.show(stage)
-                });
-            progress.clear();
-            match result {
-                Ok(described) => {
-                    total += described.usage;
-                    if cli.json {
-                        results.push(to_json_with_tags(video, &described, model));
-                    } else {
-                        print_text_with_tags(video, &described, model);
-                    }
-                    None
-                }
-                Err(e) => Some(e),
-            }
-        } else {
-            let result = describe(video, &subtitles, &options, &CANCEL, |stage| {
-                progress.show(stage)
-            });
-            progress.clear();
-            match result {
-                Ok(described) => {
-                    total += described.usage;
-                    if cli.json {
-                        results.push(to_json(video, &described, model));
-                    } else {
-                        print_text(video, &described, model);
-                    }
-                    None
-                }
-                Err(e) => Some(e),
+    let caching = cli.resume || cli.force;
+    let mut batches = Vec::new();
+    for (path, range) in batches_by_cache(&videos, caching, cli.cache_dir.as_deref()) {
+        let cache = match path.map(|path| Cache::open(&path).map_err(|e| (path, e))) {
+            None => None,
+            Some(Ok(cache)) => Some(cache),
+            Some(Err((path, e))) => {
+                eprintln!("error: cache {}: {e}", path.display());
+                return ExitCode::from(2);
             }
         };
-        match error {
-            None => {}
-            Some(Error::Cancelled) => {
-                eprintln!("cancelled: {}", video.display());
-                break;
-            }
-            Some(e) => {
-                failed = true;
-                if let Error::BadAnswer { usage, .. } = &e {
-                    total += *usage;
-                }
-                eprintln!("error: {}: {e}", video.display());
-                // A rejected key or an empty balance would fail every video left the same way.
-                if let Error::Ai(ai) = &e {
-                    if let Some(stop) = ai.stops_job() {
-                        eprintln!("{stop}");
-                        break;
-                    }
-                }
-            }
-        }
+        batches.push((cache, range));
     }
+    let run = RunOptions {
+        jobs: usize::from(cli.jobs),
+        force: cli.force,
+        subtitles: !cli.no_subtitles,
+        vocabulary,
+    };
+    let budget = Budget::new(cli.max_cost);
+    let status = Mutex::new(Status::new(videos.len(), !cli.json));
+
+    let mut outcomes: Vec<ClipOutcome> = Vec::with_capacity(videos.len());
+    let mut total = AiUsage::default();
+    let mut stopped = None;
+    for (cache, range) in &batches {
+        if stopped.is_some() {
+            outcomes.extend(range.clone().map(|_| ClipOutcome::NotStarted));
+            continue;
+        }
+        let offset = range.start;
+        let folder_run = describe_folder(
+            &videos[range.clone()],
+            cache.as_ref(),
+            &run,
+            &options,
+            &budget,
+            &CANCEL,
+            |event| lock(&status).on_event(offset, event),
+        );
+        total += folder_run.usage;
+        stopped = folder_run.stopped;
+        outcomes.extend(folder_run.clips);
+    }
+    lock(&status).clear();
+
+    let described: Vec<(usize, &ClipRecord)> = outcomes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, outcome)| outcome.record().map(|record| (i, record)))
+        .collect();
+    let grouping = cli.groups.then(|| {
+        let clips: Vec<_> = described.iter().map(|(_, record)| &record.clip).collect();
+        group_clips(&clips)
+    });
     if cli.json {
+        let results: Vec<serde_json::Value> = described
+            .iter()
+            .enumerate()
+            .map(|(n, (i, record))| {
+                let groups = grouping.as_ref().map(|g| (g, &g.clips[n]));
+                clip_to_json(
+                    &videos[*i],
+                    record,
+                    matches!(outcomes[*i], ClipOutcome::Cached(_)),
+                    groups,
+                )
+            })
+            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&results).unwrap_or_default()
         );
+    } else if let Some(grouping) = grouping.as_ref().filter(|g| !g.groups.is_empty()) {
+        let videos: Vec<&Path> = described
+            .iter()
+            .map(|(i, _)| videos[*i].as_path())
+            .collect();
+        print_groups(&videos, grouping);
+    }
+
+    let not_done = outcomes.iter().filter(|o| o.record().is_none()).count();
+    match &stopped {
+        Some(Stop::OverBudget) => eprintln!(
+            "{} {not_done} of {} videos not described.",
+            Stop::OverBudget,
+            videos.len()
+        ),
+        Some(stop @ Stop::Job(_)) => eprintln!("{stop}"),
+        // Each cancelled video is said as it stops.
+        Some(Stop::Cancelled) | None => {}
     }
     if total != AiUsage::default() {
         print_usage(total, model);
     }
-    if failed || CANCEL.load(Ordering::Relaxed) {
+    let cached = outcomes
+        .iter()
+        .filter(|o| matches!(o, ClipOutcome::Cached(_)))
+        .count();
+    if cached > 0 {
+        eprintln!("{cached} from the cache, nothing sent for them");
+    }
+    if not_done > 0 || CANCEL.load(Ordering::Relaxed) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `videos` split into runs sharing one cache file, in order: without `caching`, one run and no
+/// cache; with `cache_dir`, one run and the cache there; otherwise one run per folder (of
+/// consecutive videos in the same one), each with the cache next to its videos.
+fn batches_by_cache(
+    videos: &[PathBuf],
+    caching: bool,
+    cache_dir: Option<&Path>,
+) -> Vec<(Option<PathBuf>, Range<usize>)> {
+    if !caching {
+        return vec![(None, 0..videos.len())];
+    }
+    if let Some(dir) = cache_dir {
+        return vec![(Some(cache_path(Path::new("."), Some(dir))), 0..videos.len())];
+    }
+    let folder_of = |video: &Path| {
+        video
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    };
+    let mut batches: Vec<(Option<PathBuf>, Range<usize>)> = Vec::new();
+    for (i, video) in videos.iter().enumerate() {
+        let path = cache_path(&folder_of(video), None);
+        match batches.last_mut() {
+            Some((Some(last), range)) if *last == path => range.end = i + 1,
+            _ => batches.push((Some(path), i..i + 1)),
+        }
+    }
+    batches
 }
 
 /// `--at`: name and describe the moment at `at_s` in `video`, instead of describing a whole clip.
@@ -514,35 +619,6 @@ fn moment_to_json(
     })
 }
 
-/// The videos of `inputs`: files as given, folders as the videos in them, sorted.
-fn videos(inputs: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
-    let mut videos = Vec::new();
-    for input in inputs {
-        if input.is_dir() {
-            let mut found: Vec<PathBuf> = std::fs::read_dir(input)?
-                .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|path| path.is_file() && is_video(path))
-                .collect();
-            found.sort();
-            videos.extend(found);
-        } else if input.is_file() {
-            videos.push(input.clone());
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{} not found", input.display()),
-            ));
-        }
-    }
-    Ok(videos)
-}
-
-fn is_video(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-}
-
 /// Read a `--tags` vocabulary file: one tag per line, `name — hint`.
 fn load_vocabulary(path: &Path) -> Result<Vec<Tag>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -611,16 +687,21 @@ fn estimate(
     }
 }
 
-fn print_text(video: &Path, described: &Described, model: Model) {
+/// A described clip as text: the header line (length, frames, cost, whether it came from the
+/// cache), the summary, the moments and, when a vocabulary was used, the tags.
+fn print_clip(video: &Path, record: &ClipRecord, cached: bool) {
+    let clip = &record.clip;
+    let model = Model::from_id(&record.model);
     println!(
-        "{}  {} · {} frames · ${:.4}",
+        "{}  {} · {} frames · ${:.4}{}",
         video.display(),
-        format_time(described.duration_s),
-        described.frames,
-        model.cost_usd(described.usage)
+        format_time(clip.duration_s),
+        clip.frames.len(),
+        model.cost_usd(clip.usage),
+        if cached { " · cached" } else { "" }
     );
-    println!("  {}", described.description.summary);
-    for moment in &described.description.segments {
+    println!("  {}", clip.description.summary);
+    for moment in &clip.description.segments {
         println!(
             "  {}–{}  {}",
             format_time(moment.start_s),
@@ -628,188 +709,329 @@ fn print_text(video: &Path, described: &Described, model: Model) {
             moment.description
         );
     }
-    println!();
-}
-
-fn to_json(video: &Path, described: &Described, model: Model) -> serde_json::Value {
-    json!({
-        "file": video.display().to_string(),
-        "duration_s": described.duration_s,
-        "frames": described.frames,
-        "summary": described.description.summary,
-        "moments": described.description.segments.iter().map(|m| json!({
-            "start_s": m.start_s,
-            "end_s": m.end_s,
-            "description": m.description,
-        })).collect::<Vec<_>>(),
-        "model": model.id,
-        "usage": {
-            "input_tokens": described.usage.input_tokens,
-            "output_tokens": described.usage.output_tokens,
-        },
-        "cost_usd": model.cost_usd(described.usage),
-    })
-}
-
-fn print_text_with_tags(video: &Path, described: &DescribedWithTags, model: Model) {
-    println!(
-        "{}  {} · {} frames · ${:.4}",
-        video.display(),
-        format_time(described.duration_s),
-        described.frames,
-        model.cost_usd(described.usage)
-    );
-    println!("  {}", described.description.summary);
-    for moment in &described.description.segments {
-        println!(
-            "  {}–{}  {}",
-            format_time(moment.start_s),
-            format_time(moment.end_s),
-            moment.description
-        );
-    }
-    if !described.tags.tags.is_empty() {
-        println!("  Tags:");
-        for tag in &described.tags.tags {
-            let ranges: Vec<String> = tag
-                .ranges
-                .iter()
-                .map(|r| format!("{}\u{2013}{}", format_time(r.start_s), format_time(r.end_s)))
-                .collect();
-            let where_ = if ranges.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", ranges.join(", "))
-            };
-            println!("    {} {:.0}%{where_}", tag.name, tag.confidence * 100.0);
+    if let Some(tags) = &clip.tags {
+        if !tags.tags.is_empty() {
+            println!("  Tags:");
+            for tag in &tags.tags {
+                let ranges: Vec<String> = tag
+                    .ranges
+                    .iter()
+                    .map(|r| format!("{}\u{2013}{}", format_time(r.start_s), format_time(r.end_s)))
+                    .collect();
+                let where_ = if ranges.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", ranges.join(", "))
+                };
+                println!("    {} {:.0}%{where_}", tag.name, tag.confidence * 100.0);
+            }
+        }
+        if !tags.new_tag_ideas.is_empty() {
+            println!("  New tag ideas: {}", tags.new_tag_ideas.join(", "));
         }
     }
-    if !described.tags.new_tag_ideas.is_empty() {
-        println!(
-            "  New tag ideas: {}",
-            described.tags.new_tag_ideas.join(", ")
-        );
+    println!();
+}
+
+/// --groups as text, after the clips: each group's label, then its footage, one video a line
+/// with the time ranges it shows the group in.
+fn print_groups(videos: &[&Path], grouping: &Grouping) {
+    println!("Groups:");
+    for group in &grouping.groups {
+        println!("  {}  {}", group.id, group.label);
+        for (video, clip) in videos.iter().zip(&grouping.clips) {
+            let ranges: Vec<String> = clip
+                .stretches
+                .iter()
+                .filter(|s| s.group == group.id)
+                .map(|s| format!("{}–{}", format_time(s.start_s), format_time(s.end_s)))
+                .collect();
+            if !ranges.is_empty() {
+                println!("     {}  {}", video.display(), ranges.join(", "));
+            }
+        }
     }
     println!();
 }
 
-fn to_json_with_tags(
+/// A described clip as JSON; `tags` and `new_tag_ideas` only when a vocabulary was used,
+/// `cached` only when it came from the cache, and with --groups (`groups`: the whole grouping and
+/// this clip's part of it) `group`, `group_label`, `stretches` and each moment's `group`.
+fn clip_to_json(
     video: &Path,
-    described: &DescribedWithTags,
-    model: Model,
+    record: &ClipRecord,
+    cached: bool,
+    groups: Option<(&Grouping, &ClipGroups)>,
 ) -> serde_json::Value {
-    json!({
+    let clip = &record.clip;
+    let model = Model::from_id(&record.model);
+    let label = |id: usize| {
+        groups
+            .and_then(|(g, _)| g.group(id))
+            .map(|g| g.label.as_str())
+    };
+    let mut value = json!({
         "file": video.display().to_string(),
-        "duration_s": described.duration_s,
-        "frames": described.frames,
-        "summary": described.description.summary,
-        "moments": described.description.segments.iter().map(|m| json!({
-            "start_s": m.start_s,
-            "end_s": m.end_s,
-            "description": m.description,
-        })).collect::<Vec<_>>(),
-        "tags": described.tags.tags.iter().map(|t| json!({
-            "name": t.name,
-            "confidence": t.confidence,
-            "ranges": t.ranges.iter().map(|r| json!({
-                "start_s": r.start_s,
-                "end_s": r.end_s,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "new_tag_ideas": described.tags.new_tag_ideas,
-        "model": model.id,
-        "usage": {
-            "input_tokens": described.usage.input_tokens,
-            "output_tokens": described.usage.output_tokens,
-        },
-        "cost_usd": model.cost_usd(described.usage),
-    })
+        "duration_s": clip.duration_s,
+        "frames": clip.frames.len(),
+        "summary": clip.description.summary,
+        "moments": clip.description.segments.iter().enumerate().map(|(n, m)| {
+            let mut moment = json!({
+                "start_s": m.start_s,
+                "end_s": m.end_s,
+                "description": m.description,
+            });
+            if let Some((_, clip_groups)) = groups {
+                moment["group"] = json!(clip_groups.segments.get(n));
+            }
+            moment
+        }).collect::<Vec<_>>(),
+    });
+    if let Some(tags) = &clip.tags {
+        value["tags"] = json!(tags
+            .tags
+            .iter()
+            .map(|t| json!({
+                "name": t.name,
+                "confidence": t.confidence,
+                "ranges": t.ranges.iter().map(|r| json!({
+                    "start_s": r.start_s,
+                    "end_s": r.end_s,
+                })).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>());
+        value["new_tag_ideas"] = json!(tags.new_tag_ideas);
+    }
+    if let Some((_, clip_groups)) = groups {
+        value["group"] = json!(clip_groups.group);
+        value["group_label"] = json!(label(clip_groups.group));
+        value["stretches"] = json!(clip_groups
+            .stretches
+            .iter()
+            .map(|s| json!({
+                "start_s": s.start_s,
+                "end_s": s.end_s,
+                "group": s.group,
+                "label": label(s.group),
+            }))
+            .collect::<Vec<_>>());
+    }
+    value["model"] = json!(model.id);
+    value["usage"] = json!({
+        "input_tokens": clip.usage.input_tokens,
+        "output_tokens": clip.usage.output_tokens,
+    });
+    value["cost_usd"] = json!(model.cost_usd(clip.usage));
+    if cached {
+        value["cached"] = json!(true);
+    }
+    value
 }
 
-/// One status line on stderr for the video in work, when stderr is a terminal.
-struct Progress {
-    name: String,
+/// What a run shows while it goes: each clip's text (unless the output is JSON) and errors, in
+/// input order as soon as every earlier clip is done, and one status line on stderr, when it is a
+/// terminal, with how many clips are done and in work.
+struct Status {
+    total: usize,
+    print_text: bool,
+    terminal: bool,
+    /// The next clip (by input index) to print.
+    next: usize,
+    /// Finished clips waiting for an earlier one.
+    finished: BTreeMap<usize, (PathBuf, ClipOutcome)>,
+    /// Clips in work, and where each one is.
+    in_work: BTreeMap<usize, (String, Option<Stage>)>,
     shown: bool,
 }
 
-impl Progress {
-    fn new(video: &Path) -> Self {
+impl Status {
+    fn new(total: usize, print_text: bool) -> Self {
         Self {
-            name: video.file_name().map_or_else(
-                || video.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            ),
-            shown: std::io::stderr().is_terminal(),
+            total,
+            print_text,
+            terminal: std::io::stderr().is_terminal(),
+            next: 0,
+            finished: BTreeMap::new(),
+            in_work: BTreeMap::new(),
+            shown: false,
         }
     }
 
-    fn show(&self, stage: Stage) {
-        if !self.shown {
+    /// `event` of the run over the videos from `offset` on.
+    fn on_event(&mut self, offset: usize, event: FolderEvent<'_>) {
+        match event {
+            FolderEvent::Started { index, video } => {
+                self.in_work
+                    .insert(offset + index, (file_name(video), None));
+            }
+            FolderEvent::Stage { index, stage, .. } => {
+                if let Some((_, at)) = self.in_work.get_mut(&(offset + index)) {
+                    *at = Some(stage);
+                }
+            }
+            FolderEvent::Warning { video, message, .. } => {
+                self.clear();
+                eprintln!("warning: {}: {message}", video.display());
+            }
+            FolderEvent::Finished {
+                index,
+                video,
+                outcome,
+            } => {
+                self.in_work.remove(&(offset + index));
+                self.finished
+                    .insert(offset + index, (video.to_path_buf(), outcome.clone()));
+                self.print_ready();
+            }
+        }
+        self.show();
+    }
+
+    /// Print every finished clip no earlier clip is still waiting for.
+    fn print_ready(&mut self) {
+        while let Some((video, outcome)) = self.finished.remove(&self.next) {
+            self.clear();
+            match &outcome {
+                ClipOutcome::Described(record) | ClipOutcome::Cached(record) => {
+                    if self.print_text {
+                        let cached = matches!(outcome, ClipOutcome::Cached(_));
+                        print_clip(&video, record, cached);
+                    }
+                }
+                ClipOutcome::Failed(Error::Cancelled) => {
+                    eprintln!("cancelled: {}", video.display());
+                }
+                ClipOutcome::Failed(e) => {
+                    // A rejected key or an empty balance, which would fail every video left the
+                    // same way, is said once at the end (`Stop::Job`).
+                    eprintln!("error: {}: {e}", video.display());
+                }
+                ClipOutcome::OverBudget => {
+                    eprintln!("not sent (over --max-cost): {}", video.display());
+                }
+                ClipOutcome::NotStarted => {}
+            }
+            self.next += 1;
+        }
+    }
+
+    fn show(&mut self) {
+        let Some((name, stage)) = self.in_work.values().next() else {
+            self.clear();
+            return;
+        };
+        if !self.terminal {
             return;
         }
-        let status = match stage {
-            Stage::Frame { done, total } => format!("frame {} of {total}", done + 1),
-            Stage::Asking => "waiting for Claude".to_string(),
+        let at = match stage {
+            None => "starting".to_string(),
+            Some(Stage::Frame { done, total }) => format!("frame {} of {total}", done + 1),
+            Some(Stage::Asking) => "waiting for the answer".to_string(),
         };
-        eprint!("\r{}: {status}\x1b[K", self.name);
+        let others = match self.in_work.len() - 1 {
+            0 => String::new(),
+            n => format!(" (+{n} in work)"),
+        };
+        eprint!(
+            "\r[{} of {} done] {name}: {at}{others}\x1b[K",
+            self.next + self.finished.len(),
+            self.total
+        );
+        self.shown = true;
     }
 
-    fn clear(&self) {
+    fn clear(&mut self) {
         if self.shown {
             eprint!("\r\x1b[K");
+            self.shown = false;
         }
     }
+}
+
+fn file_name(video: &Path) -> String {
+    video.file_name().map_or_else(
+        || video.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clipscribe::{Description, Segment, TagRange, TagSuggestion, TagSuggestions};
+    use clipscribe::{
+        CacheKey, DescribedClip, Description, FileIdentity, FrameFingerprint, Segment, TagRange,
+        TagSuggestion, TagSuggestions,
+    };
 
-    fn sample() -> DescribedWithTags {
-        DescribedWithTags {
-            description: Description {
-                summary: "Two hikers reach a viewpoint over a valley with goats grazing below."
-                    .to_string(),
-                segments: vec![Segment {
-                    start_s: 12.0,
-                    end_s: 20.0,
-                    description: "A herd of goats crosses the path in front of the hikers."
+    fn sample() -> ClipRecord {
+        ClipRecord {
+            file: PathBuf::from("hike.mp4"),
+            key: CacheKey {
+                identity: FileIdentity {
+                    size: 1,
+                    modified_ns: 2,
+                    sample_hash: 3,
+                },
+                settings: "model=claude-haiku-4-5".to_string(),
+            },
+            model: MODELS[0].id.to_string(),
+            clip: DescribedClip {
+                description: Description {
+                    summary: "Two hikers reach a viewpoint over a valley with goats grazing below."
                         .to_string(),
-                }],
+                    segments: vec![Segment {
+                        start_s: 12.0,
+                        end_s: 20.0,
+                        description: "A herd of goats crosses the path in front of the hikers."
+                            .to_string(),
+                    }],
+                },
+                tags: Some(TagSuggestions {
+                    tags: vec![
+                        TagSuggestion {
+                            name: "Goat".to_string(),
+                            confidence: 0.95,
+                            ranges: vec![TagRange {
+                                start_s: 12.0,
+                                end_s: 20.0,
+                            }],
+                        },
+                        TagSuggestion {
+                            name: "Outdoor".to_string(),
+                            confidence: 0.8,
+                            ranges: vec![],
+                        },
+                    ],
+                    new_tag_ideas: vec!["Hiking trail".to_string()],
+                }),
+                usage: AiUsage {
+                    input_tokens: 3965,
+                    output_tokens: 210,
+                },
+                duration_s: 30.0,
+                frames: (0..16)
+                    .map(|i| FrameFingerprint {
+                        time_s: f64::from(i) * 2.0,
+                        fingerprint: vec![0; 64],
+                    })
+                    .collect(),
             },
-            tags: TagSuggestions {
-                tags: vec![
-                    TagSuggestion {
-                        name: "Goat".to_string(),
-                        confidence: 0.95,
-                        ranges: vec![TagRange {
-                            start_s: 12.0,
-                            end_s: 20.0,
-                        }],
-                    },
-                    TagSuggestion {
-                        name: "Outdoor".to_string(),
-                        confidence: 0.8,
-                        ranges: vec![],
-                    },
-                ],
-                new_tag_ideas: vec!["Hiking trail".to_string()],
-            },
-            usage: AiUsage {
-                input_tokens: 3965,
-                output_tokens: 210,
-            },
-            duration_s: 30.0,
-            frames: 16,
         }
     }
 
-    /// Printed with `cargo test print_text_with_tags -- --nocapture`, for the PR's sample output:
-    /// no live API key is needed since this exercises the CLI's own formatting, not a real answer.
+    /// The same clip without a vocabulary: no tags.
+    fn sample_without_tags() -> ClipRecord {
+        let mut record = sample();
+        record.clip.tags = None;
+        record
+    }
+
+    /// Printed with `cargo test print_clip -- --nocapture`, for the PR's sample output: no live
+    /// API key is needed since this exercises the CLI's own formatting, not a real answer.
     #[test]
-    fn print_text_with_tags_shows_the_summary_segments_tags_and_ideas() {
-        print_text_with_tags(Path::new("hike.mp4"), &sample(), MODELS[0]);
+    fn print_clip_shows_the_summary_segments_tags_and_ideas() {
+        print_clip(Path::new("hike.mp4"), &sample(), false);
+        print_clip(Path::new("hike.mp4"), &sample_without_tags(), true);
     }
 
     fn sample_moment() -> DescribedMoment {
@@ -856,17 +1078,153 @@ mod tests {
     }
 
     #[test]
-    fn to_json_with_tags_carries_the_tags_and_new_tag_ideas_fields() {
-        let json = to_json_with_tags(Path::new("hike.mp4"), &sample(), MODELS[0]);
+    fn clip_to_json_carries_the_tags_and_new_tag_ideas_fields() {
+        let json = clip_to_json(Path::new("hike.mp4"), &sample(), false, None);
+        assert_eq!(json["frames"], 16);
         assert_eq!(json["tags"][0]["name"], "Goat");
         assert_eq!(json["tags"][0]["ranges"][0]["start_s"], 12.0);
         assert_eq!(json["tags"][1]["name"], "Outdoor");
         assert!(json["tags"][1]["ranges"].as_array().unwrap().is_empty());
         assert_eq!(json["new_tag_ideas"], json!(["Hiking trail"]));
-        // Unchanged from plain `to_json`, so existing `--json` consumers without `--tags` see no
-        // difference: only videos run with `--tags` get these extra fields at all.
         assert!(json.get("summary").is_some());
         assert!(json.get("moments").is_some());
+        assert!(
+            json.get("cached").is_none(),
+            "only on a clip from the cache"
+        );
+        assert!(json.get("group").is_none(), "only with --groups");
+    }
+
+    /// Without --tags, --groups or the cache, a clip's JSON has exactly the fields it had before
+    /// folder runs, so existing scripts see no difference.
+    #[test]
+    fn clip_to_json_without_tags_groups_or_cache_keeps_the_old_fields() {
+        let json = clip_to_json(Path::new("hike.mp4"), &sample_without_tags(), false, None);
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "cost_usd",
+                "duration_s",
+                "file",
+                "frames",
+                "model",
+                "moments",
+                "summary",
+                "usage"
+            ]
+        );
+        let cached = clip_to_json(Path::new("hike.mp4"), &sample_without_tags(), true, None);
+        assert_eq!(cached["cached"], true);
+    }
+
+    /// Printed with `cargo test clip_to_json_with_groups -- --nocapture`, for the PR's
+    /// `--groups --json` sample output.
+    #[test]
+    fn clip_to_json_with_groups_adds_the_group_its_label_stretches_and_moment_groups() {
+        let record = sample_without_tags();
+        let grouping = group_clips(&[&record.clip]);
+        let json = clip_to_json(
+            Path::new("hike.mp4"),
+            &record,
+            false,
+            Some((&grouping, &grouping.clips[0])),
+        );
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        assert_eq!(json["group"], 1);
+        assert_eq!(json["group_label"], grouping.groups[0].label);
+        assert_eq!(json["stretches"][0]["group"], 1);
+        assert_eq!(json["stretches"][0]["start_s"], 0.0);
+        assert_eq!(json["stretches"][0]["end_s"], 30.0);
+        assert_eq!(json["moments"][0]["group"], 1);
+    }
+
+    /// Printed with `cargo test print_groups -- --nocapture`, for the PR's `--groups` sample
+    /// output: two clips of one scene (the second a brighter take) and a third of another.
+    #[test]
+    fn print_groups_lists_each_group_with_its_footage() {
+        let mut hike = sample_without_tags();
+        hike.clip.description.summary = "A black screen.".to_string();
+        let mut retake = sample_without_tags();
+        retake.clip.description.summary = "A trail winds up a hillside in the evening.".to_string();
+        for frame in &mut retake.clip.frames {
+            frame.fingerprint = (0..64).map(|i| 40 + (i % 8) * 20).collect();
+        }
+        let mut again = retake.clone();
+        for frame in &mut again.clip.frames {
+            frame.fingerprint.iter_mut().for_each(|v| *v += 30);
+        }
+        again.clip.description.summary = "The same trail again, in brighter light.".to_string();
+        let grouping = group_clips(&[&retake.clip, &hike.clip, &again.clip]);
+        let videos = [
+            Path::new("trail-1.mp4"),
+            Path::new("black.mp4"),
+            Path::new("trail-2.mp4"),
+        ];
+        print_groups(&videos, &grouping);
+        let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
+        assert_eq!(ids, [1, 2, 1]);
+    }
+
+    #[test]
+    fn a_cache_per_folder_unless_a_directory_is_given_or_nothing_is_cached() {
+        let videos: Vec<PathBuf> = ["a/1.mp4", "a/2.mp4", "b/3.mp4", "a/4.mp4", "5.mp4"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(batches_by_cache(&videos, false, None), vec![(None, 0..5)]);
+        assert_eq!(
+            batches_by_cache(&videos, true, Some(Path::new("caches"))),
+            vec![(Some(cache_path(Path::new("caches"), None)), 0..5)]
+        );
+        let per_folder = batches_by_cache(&videos, true, None);
+        let expected = [("a", 0..2), ("b", 2..3), ("a", 3..4), (".", 4..5)];
+        assert_eq!(per_folder.len(), expected.len(), "{per_folder:?}");
+        for ((path, range), (folder, want)) in per_folder.iter().zip(expected) {
+            assert_eq!(
+                path.as_deref(),
+                Some(cache_path(Path::new(folder), None).as_path())
+            );
+            assert_eq!(*range, want);
+        }
+    }
+
+    #[test]
+    fn parse_cost_takes_dollars_above_zero() {
+        assert_eq!(parse_cost("5"), Ok(5.0));
+        assert_eq!(parse_cost("$0.50"), Ok(0.5));
+        assert!(parse_cost("0").is_err());
+        assert!(parse_cost("-1").is_err());
+        assert!(parse_cost("lots").is_err());
+        assert!(parse_cost("inf").is_err());
+    }
+
+    #[test]
+    fn the_command_line_is_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let parse = |args: &[&str]| Cli::try_parse_from([&["clipscribe"], args].concat());
+        let cli = parse(&["footage/", "--resume", "--groups", "--json"]).expect("the issue's");
+        assert!(cli.resume && cli.groups && cli.json);
+        assert_eq!(usize::from(cli.jobs), DEFAULT_JOBS);
+        assert!(
+            parse(&["a.mp4", "--resume", "--force"]).is_err(),
+            "one or the other"
+        );
+        assert!(
+            parse(&["a.mp4", "--cache-dir", "c"]).is_err(),
+            "a cache needs --resume/--force"
+        );
+        assert!(parse(&["a.mp4", "--force", "--cache-dir", "c"]).is_ok());
+        assert!(parse(&["a.mp4", "--jobs", "0"]).is_err());
+        assert!(parse(&["a.mp4", "--at", "5", "--groups"]).is_err());
+        assert!(parse(&["a.mp4", "--estimate", "--max-cost", "1"]).is_err());
     }
 
     #[test]

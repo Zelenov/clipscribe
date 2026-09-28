@@ -425,7 +425,8 @@ mod tests {
 
     /// A fresh directory under the system's temp dir, removed by the caller.
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("clipscribe-cache-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("clipscribe-cache-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         dir
@@ -504,7 +505,9 @@ mod tests {
         assert_eq!(FileIdentity::of(&renamed).expect("renamed"), first);
 
         // Same size, same time, different bytes: only the sample hash tells them apart.
-        let modified = std::fs::metadata(&renamed).and_then(|m| m.modified()).expect("mtime");
+        let modified = std::fs::metadata(&renamed)
+            .and_then(|m| m.modified())
+            .expect("mtime");
         std::fs::write(&renamed, vec![8u8; 1000]).expect("rewrite");
         File::options()
             .write(true)
@@ -587,10 +590,16 @@ mod tests {
             assert_eq!(variant.identity, base.identity);
             assert_ne!(variant.settings, base.settings);
         }
-        std::fs::write(dir.join("clip.srt"), "1\n00:00:01,000 --> 00:00:02,000\nHi\n")
-            .expect("srt");
+        std::fs::write(
+            dir.join("clip.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+        )
+        .expect("srt");
         let with_srt = CacheKey::new(&video, &options(), None, true).expect("key");
-        assert_ne!(with_srt.settings, base.settings, "the subtitles are part of it");
+        assert_ne!(
+            with_srt.settings, base.settings,
+            "the subtitles are part of it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -625,7 +634,11 @@ mod tests {
             settings: "model=claude-opus-5 language=en".to_string(),
             ..stored.key.clone()
         };
-        assert_eq!(cache.get(&other_settings), None, "same file, other settings");
+        assert_eq!(
+            cache.get(&other_settings),
+            None,
+            "same file, other settings"
+        );
         let other_file = CacheKey {
             identity: identity(2),
             ..stored.key.clone()
@@ -683,14 +696,29 @@ mod tests {
         let new = record(identity(1), "New.");
         cache.put(&old).expect("put");
         cache.put(&new).expect("put");
-        assert_eq!(cache.get(&new.key).map(|r| r.clip.description.summary), Some("New.".to_string()));
+        assert_eq!(
+            cache.get(&new.key).map(|r| r.clip.description.summary),
+            Some("New.".to_string())
+        );
         drop(cache);
-        assert_eq!(std::fs::read_to_string(&path).expect("read").lines().count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .count(),
+            2
+        );
 
         let reopened = Cache::open(&path).expect("reopen");
         assert_eq!(reopened.get(&new.key), Some(new));
         drop(reopened);
-        assert_eq!(std::fs::read_to_string(&path).expect("read").lines().count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -703,7 +731,10 @@ mod tests {
         let cache = Cache::open(&path).expect("open");
         assert!(cache.is_empty());
         drop(cache);
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), format!("{newer}\n"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            format!("{newer}\n")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

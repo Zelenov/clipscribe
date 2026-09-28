@@ -29,6 +29,10 @@
 //! Everything blocks: call it from a worker thread. Without the default `frames` feature the
 //! crate has no GStreamer dependency and no [`describe`]; the models, the request, the answer,
 //! the estimate and the Anthropic client remain.
+//!
+//! Whole folders: [`describe_folder`] describes many clips with several in flight, skipping those
+//! a [`Cache`] already has and stopping within a [`Budget`]; [`group_clips`] groups similar
+//! footage. See `docs/design/whole-folders.md`.
 
 pub mod anthropic;
 mod cache;

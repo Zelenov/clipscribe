@@ -50,6 +50,7 @@ impl OpenAi {
     }
 
     /// This client, pausing together with every other client sharing `gate`.
+    #[cfg(feature = "frames")]
     pub(crate) fn with_rate_gate(mut self, gate: std::sync::Arc<provider::RateGate>) -> Self {
         self.gate = Some(gate);
         self
