@@ -1,4 +1,4 @@
-# NEXT
+# 0.3.0
 ## Added
 - Tag suggestions: `--tags tags.txt` (library: `describe_with_tags`, or `suggest_tags` for a clip
   already described) matches a clip against a closed vocabulary of tags, one per line
