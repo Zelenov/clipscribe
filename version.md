@@ -1,4 +1,4 @@
-# NEXT
+# 0.5.0
 ## Added
 - ChatGPT (OpenAI) as a second provider: `--provider anthropic|openai` (default `anthropic`)
   picks the AI service; `--model` gains `gpt-4.1-mini` (the OpenAI default) and `gpt-4.1`, and
