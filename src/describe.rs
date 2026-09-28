@@ -59,6 +59,9 @@ pub const FRAME_LONG_SIDE: u32 = 512;
 const INSTRUCTION_TOKENS: u64 = 600;
 /// Characters of subtitle text per token, for the estimate.
 const CHARS_PER_TOKEN: f64 = 3.5;
+/// In [`MomentsMode::Important`], a segment spanning at least this fraction of the clip is
+/// dropped: that is the summary's job, not a segment's.
+const WHOLE_CLIP_FRACTION: f64 = 0.9;
 
 /// A model, its prices and how it is asked.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -418,25 +421,28 @@ pub fn build_request(
     let has_subtitles = !subtitles.is_empty();
     let moments_instruction = match moments {
         MomentsMode::Important => format!(
-            "Then, at most {} segments (start_s and end_s in seconds, inside 0–{:.0}) for \
-             whatever is worth a video editor's attention on its own, in one short sentence \
-             each with the key details (place, action, camera, people, objects, on-screen \
-             text). An empty list is the right answer when nothing stands out: a static shot, \
-             someone talking to camera, or walking while talking, with nothing changing. A \
-             small or vague change is not a segment. Add a segment for a stretch that clearly \
-             stands out from the rest of the clip (an event, a different activity, something \
-             unexpected), and for each part when the clip is made of clearly different parts \
-             (a different place, look, shot type or activity) — the editor needs the cut \
-             points. Never a segment that covers the whole clip: that is what the summary is \
-             for.",
+            "Answer with a one-sentence summary of the whole clip. Then, at most {} segments \
+             (start_s and end_s in seconds, inside 0–{:.0}) for whatever is worth a video \
+             editor's attention on its own, in one short sentence each with the key details \
+             (place, action, camera, people, objects, on-screen text). An empty list is the \
+             right answer when nothing stands out: a static shot, someone talking to camera, or \
+             walking while talking, with nothing changing. A small or vague change is not a \
+             segment. Add a segment for a stretch that clearly stands out from the rest of the \
+             clip (an event, a different activity, something unexpected), and for each part \
+             when the clip is made of clearly different parts (a different place, look, shot \
+             type or activity) — the editor needs the cut points. Never a segment that covers \
+             the whole clip: that is what the summary is for.",
             max_segments(duration_s),
             duration_s,
         ),
+        // Byte-for-byte the original wording (before this mode existed): every existing caller
+        // that asks for `Full` gets exactly the same request it always did.
         MomentsMode::Full => format!(
-            "Then at most {} segments: consecutive stretches of the clip (start_s and end_s in \
-             seconds, inside 0–{:.0}) with what happens in each, in one short sentence with the \
-             key details (place, action, camera, people, objects, on-screen text). Merge \
-             stretches where nothing changes.",
+            "Answer with a one-sentence summary of the whole clip, then at most {} segments: \
+             consecutive stretches of the clip (start_s and end_s in seconds, inside 0–{:.0}) \
+             with what happens in each, in one short sentence with the key details (place, \
+             action, camera, people, objects, on-screen text). Merge stretches where nothing \
+             changes.",
             max_segments(duration_s),
             duration_s,
         ),
@@ -444,7 +450,7 @@ pub fn build_request(
     let mut instructions = format!(
         "You describe a video clip for a video editor who has not watched it. It is {} long. \
          You get frames sampled from it, each preceded by its time as t=m:ss{}.\n\
-         Answer with a one-sentence summary of the whole clip. {moments_instruction}\n\
+         {moments_instruction}\n\
          Stay factual: describe only what is seen and said. Do not guess who people are.\n{}",
         format_time(duration_s),
         if has_subtitles {
@@ -526,8 +532,10 @@ pub fn parse_answer(
         .unwrap_or_default();
     segments.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
     if moments == MomentsMode::Important {
-        segments.retain(|s| (s.end_s - s.start_s) < 0.9 * duration_s);
+        // Merge first: two tiles that individually pass the whole-clip check can merge into one
+        // that would not, so the check must see the merged result, never the other way round.
         segments = merge_same_description(segments);
+        segments.retain(|s| (s.end_s - s.start_s) < WHOLE_CLIP_FRACTION * duration_s);
     }
     segments.truncate(max_segments(duration_s));
     Ok(Description {
@@ -813,6 +821,35 @@ mod tests {
         assert!(!instructions.contains("An empty list is the right answer"));
     }
 
+    /// `Full` exists so a caller can keep exactly today's request; pinned with an exact string
+    /// comparison (not `.contains`) so a future edit to the shared preamble can't silently
+    /// reword it, as an earlier draft of this mode did.
+    #[test]
+    fn full_mode_is_byte_for_byte_the_original_wording() {
+        let request = build_request(
+            MODELS[0],
+            &[],
+            &[],
+            30.0,
+            SummaryLanguage::English,
+            MomentsMode::Full,
+        );
+        let AiContent::Text(instructions) = &request.content[0] else {
+            panic!("instructions first");
+        };
+        assert_eq!(
+            instructions,
+            "You describe a video clip for a video editor who has not watched it. It is 0:30 \
+             long. You get frames sampled from it, each preceded by its time as t=m:ss.\n\
+             Answer with a one-sentence summary of the whole clip, then at most 3 segments: \
+             consecutive stretches of the clip (start_s and end_s in seconds, inside 0–30) with \
+             what happens in each, in one short sentence with the key details (place, action, \
+             camera, people, objects, on-screen text). Merge stretches where nothing changes.\n\
+             Stay factual: describe only what is seen and said. Do not guess who people are.\n\
+             Write in English."
+        );
+    }
+
     #[test]
     fn invalid_segments_are_dropped_and_the_rest_sorted() {
         let answer = json!({"summary": " A walk. ", "segments": [
@@ -870,6 +907,62 @@ mod tests {
         let d = parse_answer(&response(answer, "end_turn"), 30.0, MomentsMode::Full)
             .expect("description");
         assert_eq!(d.segments.len(), 1, "full mode keeps it");
+    }
+
+    /// The strict `<` in the whole-clip check: a segment at exactly the threshold is dropped
+    /// (the issue says "≥ 90%"), one just under it is kept.
+    #[test]
+    fn the_whole_clip_threshold_is_inclusive_at_exactly_90_percent() {
+        let at_threshold = json!({"summary": "A walk.", "segments": [
+            {"start_s": 0.0, "end_s": 27.0, "description": "Exactly 90% of 30s"}
+        ]});
+        let d = parse_answer(
+            &response(at_threshold, "end_turn"),
+            30.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert!(d.segments.is_empty(), "{:?}", d.segments);
+
+        let just_under = json!({"summary": "A walk.", "segments": [
+            {"start_s": 0.0, "end_s": 26.9, "description": "Just under 90% of 30s"}
+        ]});
+        let d = parse_answer(
+            &response(just_under, "end_turn"),
+            30.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert_eq!(d.segments.len(), 1, "{:?}", d.segments);
+    }
+
+    /// The bug round 1's correctness review found: two tiles that individually pass the
+    /// whole-clip check can merge into one that would not — the check must see the merged
+    /// result, not run before merging.
+    #[test]
+    fn important_mode_drops_a_whole_clip_segment_formed_by_merging_two_tiles() {
+        let answer = json!({"summary": "A market street.", "segments": [
+            {"start_s": 0.0, "end_s": 16.0, "description": "People walk through the market."},
+            {"start_s": 16.0, "end_s": 29.0, "description": "people walk through the market."}
+        ]});
+        let d = parse_answer(&response(answer, "end_turn"), 30.0, MomentsMode::Important)
+            .expect("description");
+        assert!(d.segments.is_empty(), "got {:?}", d.segments);
+    }
+
+    #[test]
+    fn important_mode_merges_three_or_more_adjacent_segments_with_the_same_description() {
+        let answer = json!({"summary": "A walk.", "segments": [
+            {"start_s": 0.0, "end_s": 3.0, "description": "A dog runs by."},
+            {"start_s": 3.0, "end_s": 6.0, "description": "A dog runs by."},
+            {"start_s": 6.0, "end_s": 9.0, "description": "A dog runs by."},
+            {"start_s": 20.0, "end_s": 25.0, "description": "A cat sleeps."}
+        ]});
+        let d = parse_answer(&response(answer, "end_turn"), 30.0, MomentsMode::Important)
+            .expect("description");
+        assert_eq!(d.segments.len(), 2, "{:?}", d.segments);
+        assert_eq!(d.segments[0].start_s, 0.0);
+        assert_eq!(d.segments[0].end_s, 9.0, "all three merged into one");
     }
 
     #[test]
