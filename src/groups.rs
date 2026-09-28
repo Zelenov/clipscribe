@@ -17,7 +17,7 @@ const CUT_STRUCTURE: f64 = 0.5;
 /// ...and their level of light by more than this (mean absolute difference, 0.0–1.0).
 const CUT_LEVEL: f64 = 0.05;
 /// Two stretches closer than this (`1 − r`, over the four rotations) show the same scene.
-const SAME_SCENE: f64 = 0.2;
+pub(crate) const SAME_SCENE: f64 = 0.2;
 /// A description segment names a stretch when it covers at least this fraction of it.
 const LABEL_COVERAGE: f64 = 0.5;
 
@@ -26,7 +26,9 @@ const LABEL_COVERAGE: f64 = 0.5;
 pub struct Grouping {
     /// Every group, ordered by id.
     pub groups: Vec<Group>,
-    /// One per clip given to [`group_clips`], in the same order.
+    /// One per clip given to [`group_clips`], in the same order: `clips[n]` is the `n`th clip of
+    /// the slice passed in. When that slice was filtered (say, only the described clips of a
+    /// [`crate::FolderRun`]), keep the original index of each clip next to it to find its video.
     pub clips: Vec<ClipGroups>,
 }
 
@@ -65,8 +67,11 @@ pub struct ClipGroups {
 /// A stretch of a clip between two cuts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stretch {
+    /// Where it starts, in seconds from the start of the clip.
     pub start_s: f64,
+    /// Where it ends, in seconds from the start of the clip.
     pub end_s: f64,
+    /// The [`Group::id`] it belongs to.
     pub group: usize,
 }
 
@@ -201,6 +206,23 @@ pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
         .collect();
 
     Grouping { groups, clips }
+}
+
+/// The distance [`group_clips`] would join `a` and `b` by: the smallest [`scene_distance`] between
+/// a stretch of one and a stretch of the other (`None` when either has no stretch with a
+/// signature). For measuring the thresholds on real clips.
+#[cfg(test)]
+pub(crate) fn clip_distance(a: &DescribedClip, b: &DescribedClip) -> Option<f64> {
+    let signatures = |clip: &DescribedClip| -> Vec<Vec<f64>> {
+        stretches_of(clip)
+            .into_iter()
+            .filter_map(|(_, _, signature)| signature)
+            .collect()
+    };
+    let (a, b) = (signatures(a), signatures(b));
+    a.iter()
+        .flat_map(|x| b.iter().map(move |y| scene_distance(x, y)))
+        .min_by(f64::total_cmp)
 }
 
 /// The group covering most of a clip's stretches' time; the lowest id on a tie.

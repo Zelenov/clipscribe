@@ -8,10 +8,11 @@
 //! [`crate::CacheKey`], [`crate::Cache`], [`describe_clip`] and [`Budget`].
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use crate::describe::{frame_tokens, Description, Model, FRAME_LONG_SIDE};
-use crate::provider::{AiContent, AiRequest, AiUsage};
+use crate::provider::{AiContent, AiRequest, AiUsage, Provider};
 use crate::tags::{Tag, TagSuggestions};
 
 /// Extensions of the files a folder contributes (compared without regard to case).
@@ -56,7 +57,7 @@ pub fn find_videos(inputs: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
 }
 
 /// Whether `path` has one of [`VIDEO_EXTENSIONS`].
-pub fn is_video(path: &Path) -> bool {
+pub(crate) fn is_video(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
@@ -66,7 +67,9 @@ pub fn is_video(path: &Path) -> bool {
 /// packed) of the upright frame, what [`crate::group_clips`] compares.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameFingerprint {
+    /// Where the frame is in the clip, in seconds from its start.
     pub time_s: f64,
+    /// 64 bytes: the average luma (0–255) of each cell of an 8×8 grid, row by row.
     pub fingerprint: Vec<u8>,
 }
 
@@ -75,29 +78,50 @@ pub struct FrameFingerprint {
 /// from, for grouping.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DescribedClip {
+    /// The summary and the moments, as [`crate::describe`] gives them.
     pub description: Description,
     /// Tag suggestions, when a vocabulary was given.
     pub tags: Option<TagSuggestions>,
     /// What the request was billed for; see [`Model::cost_usd`].
     pub usage: AiUsage,
+    /// The clip's length, in seconds.
     pub duration_s: f64,
     /// One per frame sent, in time order.
     pub frames: Vec<FrameFingerprint>,
 }
 
 /// A spending cap shared by the requests of a run: what has been spent, plus what the requests in
-/// flight could still cost. See [`Budget::reserve`].
+/// flight could still cost. See [`Budget::reserve`] and [`Budget::reserve_or_wait`].
 #[derive(Debug, Default)]
 pub struct Budget {
     max_usd: Option<f64>,
     state: Mutex<Spending>,
+    /// Signalled whenever a reservation is settled or released, for [`Budget::reserve_or_wait`].
+    changed: Condvar,
 }
 
 #[derive(Debug, Default)]
 struct Spending {
     spent: f64,
     reserved: f64,
+    /// How many times [`Budget::reserve_or_wait`] had to wait for other reservations to settle.
+    waits: usize,
 }
+
+/// What [`Budget::reserve_or_wait`] got.
+#[derive(Debug)]
+pub enum Reserved<'a> {
+    /// The money is set aside: send the request.
+    Yes(Reservation<'a>),
+    /// Even with nothing else in flight, what is spent and this request could pass the cap: do not
+    /// send it.
+    OverBudget,
+    /// `cancel` was set while waiting for other requests to settle.
+    Cancelled,
+}
+
+/// How often [`Budget::reserve_or_wait`] looks at the cancel flag while it waits.
+const CANCEL_CHECK: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl Budget {
     /// A budget of at most `max_usd` US dollars; `None` is no cap (spending is still counted).
@@ -105,9 +129,11 @@ impl Budget {
         Self {
             max_usd,
             state: Mutex::default(),
+            changed: Condvar::new(),
         }
     }
 
+    /// The cap in US dollars; `None` when there is none.
     pub fn max_usd(&self) -> Option<f64> {
         self.max_usd
     }
@@ -119,8 +145,9 @@ impl Budget {
 
     /// Set aside `usd` for a request about to be sent, or `None` when what is spent, what is set
     /// aside for other requests and `usd` together would pass the cap: then the request must not be
-    /// sent. The reservation is released when dropped, or replaced by what the request really cost
-    /// with [`Reservation::settle`].
+    /// sent now. Never waits; see [`Budget::reserve_or_wait`] for a request that should wait for
+    /// the others in flight instead. The reservation is released when dropped, or replaced by what
+    /// the request really cost with [`Reservation::settle`].
     pub fn reserve(&self, usd: f64) -> Option<Reservation<'_>> {
         let usd = usd.max(0.0);
         let mut state = self.lock();
@@ -130,11 +157,59 @@ impl Budget {
             }
         }
         state.reserved += usd;
-        Some(Reservation {
+        Some(self.reservation(usd))
+    }
+
+    /// Set aside `usd` for a request about to be sent, like [`Budget::reserve`], but when it does
+    /// not fit only because of what other requests in flight have set aside, wait for them to
+    /// settle (they usually cost a fraction of their reservation) and try again.
+    /// [`Reserved::OverBudget`] only when what is already spent plus `usd` alone would pass the
+    /// cap. Checks `cancel` while it waits.
+    ///
+    /// A caller must not wait while holding a reservation of its own from this budget: only
+    /// reservations held by other threads can settle while it waits.
+    pub fn reserve_or_wait(&self, usd: f64, cancel: &AtomicBool) -> Reserved<'_> {
+        let usd = usd.max(0.0);
+        let mut state = self.lock();
+        let mut waited = false;
+        loop {
+            let fits = |state: &Spending, others: f64| {
+                self.max_usd
+                    .is_none_or(|max| state.spent + others + usd <= max)
+            };
+            if !fits(&state, 0.0) {
+                return Reserved::OverBudget;
+            }
+            if fits(&state, state.reserved) {
+                state.reserved += usd;
+                return Reserved::Yes(self.reservation(usd));
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Reserved::Cancelled;
+            }
+            if !waited {
+                waited = true;
+                state.waits += 1;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, CANCEL_CHECK)
+                .map_or_else(|e| e.into_inner().0, |(state, _)| state);
+        }
+    }
+
+    /// How many times [`Budget::reserve_or_wait`] waited for other requests to settle.
+    #[cfg(test)]
+    pub(crate) fn waits(&self) -> usize {
+        self.lock().waits
+    }
+
+    fn reservation(&self, usd: f64) -> Reservation<'_> {
+        Reservation {
             budget: self,
             usd,
             settled: false,
-        })
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Spending> {
@@ -162,6 +237,8 @@ impl Reservation<'_> {
         state.reserved = (state.reserved - self.usd).max(0.0);
         state.spent += actual_usd.max(0.0);
         self.settled = true;
+        drop(state);
+        self.budget.changed.notify_all();
     }
 }
 
@@ -170,12 +247,14 @@ impl Drop for Reservation<'_> {
         if !self.settled {
             let mut state = self.budget.lock();
             state.reserved = (state.reserved - self.usd).max(0.0);
+            drop(state);
+            self.budget.changed.notify_all();
         }
     }
 }
 
 /// The most `request` can cost with `model`, in US dollars, for [`Budget::reserve`]: every image
-/// at its real size ([`frame_tokens`]; a JPEG whose size cannot be read counts as a
+/// at its real size (see [`image_tokens_bound`]; a JPEG whose size cannot be read counts as a
 /// [`FRAME_LONG_SIDE`] square), the text at 3.5 bytes a token, the provider's own additions, 10 %
 /// on top, and the answer at the request's `max_tokens` — the most it can be billed for.
 pub fn request_cost_bound(model: Model, request: &AiRequest) -> f64 {
@@ -186,7 +265,7 @@ pub fn request_cost_bound(model: Model, request: &AiRequest) -> f64 {
             AiContent::Text(text) => text.len() as f64 / BYTES_PER_TOKEN,
             AiContent::Jpeg(jpeg) => {
                 let (w, h) = jpeg_size(jpeg).unwrap_or((FRAME_LONG_SIDE, FRAME_LONG_SIDE));
-                frame_tokens(w, h) as f64
+                image_tokens_bound(model.provider, w, h) as f64
             }
         })
         .sum();
@@ -196,6 +275,21 @@ pub fn request_cost_bound(model: Model, request: &AiRequest) -> f64 {
         input_tokens: input.ceil() as u64,
         output_tokens: u64::from(request.max_tokens),
     })
+}
+
+/// Input tokens a `width`×`height` image can be billed for by `provider`. Anthropic: one per 28×28
+/// tile ([`frame_tokens`]). OpenAI bills images differently depending on the model, so the larger
+/// of its two published schemes: 85 plus 170 per 512×512 tile (GPT-4.1), or one per 32×32 patch
+/// times 1.62 (GPT-4.1 mini) — a 512×288 frame is 255 tokens there, 209 with Anthropic.
+fn image_tokens_bound(provider: Provider, width: u32, height: u32) -> u64 {
+    match provider {
+        Provider::Anthropic => frame_tokens(width, height),
+        Provider::OpenAi => {
+            let tiles = u64::from(width.div_ceil(512)) * u64::from(height.div_ceil(512));
+            let patches = u64::from(width.div_ceil(32)) * u64::from(height.div_ceil(32));
+            (85 + 170 * tiles).max((patches as f64 * 1.62).ceil() as u64)
+        }
+    }
 }
 
 /// Width and height of a JPEG from its frame header (SOF marker), without decoding it.
@@ -262,8 +356,8 @@ pub enum ClipOutcome {
     Cached(crate::ClipRecord),
     /// Not described; [`crate::Error::Cancelled`] when the run was cancelled while it was in work.
     Failed(crate::Error),
-    /// Its frames were read, but sending the request could have passed the budget: nothing was
-    /// sent, and the run stopped starting new clips.
+    /// Its frames were read, but sending the request could have passed the budget even with no
+    /// other request in flight: nothing was sent, and the run stopped describing new clips.
     OverBudget,
     /// The run stopped before reaching it.
     NotStarted,
@@ -284,7 +378,7 @@ impl ClipOutcome {
 pub enum Stop {
     /// `cancel` was set.
     Cancelled,
-    /// The next request could have passed the budget.
+    /// The next request could have passed the budget, even with no other request in flight.
     OverBudget,
     /// An error that would fail every clip the same way (see [`crate::AiError::stops_job`]); its
     /// summary line.
@@ -321,7 +415,10 @@ pub enum FolderEvent<'a> {
         video: &'a Path,
         message: String,
     },
-    /// Done with it; the same outcome [`FolderRun::clips`] will hold.
+    /// Done with it; the same outcome [`FolderRun::clips`] will hold. Also sent, without a
+    /// `Started` before it, for each clip left [`ClipOutcome::NotStarted`] after the run stopped
+    /// for the budget or an error (not after a cancel), so a display showing clips in order can
+    /// move past it to the clips served from the cache after it.
     Finished {
         index: usize,
         video: &'a Path,
@@ -334,10 +431,32 @@ impl std::fmt::Display for Stop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cancelled => f.write_str("Cancelled."),
-            Self::OverBudget => f.write_str("Stopped: the next clip could pass the budget."),
+            Self::OverBudget => f.write_str(
+                "Stopped: the next video could take the run past its budget. Raise the budget to \
+                 describe the rest.",
+            ),
             Self::Job(summary) => f.write_str(summary),
         }
     }
+}
+
+/// What `cache` already has for `video` described with `options` and `run` (its vocabulary and
+/// subtitles setting): the same file with the same settings. Always `None` with `run.force`, and
+/// when the video cannot be read to tell its identity. Reads at most 192 KiB of the video (see
+/// [`crate::FileIdentity`]); nothing is sent. [`describe_folder`] serves these even after it has
+/// stopped for the budget or a rejected key, since they cost nothing.
+pub fn cached_clip(
+    video: &Path,
+    cache: &crate::Cache,
+    run: &RunOptions,
+    options: &crate::Options,
+) -> Option<crate::ClipRecord> {
+    if run.force {
+        return None;
+    }
+    let key =
+        crate::CacheKey::new(video, options, run.vocabulary.as_deref(), run.subtitles).ok()?;
+    cache.get(&key)
 }
 
 #[cfg(feature = "frames")]
@@ -350,21 +469,26 @@ mod run {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        request_cost_bound, Budget, ClipOutcome, DescribedClip, FolderEvent, FolderRun,
-        FrameFingerprint, RunOptions, Stop,
+        cached_clip, request_cost_bound, Budget, ClipOutcome, DescribedClip, FolderEvent,
+        FolderRun, FrameFingerprint, Reserved, RunOptions, Stop,
     };
     use crate::cache::{Cache, CacheKey, ClipRecord};
-    use crate::describe::{build_request, parse_answer};
-    use crate::provider::{AiError, AiProvider, AiUsage, RateGate};
+    use crate::describe::{build_request, parse_answer, Frame};
+    use crate::provider::{AiError, AiProvider, AiRequest, AiUsage, RateGate};
     use crate::tags::{build_combined_request, parse_combined_answer, Tag};
     use crate::{srt, Cue, Error, Options, Stage};
 
     /// Describe the clip at `video` like [`crate::describe`] (or [`crate::describe_with_tags`]
     /// when `vocabulary` is given), keeping its frames' fingerprints for [`crate::group_clips`],
     /// within `budget`: once its frames are read, the request's upper bound
-    /// ([`super::request_cost_bound`]) is reserved first, and `Ok(None)` means it did not fit, so
-    /// nothing was sent. A timeout counts its whole bound as spent (it may have been billed); any
-    /// other failure spends nothing but a bad answer's usage.
+    /// ([`super::request_cost_bound`]) is reserved first ([`Budget::reserve_or_wait`]: waiting
+    /// for other requests in flight on the same budget to settle when only they are in the way),
+    /// and `Ok(None)` means it could not fit even then, so nothing was sent. A timeout counts its
+    /// whole bound as spent (it may have been billed); any other failure spends nothing but a bad
+    /// answer's usage.
+    ///
+    /// [`crate::describe`] and [`crate::describe_with_tags`] are this with a budget without a
+    /// cap: one clip is always asked for the same way.
     pub fn describe_clip(
         video: &Path,
         subtitles: &[Cue],
@@ -382,6 +506,53 @@ mod run {
             cancel,
         };
         worker.describe(video, subtitles, vocabulary, on_stage)
+    }
+
+    /// A clip's frames, read, and the request made from them: everything before a request is sent.
+    pub(crate) struct Prepared {
+        pub(crate) duration_s: f64,
+        pub(crate) frames: Vec<Frame>,
+        pub(crate) fingerprints: Vec<Vec<u8>>,
+        pub(crate) request: AiRequest,
+    }
+
+    /// Read `video`'s frames and build the request describing it (with tag suggestions from
+    /// `vocabulary`, when given): the one place a whole-clip request is made.
+    pub(crate) fn prepare(
+        video: &Path,
+        subtitles: &[Cue],
+        vocabulary: Option<&[Tag]>,
+        options: &Options,
+        cancel: &AtomicBool,
+        on_stage: &mut impl FnMut(Stage),
+    ) -> Result<Prepared, Error> {
+        let (duration_s, frames, fingerprints) =
+            crate::read_frames(video, options.frame_sampling, cancel, on_stage)?;
+        let request = match vocabulary {
+            Some(vocabulary) => build_combined_request(
+                options.model,
+                &frames,
+                subtitles,
+                vocabulary,
+                duration_s,
+                options.language,
+                options.moments,
+            ),
+            None => build_request(
+                options.model,
+                &frames,
+                subtitles,
+                duration_s,
+                options.language,
+                options.moments,
+            ),
+        };
+        Ok(Prepared {
+            duration_s,
+            frames,
+            fingerprints,
+            request,
+        })
     }
 
     /// One clip's request, with a given client.
@@ -404,31 +575,29 @@ mod run {
                 return Err(Error::Cancelled);
             }
             let options = self.options;
-            let (duration_s, frames, fingerprints) =
-                crate::read_frames(video, options.frame_sampling, self.cancel, &mut on_stage)?;
-            let request = match vocabulary {
-                Some(vocabulary) => build_combined_request(
-                    options.model,
-                    &frames,
-                    subtitles,
-                    vocabulary,
-                    duration_s,
-                    options.language,
-                    options.moments,
-                ),
-                None => build_request(
-                    options.model,
-                    &frames,
-                    subtitles,
-                    duration_s,
-                    options.language,
-                    options.moments,
-                ),
-            };
+            let Prepared {
+                duration_s,
+                frames,
+                fingerprints,
+                request,
+            } = prepare(
+                video,
+                subtitles,
+                vocabulary,
+                options,
+                self.cancel,
+                &mut on_stage,
+            )?;
             let bound = request_cost_bound(options.model, &request);
-            let Some(reservation) = self.budget.reserve(bound) else {
-                return Ok(None);
+            let reservation = match self.budget.reserve_or_wait(bound, self.cancel) {
+                Reserved::Yes(reservation) => reservation,
+                Reserved::OverBudget => return Ok(None),
+                Reserved::Cancelled => return Err(Error::Cancelled),
             };
+            // The last moment a Ctrl+C can still save the money: the reservation is released.
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
             on_stage(Stage::Asking);
             let response = match self.provider.complete(&request, self.cancel) {
                 Ok(response) => response,
@@ -475,10 +644,14 @@ mod run {
     /// Each clip is looked up by its [`CacheKey`] (the file's identity and how it is described).
     /// A new result is written to the cache as soon as it is in, so a crash or a cancel loses at
     /// most the clips in flight. Every worker's client shares one pause: a 429 on one holds the
-    /// others back too. The run stops starting new clips when `cancel` is set, when the next
-    /// request could pass `budget` ([`ClipOutcome::OverBudget`]) or when an error would fail
-    /// every clip the same way (a rejected key, no credit); clips already in flight finish.
-    /// `on_event` follows along from the worker threads. Blocks until done.
+    /// others back too. A worker whose request does not fit `budget` only because of the others
+    /// in flight waits for them to settle. The run stops describing new clips when a request
+    /// could pass `budget` even with nothing else in flight ([`ClipOutcome::OverBudget`]) or when
+    /// an error would fail every clip the same way (a rejected key, no credit); clips already in
+    /// flight finish, and the clips left are still served from the cache when it has them
+    /// (nothing is sent for those), the others left [`ClipOutcome::NotStarted`]. `cancel` stops
+    /// at once: nothing more is taken up. `on_event` follows along from the worker threads.
+    /// Blocks until done.
     pub fn describe_folder(
         videos: &[PathBuf],
         cache: Option<&Cache>,
@@ -538,13 +711,34 @@ mod run {
                     scope.spawn(|| {
                         let provider = make_provider();
                         loop {
-                            if self.cancel.load(Ordering::Relaxed) || halt.load(Ordering::Relaxed) {
+                            if self.cancel.load(Ordering::Relaxed) {
                                 break;
                             }
                             let index = next.fetch_add(1, Ordering::Relaxed);
                             let Some(video) = videos.get(index) else {
                                 break;
                             };
+                            if halt.load(Ordering::Relaxed) {
+                                // Stopped: what the cache has costs nothing, the rest waits for
+                                // the next run.
+                                let outcome = self
+                                    .cache
+                                    .and_then(|cache| {
+                                        cached_clip(video, cache, self.run, self.options)
+                                    })
+                                    .map_or(ClipOutcome::NotStarted, ClipOutcome::Cached);
+                                if matches!(outcome, ClipOutcome::Cached(_)) {
+                                    on_event(FolderEvent::Started { index, video });
+                                }
+                                on_event(FolderEvent::Finished {
+                                    index,
+                                    video,
+                                    outcome: &outcome,
+                                });
+                                *outcomes[index].lock().unwrap_or_else(|e| e.into_inner()) =
+                                    outcome;
+                                continue;
+                            }
                             on_event(FolderEvent::Started { index, video });
                             let outcome = match &provider {
                                 Ok(provider) => self.one(index, video, provider.as_ref(), on_event),
@@ -773,17 +967,94 @@ mod tests {
     fn every_clip_is_counted_as_done_only_when_described_or_cached() {
         assert!(ClipOutcome::OverBudget.record().is_none());
         assert!(ClipOutcome::NotStarted.record().is_none());
-        assert_eq!(
-            Stop::OverBudget.to_string(),
-            "Stopped: the next clip could pass the budget."
+        assert!(
+            Stop::OverBudget.to_string().contains("Raise the budget"),
+            "says what to do"
         );
+    }
+
+    /// A request that does not fit only because of another one in flight waits for it to settle
+    /// (for much less than it set aside, as requests do) and then goes ahead; one that could not
+    /// fit even alone is over budget at once.
+    #[test]
+    fn a_reservation_waits_for_the_others_in_flight_instead_of_giving_up() {
+        let budget = Budget::new(Some(1.0));
+        let cancel = AtomicBool::new(false);
+        let first = budget.reserve(0.6).expect("fits");
+        assert!(
+            matches!(budget.reserve_or_wait(1.5, &cancel), Reserved::OverBudget),
+            "too much even alone: no wait"
+        );
+        let (sent, got) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let reserved = budget.reserve_or_wait(0.6, &cancel);
+                let ok = matches!(&reserved, Reserved::Yes(r) if r.usd() == 0.6);
+                sent.send(ok).expect("send");
+                if let Reserved::Yes(r) = reserved {
+                    r.settle(0.1);
+                }
+            });
+            // Wait until the other thread is really waiting, not a fixed time.
+            while budget.waits() == 0 {
+                std::thread::yield_now();
+            }
+            assert!(
+                got.try_recv().is_err(),
+                "still waiting while 0.6 is in flight"
+            );
+            first.settle(0.1);
+            assert_eq!(got.recv(), Ok(true), "went ahead once the first settled");
+        });
+        assert!((budget.spent_usd() - 0.2).abs() < 1e-12);
+
+        // The others in flight settle for so much that this no longer fits even alone.
+        let big = budget.reserve(0.7).expect("0.2 + 0.7 fits");
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| budget.reserve_or_wait(0.5, &cancel));
+            while budget.waits() < 2 {
+                std::thread::yield_now();
+            }
+            big.settle(0.7);
+            assert!(matches!(
+                waiting.join().expect("join"),
+                Reserved::OverBudget
+            ));
+        });
+
+        // Ctrl+C while waiting.
+        let cancel_me = AtomicBool::new(false);
+        let held = budget.reserve(0.05).expect("fits");
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| budget.reserve_or_wait(0.08, &cancel_me));
+            while budget.waits() < 3 {
+                std::thread::yield_now();
+            }
+            cancel_me.store(true, Ordering::Relaxed);
+            assert!(matches!(waiting.join().expect("join"), Reserved::Cancelled));
+        });
+        drop(held);
+        assert!(matches!(
+            Budget::new(None).reserve_or_wait(1e9, &cancel),
+            Reserved::Yes(_)
+        ));
+    }
+
+    /// OpenAI bills a frame for more tokens than Anthropic does; the bound follows the provider.
+    #[test]
+    fn the_image_bound_follows_each_providers_billing() {
+        assert_eq!(image_tokens_bound(Provider::Anthropic, 512, 288), 209);
+        assert_eq!(image_tokens_bound(Provider::OpenAi, 512, 288), 255);
+        assert_eq!(image_tokens_bound(Provider::OpenAi, 288, 512), 255);
+        // Two 512 tiles (425) against 16×32 patches × 1.62 (830): the larger.
+        assert_eq!(image_tokens_bound(Provider::OpenAi, 1024, 512), 830);
     }
 
     /// The folder run end to end on real clips, with a local mock server standing in for the API:
     /// resuming, forcing, the budget cap, several clips in flight, and grouping.
     #[cfg(all(feature = "frames", target_os = "linux"))]
     mod runs {
-        use super::super::run::Runner;
+        use super::super::run::{prepare, Runner};
         use super::super::*;
         use crate::anthropic::{Anthropic, RetryPolicy};
         use crate::cache::{cache_path, Cache};
@@ -792,6 +1063,7 @@ mod tests {
         use crate::{group_clips, Error, Model, Options};
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
+        use std::path::Path;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
@@ -799,6 +1071,9 @@ mod tests {
         /// A local server answering every request with a description, on as many connections at
         /// once as come in, holding each answer up to `wait` for another request to overlap it:
         /// how many requests it got, and the most it had in work at the same time.
+        /// When a held answer may go.
+        type Release = Arc<dyn Fn() -> bool + Send + Sync>;
+
         struct Server {
             url: String,
             requests: Arc<AtomicUsize>,
@@ -811,6 +1086,12 @@ mod tests {
         const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 
         fn server(wait: Duration) -> Server {
+            server_with(wait, None)
+        }
+
+        /// [`server`], holding each answer until `release` says so (or `wait` runs out) instead
+        /// of until two requests overlapped.
+        fn server_with(wait: Duration, release: Option<Release>) -> Server {
             assert!(
                 wait * 2 <= ANSWER_TIMEOUT,
                 "a held answer must not time out"
@@ -824,6 +1105,7 @@ mod tests {
             std::thread::spawn(move || {
                 while let Ok((stream, _)) = listener.accept() {
                     let (count, most, in_work) = (count.clone(), most.clone(), in_work.clone());
+                    let release = release.clone();
                     std::thread::spawn(move || {
                         let mut reader = BufReader::new(stream);
                         let mut length = 0;
@@ -849,7 +1131,11 @@ mod tests {
                         // overlapped, and a request that arrives after the overlap was already
                         // seen (the last clip of a run) has nothing left to wait for.
                         let started = std::time::Instant::now();
-                        while most.load(Ordering::SeqCst) < 2 && started.elapsed() < wait {
+                        let released = || match &release {
+                            Some(release) => release(),
+                            None => most.load(Ordering::SeqCst) >= 2,
+                        };
+                        while !released() && started.elapsed() < wait {
                             std::thread::sleep(Duration::from_millis(10));
                         }
                         in_work.fetch_sub(1, Ordering::SeqCst);
@@ -1067,6 +1353,29 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// What the budget reserves for `video`: the bound of the very request the run sends.
+        fn bound(video: &Path) -> f64 {
+            let options = options();
+            let prepared = prepare(
+                video,
+                &[],
+                None,
+                &options,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .expect("prepared");
+            request_cost_bound(options.model, &prepared.request)
+        }
+
+        /// What the mock server's answer costs (its 3,000 in / 40 out tokens).
+        fn mock_cost() -> f64 {
+            options().model.cost_usd(AiUsage {
+                input_tokens: 3000,
+                output_tokens: 40,
+            })
+        }
+
         /// A cap below one clip's bound: its frames are read, but nothing is sent, nothing is
         /// cached, and no other clip is started.
         #[test]
@@ -1075,9 +1384,10 @@ mod tests {
                 "budget",
                 &["rotated-90.mp4", "file_example_MOV_480_700kB.mov"],
             );
+            let bounds: Vec<f64> = videos.iter().map(|v| bound(v)).collect();
             let server = server(Duration::ZERO);
             let cache = Cache::open(&cache_path(&dir, None)).expect("cache");
-            let budget = Budget::new(Some(0.001));
+            let budget = Budget::new(Some(bounds[0] * 0.9));
             let run = run_folder(
                 &server,
                 &videos,
@@ -1096,11 +1406,11 @@ mod tests {
             assert_eq!(budget.spent_usd(), 0.0);
             assert!(cache.is_empty());
 
-            // Room for one clip: the first (rotated-90.mp4, 3 frames) reserves a bound of about
-            // $0.0216 and costs $0.0032 (the mock's 3,000 in / 40 out tokens); the second (the
-            // MOV, 16 frames) would reserve about $0.0242 more, past $0.025. (The other way
-            // round both would fit — $0.0032 + $0.0216 < $0.025 — hence the clips' order.)
-            let one_clip = Budget::new(Some(0.025));
+            // Room for the first clip, and then not for the second's bound on top of what the
+            // first really cost.
+            let cap = mock_cost() + bounds[1] - 1e-6;
+            assert!(bounds[0] <= cap, "the first fits: {bounds:?} in {cap}");
+            let one_clip = Budget::new(Some(cap));
             let run = run_folder(
                 &server,
                 &videos,
@@ -1115,7 +1425,163 @@ mod tests {
             );
             assert_eq!(kinds(&run), ["described", "over budget"]);
             assert_eq!(server.requests.load(Ordering::SeqCst), 1);
-            assert!(one_clip.spent_usd() <= 0.025);
+            assert!(one_clip.spent_usd() <= cap);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// With several clips in flight, a clip whose bound does not fit next to the others' open
+        /// reservations waits for them to settle instead of stopping the run: a cap with room for
+        /// every clip's real cost, but for only one bound at a time, describes them all, one after
+        /// the other, and never passes the cap.
+        #[test]
+        fn concurrent_reservations_wait_instead_of_stopping_the_run() {
+            let (_dir, videos) = folder(
+                "budget-jobs",
+                &[
+                    "rotated-90.mp4",
+                    "file_example_MOV_480_700kB.mov",
+                    "Short.Travel.Health.Views.file_example_WEBM_480_900KB.webm",
+                ],
+            );
+            let bounds: Vec<f64> = videos.iter().map(|v| bound(v)).collect();
+            let largest = bounds.iter().copied().fold(0.0, f64::max);
+            let smallest = bounds.iter().copied().fold(f64::INFINITY, f64::min);
+            let cap = 2.0 * mock_cost() + largest + 1e-6;
+            assert!(
+                smallest + largest > cap,
+                "two bounds at once must not fit, or nothing would wait: {bounds:?} in {cap}"
+            );
+            let budget = Arc::new(Budget::new(Some(cap)));
+            // Hold the first answer until another clip is waiting for the budget, so the test
+            // does not depend on how fast each clip decodes: the wait really happens.
+            let waiting = budget.clone();
+            let server = server_with(
+                Duration::from_secs(60),
+                Some(Arc::new(move || waiting.waits() > 0)),
+            );
+            let run = run_folder(
+                &server,
+                &videos,
+                None,
+                &RunOptions {
+                    jobs: 3,
+                    ..RunOptions::default()
+                },
+                &budget,
+                &AtomicBool::new(false),
+                &|_| {},
+            );
+            assert_eq!(kinds(&run), ["described", "described", "described"]);
+            assert_eq!(run.stopped, None);
+            assert!(budget.waits() > 0, "a clip waited for the budget");
+            assert_eq!(
+                server.most_at_once.load(Ordering::SeqCst),
+                1,
+                "one bound at a time"
+            );
+            assert!(budget.spent_usd() <= cap, "{} > {cap}", budget.spent_usd());
+            assert!((budget.spent_usd() - 3.0 * mock_cost()).abs() < 1e-9);
+        }
+
+        /// Once a run stops (here for the budget), the clips it did not get to are still served
+        /// from the cache when it has them — they cost nothing — and only the others are left not
+        /// started.
+        #[test]
+        fn a_stopped_run_still_serves_what_the_cache_has() {
+            let (dir, videos) = folder(
+                "stopped-cache",
+                &[
+                    "rotated-90.mp4",
+                    "file_example_MOV_480_700kB.mov",
+                    "file_example_MP4_480_1_5MG.mp4",
+                ],
+            );
+            let server = server(Duration::ZERO);
+            let cache = Cache::open(&cache_path(&dir, None)).expect("cache");
+            let earlier = run_folder(
+                &server,
+                &videos[2..],
+                Some(&cache),
+                &RunOptions::default(),
+                &Budget::new(None),
+                &AtomicBool::new(false),
+                &|_| {},
+            );
+            assert_eq!(kinds(&earlier), ["described"]);
+
+            let finished = std::sync::Mutex::new(Vec::new());
+            let run = run_folder(
+                &server,
+                &videos,
+                Some(&cache),
+                &RunOptions {
+                    jobs: 1,
+                    ..RunOptions::default()
+                },
+                &Budget::new(Some(bound(&videos[0]) * 0.9)),
+                &AtomicBool::new(false),
+                &|event| {
+                    if let FolderEvent::Finished { index, .. } = event {
+                        finished.lock().expect("lock").push(index);
+                    }
+                },
+            );
+            assert_eq!(kinds(&run), ["over budget", "not started", "cached"]);
+            assert_eq!(run.stopped, Some(Stop::OverBudget));
+            assert_eq!(
+                server.requests.load(Ordering::SeqCst),
+                1,
+                "nothing new sent"
+            );
+            assert_eq!(run.clips[2].record(), earlier.clips[0].record());
+            assert_eq!(
+                *finished.lock().expect("lock"),
+                [0, 1, 2],
+                "every clip is finished, in order, so a display can move past the unstarted one"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Ctrl+C while an answer is on its way does not throw it away: it was billed, so it is
+        /// cached and counted; nothing new is started.
+        #[test]
+        fn an_answer_in_flight_when_cancelled_is_still_kept() {
+            let (dir, videos) = folder(
+                "cancel-in-flight",
+                &["rotated-90.mp4", "file_example_MOV_480_700kB.mov"],
+            );
+            let cancel = Arc::new(AtomicBool::new(false));
+            // Hold the answer until the cancel is set.
+            let cancelled = cancel.clone();
+            let server = server_with(
+                Duration::from_secs(60),
+                Some(Arc::new(move || cancelled.load(Ordering::SeqCst))),
+            );
+            let requests = server.requests.clone();
+            let flag = cancel.clone();
+            std::thread::spawn(move || {
+                while requests.load(Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                flag.store(true, Ordering::SeqCst);
+            });
+            let cache = Cache::open(&cache_path(&dir, None)).expect("cache");
+            let run = run_folder(
+                &server,
+                &videos,
+                Some(&cache),
+                &RunOptions {
+                    jobs: 1,
+                    ..RunOptions::default()
+                },
+                &Budget::new(None),
+                &cancel,
+                &|_| {},
+            );
+            assert_eq!(kinds(&run), ["described", "not started"]);
+            assert_eq!(run.stopped, Some(Stop::Cancelled));
+            assert_eq!(cache.len(), 1, "the billed answer is cached");
+            assert_eq!(run.usage.input_tokens, 3000, "and counted");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1153,32 +1619,70 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// A clip made with `gst-launch-1.0 videotestsrc pattern=<pattern>`, or `None` when the
-        /// tool is not installed.
-        fn test_pattern(dir: &std::path::Path, pattern: &str) -> Option<PathBuf> {
-            let path = dir.join(format!("pattern-{pattern}.mkv"));
-            let made = std::process::Command::new("gst-launch-1.0")
-                .args(["-q", "videotestsrc", "num-buffers=60"])
-                .arg(format!("pattern={pattern}"))
-                .args([
-                    "!",
-                    "video/x-raw,framerate=10/1,width=320,height=180",
-                    "!",
-                    "jpegenc",
-                    "!",
-                    "matroskamux",
-                    "!",
-                    "filesink",
-                ])
-                .arg(format!("location={}", path.display()))
-                .status();
-            made.is_ok_and(|s| s.success()).then_some(path)
+        /// A 6 s clip made in-process with GStreamer (no `gst-launch-1.0` needed): `source` is
+        /// the start of a pipeline description giving raw video, scaled here to 320×180 and
+        /// written as Motion-JPEG in Matroska to `dir/<name>.mkv`.
+        fn render(dir: &Path, name: &str, source: &str) -> PathBuf {
+            use gstreamer as gst;
+            use gstreamer::prelude::*;
+            gst::init().expect("GStreamer");
+            let path = dir.join(format!("{name}.mkv"));
+            let description = format!(
+                "{source} ! videoconvert ! videoscale ! video/x-raw,width=320,height=180 ! \
+                 jpegenc ! matroskamux ! filesink location=\"{}\"",
+                path.display()
+            );
+            let pipeline = gst::parse::launch(&description).expect("pipeline");
+            pipeline.set_state(gst::State::Playing).expect("playing");
+            let bus = pipeline.bus().expect("bus");
+            let mut done = false;
+            for message in bus.iter_timed(gst::ClockTime::from_seconds(120)) {
+                match message.view() {
+                    gst::MessageView::Eos(_) => {
+                        done = true;
+                        break;
+                    }
+                    gst::MessageView::Error(e) => panic!("{name}: {} ({:?})", e.error(), e.debug()),
+                    _ => {}
+                }
+            }
+            let _ = pipeline.set_state(gst::State::Null);
+            assert!(done, "{name}: not finished in time");
+            path
+        }
+
+        /// A `videotestsrc` pattern, 6 s: a scene unlike the test clips.
+        fn pattern(dir: &Path, pattern: &str) -> PathBuf {
+            render(
+                dir,
+                &format!("pattern-{pattern}"),
+                &format!(
+                    "videotestsrc num-buffers=60 pattern={pattern} ! video/x-raw,framerate=10/1"
+                ),
+            )
+        }
+
+        /// The first 6 s of the MP4 test clip, cropped by `crop` (`left right top bottom`, in
+        /// pixels of its 480×270 frame) and scaled back up: the same scene framed differently.
+        fn reframed(dir: &Path, name: &str, [left, right, top, bottom]: [u32; 4]) -> PathBuf {
+            let clip = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/clips/file_example_MP4_480_1_5MG.mp4");
+            render(
+                dir,
+                name,
+                &format!(
+                    "filesrc location=\"{}\" ! decodebin ! videoconvert ! videorate ! \
+                     video/x-raw,framerate=10/1 ! identity eos-after=60 ! \
+                     videocrop left={left} right={right} top={top} bottom={bottom}",
+                    clip.display()
+                ),
+            )
         }
 
         /// Grouping on the real test clips: all four are the same footage (the MP4, the MOV and
         /// the WebM one video in three containers, `rotated-90.mp4` its first 6 s stored sideways),
-        /// so one group; generated test patterns, when `gst-launch-1.0` is there to make them, are
-        /// other scenes and get groups of their own.
+        /// so one group; generated test patterns are other scenes and get groups of their own.
+        /// Both halves always run (the patterns are made in-process).
         #[test]
         fn the_test_clips_are_one_group_and_other_scenes_are_not() {
             let (dir, mut videos) = folder(
@@ -1190,15 +1694,10 @@ mod tests {
                     "rotated-90.mp4",
                 ],
             );
-            let patterns: Vec<PathBuf> = ["smpte", "ball"]
+            let patterns: Vec<PathBuf> = ["smpte", "ball", "gradient"]
                 .iter()
-                .filter_map(|p| test_pattern(&dir, p))
+                .map(|p| pattern(&dir, p))
                 .collect();
-            if patterns.is_empty() {
-                eprintln!(
-                    "gst-launch-1.0 could not make the test patterns: only the clips checked"
-                );
-            }
             videos.extend(patterns.iter().cloned());
             let server = server(Duration::ZERO);
             let run = run_folder(
@@ -1234,10 +1733,99 @@ mod tests {
                 assert!(clip.stretches.iter().all(|s| s.group == 1), "{clip:?}");
             }
             let mut pattern_ids = ids[4..].to_vec();
+            pattern_ids.sort_unstable();
             pattern_ids.dedup();
             assert_eq!(pattern_ids.len(), patterns.len(), "a group each: {ids:?}");
             assert!(ids[4..].iter().all(|&id| id != 1), "{ids:?}");
             assert_eq!(grouping.groups[0].stretches, 4);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The measurement behind the grouping thresholds (`docs/design/whole-folders.md`,
+        /// "Measured"): the distance `group_clips` joins clips by, between the test clips, the
+        /// test clip re-framed (cropped and scaled, as a camera moved or zoomed would), and
+        /// generated patterns. Prints the table (`cargo test --lib grouping_distances --
+        /// --nocapture`) and checks only what the design relies on.
+        #[test]
+        fn grouping_distances_on_the_test_clips() {
+            let dir = std::env::temp_dir()
+                .join(format!("clipscribe-run-distances-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/clips");
+            let mut named: Vec<(&str, PathBuf)> = vec![
+                ("MP4", repo.join("file_example_MP4_480_1_5MG.mp4")),
+                ("MOV", repo.join("file_example_MOV_480_700kB.mov")),
+                (
+                    "WebM",
+                    repo.join("Short.Travel.Health.Views.file_example_WEBM_480_900KB.webm"),
+                ),
+                ("rotated-90", repo.join("rotated-90.mp4")),
+                ("zoom 1.25x", reframed(&dir, "zoom", [48, 48, 27, 27])),
+                ("pan 20%", reframed(&dir, "pan", [96, 0, 0, 0])),
+                ("pan 40%", reframed(&dir, "pan-far", [192, 0, 0, 0])),
+            ];
+            for p in ["smpte", "ball", "gradient", "pinwheel", "circular"] {
+                named.push((p, pattern(&dir, p)));
+            }
+            let options = options();
+            let clips: Vec<DescribedClip> = named
+                .iter()
+                .map(|(name, path)| {
+                    let prepared = prepare(
+                        path,
+                        &[],
+                        None,
+                        &options,
+                        &AtomicBool::new(false),
+                        &mut |_| {},
+                    )
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                    DescribedClip {
+                        description: crate::Description {
+                            summary: String::new(),
+                            segments: Vec::new(),
+                        },
+                        tags: None,
+                        usage: AiUsage::default(),
+                        duration_s: prepared.duration_s,
+                        frames: prepared
+                            .frames
+                            .iter()
+                            .zip(prepared.fingerprints)
+                            .map(|(f, fingerprint)| FrameFingerprint {
+                                time_s: f.time_s,
+                                fingerprint,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            let distance = |a: usize, b: usize| {
+                crate::groups::clip_distance(&clips[a], &clips[b]).unwrap_or(f64::NAN)
+            };
+            eprintln!("distance (1 - r, best rotation, closest stretches) from the MP4:");
+            for (i, (name, _)) in named.iter().enumerate().skip(1) {
+                eprintln!("  {name:<12} {:.3}", distance(0, i));
+            }
+            let patterns = 7..named.len();
+            eprintln!("between patterns:");
+            let mut closest_patterns = f64::INFINITY;
+            for i in patterns.clone() {
+                for j in patterns.clone().filter(|&j| j > i) {
+                    let d = distance(i, j);
+                    closest_patterns = closest_patterns.min(d);
+                    eprintln!("  {:<9} {:<9} {d:.3}", named[i].0, named[j].0);
+                }
+            }
+            let same = crate::groups::SAME_SCENE;
+            for (i, (name, _)) in named.iter().enumerate().take(4).skip(1) {
+                assert!(distance(0, i) < same, "{name}: {}", distance(0, i));
+            }
+            for i in patterns {
+                assert!(distance(0, i) > same, "{}: {}", named[i].0, distance(0, i));
+            }
+            assert!(closest_patterns > same, "{closest_patterns}");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

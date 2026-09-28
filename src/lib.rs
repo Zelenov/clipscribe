@@ -49,10 +49,16 @@ mod tags;
 
 use std::time::Duration;
 
-pub use cache::*;
+pub use cache::{cache_path, Cache, CacheKey, ClipRecord, FileIdentity, CACHE_FILE_NAME};
 pub use describe::*;
-pub use folder::*;
-pub use groups::*;
+pub use folder::{
+    cached_clip, find_videos, request_cost_bound, Budget, ClipOutcome, DescribedClip, FolderEvent,
+    FolderRun, FrameFingerprint, Reservation, Reserved, RunOptions, Stop, DEFAULT_JOBS,
+    VIDEO_EXTENSIONS,
+};
+#[cfg(feature = "frames")]
+pub use folder::{describe_clip, describe_folder};
+pub use groups::{group_clips, ClipGroups, Group, Grouping, Stretch};
 pub use moment::*;
 pub use provider::{AiError, AiProvider, AiUsage, Provider};
 pub use tags::*;
@@ -180,8 +186,8 @@ fn gated_provider_for(
 }
 
 /// The frames a whole-clip description is made from, with the length of the clip and each
-/// frame's fingerprint (see [`FrameFingerprint`]): shared by [`describe`], [`describe_with_tags`]
-/// and [`describe_clip`].
+/// frame's fingerprint (see [`FrameFingerprint`]): for [`describe_clip`], which [`describe`] and
+/// [`describe_with_tags`] go through.
 #[cfg(feature = "frames")]
 #[allow(clippy::type_complexity)]
 fn read_frames(
@@ -217,36 +223,32 @@ pub fn describe(
     subtitles: &[Cue],
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
-    mut on_stage: impl FnMut(Stage),
+    on_stage: impl FnMut(Stage),
 ) -> Result<Described, Error> {
-    let (duration_s, frames, _) =
-        read_frames(video, options.frame_sampling, cancel, &mut on_stage)?;
-    let request = build_request(
-        options.model,
-        &frames,
+    let clip = uncapped(describe_clip(
+        video,
         subtitles,
-        duration_s,
-        options.language,
-        options.moments,
-    );
-    on_stage(Stage::Asking);
-    let provider = provider_for(options)?;
-    let response = provider.complete(&request, cancel).map_err(|e| match e {
-        AiError::Cancelled => Error::Cancelled,
-        e => Error::Ai(e),
-    })?;
-    let description = parse_answer(&response, duration_s, options.moments).map_err(|reason| {
-        Error::BadAnswer {
-            reason,
-            usage: response.usage,
-        }
-    })?;
+        None,
+        options,
+        &Budget::new(None),
+        cancel,
+        on_stage,
+    )?);
     Ok(Described {
-        description,
-        usage: response.usage,
-        duration_s,
-        frames: frames.len(),
+        frames: clip.frames.len(),
+        description: clip.description,
+        usage: clip.usage,
+        duration_s: clip.duration_s,
     })
+}
+
+/// What [`describe_clip`] gives with a budget without a cap, which always has room.
+#[cfg(feature = "frames")]
+fn uncapped(clip: Option<DescribedClip>) -> DescribedClip {
+    match clip {
+        Some(clip) => clip,
+        None => unreachable!("a budget without a cap never refuses a request"),
+    }
 }
 
 /// A clip described together with tag suggestions from a vocabulary, from one request: see
@@ -270,38 +272,24 @@ pub fn describe_with_tags(
     vocabulary: &[Tag],
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
-    mut on_stage: impl FnMut(Stage),
+    on_stage: impl FnMut(Stage),
 ) -> Result<DescribedWithTags, Error> {
-    let (duration_s, frames, _) =
-        read_frames(video, options.frame_sampling, cancel, &mut on_stage)?;
-    let request = build_combined_request(
-        options.model,
-        &frames,
+    let clip = uncapped(describe_clip(
+        video,
         subtitles,
-        vocabulary,
-        duration_s,
-        options.language,
-        options.moments,
-    );
-    on_stage(Stage::Asking);
-    let provider = provider_for(options)?;
-    let response = provider.complete(&request, cancel).map_err(|e| match e {
-        AiError::Cancelled => Error::Cancelled,
-        e => Error::Ai(e),
-    })?;
-    let (description, tags) =
-        parse_combined_answer(&response, duration_s, vocabulary, options.moments).map_err(
-            |reason| Error::BadAnswer {
-                reason,
-                usage: response.usage,
-            },
-        )?;
+        Some(vocabulary),
+        options,
+        &Budget::new(None),
+        cancel,
+        on_stage,
+    )?);
     Ok(DescribedWithTags {
-        description,
-        tags,
-        usage: response.usage,
-        duration_s,
-        frames: frames.len(),
+        frames: clip.frames.len(),
+        description: clip.description,
+        // Always there when a vocabulary was given.
+        tags: clip.tags.unwrap_or_default(),
+        usage: clip.usage,
+        duration_s: clip.duration_s,
     })
 }
 
