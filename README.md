@@ -87,13 +87,52 @@ same window. `MOMENT_WINDOW_S` (1 s) is a reasonable default for `window_s`. Ret
 `DescribedMoment { moment: Moment { name, description }, usage }` — `moment.name` is a few words,
 fit for a marker label; `usage` prices with `Model::cost_usd` like any other call.
 
+### Whole folders
+
+`describe_folder` describes many clips in one call, several at once, and can resume a stopped
+run and stop at a budget:
+
+```rust
+use clipscribe::{cache_path, describe_folder, find_videos, group_clips, Budget, Cache, RunOptions};
+
+let videos = find_videos(&["footage".into()])?; // the videos in the folder, sorted
+let cache = Cache::open(&cache_path("footage".as_ref(), None))?;
+let budget = Budget::new(Some(5.0)); // US dollars
+let run = describe_folder(&videos, Some(&cache), &RunOptions::default(), &options, &budget,
+    &AtomicBool::new(false), |event| eprintln!("{event:?}"));
+let clips: Vec<_> = run.clips.iter().filter_map(|c| c.record()).map(|r| &r.clip).collect();
+let grouping = group_clips(&clips);
+```
+
+- **Resume.** The `Cache` is a `.clipscribe-cache.jsonl` file next to the videos (or in a
+  directory you pass to `cache_path`). A clip is found by its `FileIdentity` (size, modification
+  time and a hash of its first, middle and last 64 KiB) and the settings it was described with,
+  so a renamed clip is still found and a different model or `.srt` describes it again. Each clip
+  is written as soon as it is done: a crash or a cancel loses only the clips in work.
+  `RunOptions::force` describes everything again.
+- **Several at once.** `RunOptions::jobs` clips (default 4) are in flight; a rate limit on one
+  pauses all of them.
+- **Budget.** Before each request, `Budget` sets aside the most it can cost; a request that could
+  pass the cap is not sent, the clip comes back `ClipOutcome::OverBudget`, and no new clip starts.
+- **Outcomes.** `FolderRun::clips` has a `ClipOutcome` per video, in order (`Described`, `Cached`,
+  `Failed`, `OverBudget`, `NotStarted`), with `usage` (what this run spent) and `stopped` (why it
+  stopped early, if it did). `FolderEvent`s arrive from the worker threads, for a progress display.
+- **Grouping.** `group_clips` puts clips, and stretches within them, that show the same scene in
+  one `Group`, with a label taken from the descriptions. It compares 8×8 brightness grids of the
+  frames already sent (whatever the exposure, and turned sideways too), so it costs nothing,
+  runs offline and gives the same groups every time. It finds the same place or set-up filmed
+  again, not the same activity in a different place.
+
+To build your own loop instead, the parts are public: `CacheKey`, `Cache::get`/`put`,
+`describe_clip` (one clip, within a `Budget`) and `request_cost_bound`.
+
 ### Features
 
 | Feature | |
 |---|---|
 | `cli` (default) | The `clipscribe` binary (clap, ctrlc). Implies `frames`. |
-| `frames` (default) | GStreamer frame reading and `describe`. |
-| none | Models, languages, request and answer types, the estimate, `srt` and both providers' clients, with no GStreamer. |
+| `frames` (default) | GStreamer frame reading, `describe` and `describe_folder`. |
+| none | Models, languages, request and answer types, the estimate, `srt`, both providers' clients, the cache and `group_clips`, with no GStreamer. |
 
 ## Building
 

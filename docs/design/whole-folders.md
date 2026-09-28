@@ -285,6 +285,18 @@ one-at-a-time run. The status line shows how many clips are done and in work. Ca
 like described ones (JSON: `"cached": true`, with the usage they cost when described); the usage
 line at the end counts only what this run spent, and says how many clips came from the cache.
 
+Added while wiring the CLI (after the session that wrote the above was interrupted):
+
+- With `--resume`/`--force` and no `--cache-dir`, inputs from several folders run as one
+  `describe_folder` per folder (each stretch of consecutive videos in one folder, with that
+  folder's cache), one after the other in input order, sharing one `Budget`; a stop in one
+  (budget, cancel, rejected key) leaves the rest `NotStarted`. Without a cache, or with
+  `--cache-dir`, it is a single `describe_folder`. Every cache is opened before anything is sent.
+- `--resume` and `--force` exclude each other; `--cache-dir` needs one of them. `--at` and
+  `--estimate` take none of the folder-run options.
+- The exit code is 1 whenever a video was not described (failed, over budget, not started,
+  cancelled), as a failure was before.
+
 ## Tests
 
 - Cache: identity changes with size, mtime or the sampled content, and not with a rename; the

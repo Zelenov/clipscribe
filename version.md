@@ -1,3 +1,25 @@
+# NEXT
+## Added
+- Whole folders: `clipscribe footage/ --resume --groups --json`. `--resume` skips videos already
+  described (a `.clipscribe-cache.jsonl` next to them, or in `--cache-dir`) and saves each new one
+  as soon as it is done, so a stopped run picks up where it left off; `--force` describes
+  everything again and refreshes the cache. Library: `Cache`, `CacheKey`, `FileIdentity`.
+- Several videos in work at once: `--jobs N` (default 4); a rate limit on one pauses them all.
+  Results still print in input order.
+- `--max-cost USD`: a budget cap. A request that could take the run past it is not sent, and no
+  new video starts. Library: `Budget`, `request_cost_bound`.
+- `--groups`: groups similar footage (videos, and stretches within them, showing the same scene),
+  each group with a label from the descriptions, at no extra cost. Text ends with a `Groups:`
+  section; JSON clip objects gain `group`, `group_label`, `stretches`, and each moment a `group`.
+  Library: `group_clips`.
+- Library: `describe_folder` runs a whole folder with `FolderEvent`s for a progress display;
+  `describe_clip` describes one clip within a `Budget`; `find_videos` lists a folder's videos.
+
+## Changed
+- Every run over whole clips goes through the folder run, several videos at once; `--jobs 1`
+  works one video at a time as before. With `--json`, a clip from the cache carries
+  `"cached": true`. The status line shows how many videos are done and in work.
+
 # 0.6.0
 ## Added
 - `describe_moment(video, at_s, window_s, subtitles, &options, cancel)`: a name and a
