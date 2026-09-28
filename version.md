@@ -1,3 +1,17 @@
+# 0.4.0
+## Added
+- Only important moments: by default, a description's moments (segments) cover only what stands
+  out — none at all for a static or uniform clip, one per clearly different or standout part
+  otherwise — instead of always tiling the whole clip. `--moments important|full` picks between
+  the new default and the old, always-covers-the-clip behaviour.
+
+## Changed
+- Library: `Options` has a new field `moments: MomentsMode` (`Important` or `Full`); set it to
+  `MomentsMode::Important` for the new default or `MomentsMode::Full` to keep today's behaviour
+  exactly.
+- Library: `describe::build_request` and `describe::parse_answer` each take a new `moments:
+  MomentsMode` parameter; pass `MomentsMode::Full` to keep calling them the way you do today.
+
 # 0.3.0
 ## Added
 - Tag suggestions: `--tags tags.txt` (library: `describe_with_tags`, or `suggest_tags` for a clip

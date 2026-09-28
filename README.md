@@ -41,6 +41,10 @@ with its `bin` on `PATH`). Or build it with `cargo install clipscribe`.
   description knows what is said.
 - One request goes to the Anthropic Messages API; the answer is structured JSON, and moments
   outside the clip are dropped. Clips over 30 minutes are refused.
+- Moments (segments) default to **important**: none at all for a static or uniform clip (the
+  summary already covers it), one per clearly different or standout part otherwise — never a
+  moment that just tiles the timeline. `--moments full` goes back to always covering the whole
+  clip in consecutive stretches.
 
 ## Command line
 
@@ -60,6 +64,7 @@ clipscribe clip.mp4 --tags tags.txt    # also suggest tags from a vocabulary (se
 | `--model haiku\|sonnet\|opus` | Claude Haiku 4.5 (default; about $10 per 1000 one-minute clips), Sonnet 5 or Opus 5 (notice more, cost more). |
 | `--language` | `subtitles` (default: the subtitles' language, English if none), `en`, `ru`, `uk`, `de`, `es`, `fr`. |
 | `--frames keyframes\|interval` | `keyframes` (default: one per window of the clip where the picture changes the most) or `interval` (one every 2 s, spread evenly on a longer clip). |
+| `--moments important\|full` | `important` (default: only what stands out, possibly none) or `full` (the whole clip in consecutive stretches, today's old behaviour). |
 | `--tags <file>` | Suggest tags from this vocabulary in the same request as the description (see below); not set by default. |
 | `--no-subtitles` | Do not send the `.srt`. |
 | `--json` | One JSON array: `file`, `duration_s`, `frames`, `summary`, `moments[{start_s, end_s, description}]`, `model`, `usage`, `cost_usd` — with `--tags`, also `tags[{name, confidence, ranges[{start_s, end_s}]}]` and `new_tag_ideas`. |
@@ -98,7 +103,7 @@ clipscribe = { version = "0.1", default-features = false, features = ["frames"] 
 
 ```rust
 use std::sync::atomic::AtomicBool;
-use clipscribe::{describe, srt, FrameSampling, Options, SummaryLanguage, MODELS};
+use clipscribe::{describe, srt, FrameSampling, MomentsMode, Options, SummaryLanguage, MODELS};
 
 let video = std::path::Path::new("clip.mp4");
 let options = Options {
@@ -106,6 +111,7 @@ let options = Options {
     model: MODELS[0],
     language: SummaryLanguage::English,
     frame_sampling: FrameSampling::KeyFrames,
+    moments: MomentsMode::Important,
 };
 let subtitles = srt::load_for(video)?;
 let described = describe(video, &subtitles, &options, &AtomicBool::new(false), |stage| {
