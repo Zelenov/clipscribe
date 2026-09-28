@@ -463,6 +463,10 @@ fn describe_one_moment(
         }
         Err(e) => {
             eprintln!("error: {}: {e}", video.display());
+            // A bad answer is still billed: say so, like the batch loop does.
+            if let Error::BadAnswer { usage, .. } = &e {
+                print_usage(*usage, model);
+            }
             ExitCode::FAILURE
         }
     }

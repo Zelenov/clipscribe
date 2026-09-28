@@ -45,6 +45,7 @@ pub fn build_moment_request(
     window_s: f64,
     language: SummaryLanguage,
 ) -> AiRequest {
+    let window_s = window_s.max(0.0);
     let nearby: Vec<&Cue> = subtitles
         .iter()
         .filter(|cue| {
@@ -209,6 +210,24 @@ mod tests {
             panic!("instructions first");
         };
         assert!(instructions.contains("further away"), "{instructions}");
+    }
+
+    #[test]
+    fn a_negative_window_behaves_like_a_zero_window() {
+        let subtitles = vec![cue(9.6, 10.4, "right here"), cue(1.0, 2.0, "far away")];
+        let negative = build_moment_request(
+            Model::default(),
+            &[frame(10.0)],
+            &subtitles,
+            10.0,
+            -5.0,
+            SummaryLanguage::English,
+        );
+        let AiContent::Text(instructions) = &negative.content[0] else {
+            panic!("instructions first");
+        };
+        assert!(instructions.contains("right here"), "{instructions}");
+        assert!(!instructions.contains("far away"), "{instructions}");
     }
 
     #[test]
