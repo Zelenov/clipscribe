@@ -1,3 +1,11 @@
+# NEXT
+## Added
+- Tag suggestions: `--tags tags.txt` (library: `describe_with_tags`, or `suggest_tags` for a clip
+  already described) matches a clip against a closed vocabulary of tags, one per line
+  (`name — hint`), with a confidence and time ranges per suggestion; the model may also propose
+  short, unscored ideas for tags not in the vocabulary. `--json` gains `tags` and
+  `new_tag_ideas` fields when `--tags` is used; unchanged otherwise.
+
 # 0.2.0
 ## Added
 - Key frames: by default, frames are chosen where the picture changes the most in each window of
