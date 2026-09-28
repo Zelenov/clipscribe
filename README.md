@@ -1,101 +1,28 @@
 # clipscribe
 
-Describe what happens in video clips, and when, with Claude.
+Describe what happens in video clips, and when, with Claude or ChatGPT — a Rust crate
+([frename](https://github.com/Zelenov/frename) uses it).
 
 A video file and its subtitles go in; a one-sentence summary and time-ranged key moments come
-out, even for clips with no speech. Use it from the command line, or as a Rust crate
-([frename](https://github.com/Zelenov/frename) does). For example:
-
-```
-$ clipscribe market.mp4
-market.mp4  1:24 · 42 frames · $0.0112
-  A guide leads two tourists through a spice market and explains the prices.
-  0:00–0:14  Walking in through the market entrance, crowded, handheld camera.
-  0:14–0:41  Close-ups of spice sacks while the guide names each one.
-  0:41–1:24  The tourists buy saffron; the vendor weighs it on a scale.
-```
-
-## Download
-
-Get the build for your system from [Releases](https://github.com/Zelenov/clipscribe/releases/latest):
-
-| System | File |
-|---|---|
-| Windows x64 | `clipscribe-windows-x64-vX.Y.Z.zip` |
-| Linux x64 | `clipscribe-linux-x64-vX.Y.Z.tar.gz` |
-| macOS (Apple Silicon) | `clipscribe-macos-arm64-vX.Y.Z.tar.gz` |
-
-Unpack it and put `clipscribe` / `clipscribe.exe` anywhere on `PATH`. GStreamer is not inside:
-install its runtime (see [Building](#building); on Windows the official MSVC *runtime* package,
-with its `bin` on `PATH`). Or build it with `cargo install clipscribe`.
+out, even for clips with no speech.
 
 ## How it works
 
 - Frames are read with GStreamer, at most 60 per clip, 512 px on the long side, turned upright if
   the clip has a rotation tag, and encoded as JPEG in memory. Nothing is written to disk. By
-  default they are **key frames**: the clip is split into as many equal windows as the frame
-  budget, and the one frame kept from each is wherever the picture changes the most in it, so a
-  static shot spends no more of the budget than a clip that keeps cutting to something new.
-  `--frames interval` goes back to one frame every 2 s, spread evenly on a longer clip.
+  default they are **key frames** (`FrameSampling::KeyFrames`): the clip is split into as many
+  equal windows as the frame budget, and the one frame kept from each is wherever the picture
+  changes the most in it, so a static shot spends no more of the budget than a clip that keeps
+  cutting to something new. `FrameSampling::Interval` goes back to one frame every 2 s, spread
+  evenly on a longer clip.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
   description knows what is said.
-- One request goes to Claude (Anthropic) or ChatGPT (OpenAI, `--provider openai`); the answer is
-  structured JSON, and moments outside the clip are dropped. Clips over 30 minutes are refused.
-- Moments (segments) default to **important**: none at all for a static or uniform clip (the
-  summary already covers it), one per clearly different or standout part otherwise — never a
-  moment that just tiles the timeline. `--moments full` goes back to always covering the whole
-  clip in consecutive stretches.
-
-## Command line
-
-You need an [Anthropic API key](https://console.anthropic.com/) (or an
-[OpenAI key](https://platform.openai.com/api-keys) with `--provider openai`) and GStreamer (see
-[Building](#building)).
-
-```sh
-export ANTHROPIC_API_KEY=sk-ant-...
-clipscribe clip.mp4 other.mov          # describe
-clipscribe footage/ --json > out.json  # every video in a folder, as JSON
-clipscribe footage/ --estimate         # what it would cost; nothing is sent
-clipscribe clip.mp4 --tags tags.txt    # also suggest tags from a vocabulary (see below)
-clipscribe clip.mp4 --provider openai  # use ChatGPT instead (needs OPENAI_API_KEY)
-```
-
-| Option | |
-|---|---|
-| `--provider anthropic\|openai` | `anthropic` (default): Claude. `openai`: ChatGPT. |
-| `--model` | `--provider anthropic`: `haiku` (default; about $10 per 1000 one-minute clips), `sonnet` or `opus` (notice more, cost more). `--provider openai`: `gpt-4.1-mini` (default) or `gpt-4.1`. |
-| `--language` | `subtitles` (default: the subtitles' language, English if none), `en`, `ru`, `uk`, `de`, `es`, `fr`. |
-| `--frames keyframes\|interval` | `keyframes` (default: one per window of the clip where the picture changes the most) or `interval` (one every 2 s, spread evenly on a longer clip). |
-| `--moments important\|full` | `important` (default: only what stands out, possibly none) or `full` (the whole clip in consecutive stretches, today's old behaviour). |
-| `--tags <file>` | Suggest tags from this vocabulary in the same request as the description (see below); not set by default. |
-| `--no-subtitles` | Do not send the `.srt`. |
-| `--json` | One JSON array: `file`, `duration_s`, `frames`, `summary`, `moments[{start_s, end_s, description}]`, `model`, `usage`, `cost_usd` — with `--tags`, also `tags[{name, confidence, ranges[{start_s, end_s}]}]` and `new_tag_ideas`. |
-| `--estimate` | Price the videos from their lengths only. |
-| `--api-key` | Instead of `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. |
-
-Progress goes to stderr, results to stdout, and the tokens and cost of the run to stderr at the
-end. Ctrl+C stops the video in work. A rejected key or an empty balance stops the batch. The exit
-code is 1 when a video failed.
-
-### Tag suggestions
-
-`--tags tags.txt` matches each clip against a closed vocabulary — one tag per line in the file,
-`name — hint` (the hint is optional) — instead of the model inventing tags freely. Each suggestion
-gets a confidence and, when it does not apply to the whole clip, the time ranges where it does; a
-tag is never suggested outside the vocabulary, but the model may add short, unscored `new_tag_ideas`
-for anything worth tagging that the vocabulary does not cover.
-
-```
-$ clipscribe hike.mp4 --tags tags.txt
-hike.mp4  0:30 · 16 frames · $0.0050
-  Two hikers reach a viewpoint over a valley with goats grazing below.
-  0:12–0:20  A herd of goats crosses the path in front of the hikers.
-  Tags:
-    Goat 95% (0:12–0:20)
-    Outdoor 80%
-  New tag ideas: Hiking trail
-```
+- One request goes to Claude (Anthropic) or ChatGPT (OpenAI); the answer is structured JSON, and
+  moments outside the clip are dropped. Clips over 30 minutes are refused.
+- Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a
+  static or uniform clip (the summary already covers it), one per clearly different or standout
+  part otherwise — never a moment that just tiles the timeline. `MomentsMode::Full` goes back to
+  always covering the whole clip in consecutive stretches.
 
 ## As a library
 
@@ -132,16 +59,24 @@ Everything blocks: call it from a worker thread. `describe` fails with `Error::C
 `BadAnswer` (billed, but not usable). `estimate_usage` and `Model::cost_usd` price a clip
 before sending it; `frames::clip_duration_s` reads its length.
 
-`describe_with_tags(video, subtitles, vocabulary, &options, ...)` describes a clip and suggests
-tags from a `&[Tag]` vocabulary (`parse_vocabulary` reads the file format above) in one request,
-returning a `DescribedWithTags`. `suggest_tags(description, duration_s, subtitles, vocabulary,
-&options, cancel)` tags a clip already described earlier instead, from its `Description` alone —
-cheaper, no video read, works without the `frames` feature — at the cost of not seeing anything
-the description itself left out. `estimate_tags_usage` prices either.
-
 Every entry of `MODELS` carries its `Provider` (`Anthropic` or `OpenAi`); `options.api_key` is
 read against whichever provider `options.model` belongs to, so switching to a GPT model is just
 picking a different `MODELS` entry and an OpenAI key — nothing else about the call changes.
+
+### Tag suggestions
+
+`describe_with_tags(video, subtitles, vocabulary, &options, ...)` describes a clip and suggests
+tags from a `&[Tag]` vocabulary in one request, returning a `DescribedWithTags`. A vocabulary is a
+closed list — one tag per line in a `name — hint` file, read with `parse_vocabulary` — instead of
+the model inventing tags freely: each suggestion gets a confidence and, when it does not apply to
+the whole clip, the time ranges where it does; a tag is never suggested outside the vocabulary,
+but the model may add short, unscored `new_tag_ideas` for anything worth tagging that the
+vocabulary does not cover.
+
+`suggest_tags(description, duration_s, subtitles, vocabulary, &options, cancel)` tags a clip
+already described earlier instead, from its `Description` alone — cheaper, no video read, works
+without the `frames` feature — at the cost of not seeing anything the description itself left
+out. `estimate_tags_usage` prices either.
 
 ### Features
 
@@ -153,7 +88,7 @@ picking a different `MODELS` entry and an OpenAI key — nothing else about the 
 
 ## Building
 
-GStreamer's runtime and development files are needed for `frames` (and so for the command line).
+GStreamer's runtime and development files are needed for the `frames` feature.
 
 - **Linux:** `sudo apt-get install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav`
 - **Windows:** the official MSVC package from gstreamer.freedesktop.org, or
@@ -162,8 +97,8 @@ GStreamer's runtime and development files are needed for `frames` (and so for th
 - **macOS:** `brew install gstreamer`.
 
 ```sh
-cargo build --release   # target/release/clipscribe
-cargo test              # the frame tests decode tests/clips on Linux
+cargo build --release
+cargo test    # the frame tests decode tests/clips on Linux
 ```
 
 `CLIPSCRIBE_LIVE_API_KEY` makes `cargo test` send one real request (about $0.01).
