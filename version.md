@@ -1,4 +1,4 @@
-# NEXT
+# 0.6.0
 ## Added
 - `describe_moment(video, at_s, window_s, subtitles, &options, cancel)`: a name and a
   one-to-two sentence description for the frame at a given time, for a marker — one small, fast
