@@ -12,9 +12,9 @@ use std::sync::Mutex;
 
 use clap::{ArgGroup, Parser, ValueEnum};
 use clipscribe::{
-    cache_path, cached_clip, describe_folder, describe_moment, estimate_tags_usage, estimate_usage,
-    find_videos, format_time, frames, group_clips, parse_vocabulary, srt, AiUsage, Budget, Cache,
-    ClipGroups, ClipOutcome, ClipRecord, DescribedMoment, Error, FolderEvent, FrameSampling,
+    cache_path, describe_folder, describe_moment, estimate_tags_usage, estimate_usage, find_videos,
+    format_time, frames, group_clips, parse_vocabulary, serve_after_stop, srt, AiUsage, Budget,
+    Cache, ClipGroups, ClipOutcome, ClipRecord, DescribedMoment, Error, FolderEvent, FrameSampling,
     Grouping, Model, MomentsMode, Options, Provider, RunOptions, Stage, Stop, SummaryLanguage, Tag,
     DEFAULT_JOBS, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
 };
@@ -105,7 +105,9 @@ struct Cli {
     jobs: u16,
 
     /// Stop before a request could take this run's spending past this many US dollars (videos
-    /// found in the cache cost nothing).
+    /// found in the cache cost nothing). Each request sets aside several times its likely cost
+    /// (its answer counted at full length) before it is sent, so a cap close to --estimate's
+    /// total can still stop a video or two early.
     #[arg(long, value_parser = parse_cost)]
     max_cost: Option<f64>,
 
@@ -412,24 +414,18 @@ fn main() -> ExitCode {
     for (cache, range) in &batches {
         let offset = range.start;
         if let Some(stop) = &stopped {
-            // Stopped for the budget or a rejected key: what the cache has still costs nothing.
-            // A cancel takes nothing more up.
-            for index in range.clone() {
-                let outcome = cache
-                    .as_ref()
-                    .filter(|_| *stop != Stop::Cancelled)
-                    .and_then(|cache| cached_clip(&videos[index], cache, &run, &options))
-                    .map_or(ClipOutcome::NotStarted, ClipOutcome::Cached);
-                lock(&status).on_event(
-                    0,
-                    FolderEvent::Finished {
-                        index,
-                        video: &videos[index],
-                        outcome: &outcome,
-                    },
-                );
-                outcomes.push(outcome);
-            }
+            // An earlier folder stopped the run: this one's cache is still served (not after a
+            // cancel), the rest is not started.
+            outcomes.extend(serve_after_stop(
+                range
+                    .clone()
+                    .map(|index| (index - offset, videos[index].as_path())),
+                cache.as_ref(),
+                &run,
+                &options,
+                stop,
+                &|event| lock(&status).on_event(offset, event),
+            ));
             continue;
         }
         let folder_run = describe_folder(
@@ -493,6 +489,8 @@ fn main() -> ExitCode {
                 "{}",
                 budget_stop_message(
                     budget.max_usd().unwrap_or_default(),
+                    budget.spent_usd(),
+                    budget.refused_usd(),
                     not_done,
                     videos.len(),
                     described_now,
@@ -521,18 +519,35 @@ fn main() -> ExitCode {
     }
 }
 
-/// What to say when a run stopped at `--max-cost`, and what to do next: `not_done` of `total`
-/// videos are left, `described_now` were described (and paid for) by this run, and `caching`
-/// says whether they were saved to the cache (`--resume` or `--force`) for the next run to skip.
+/// What to say when a run stopped at `--max-cost`, and what to do next: `spent_usd` is what this
+/// run spent, `next_usd` the bound of the video that did not fit (see [`Budget::refused_usd`]),
+/// `not_done` of `total` videos are left, `described_now` were described (and paid for) by this
+/// run, and `caching` says whether they were saved to the cache (`--resume` or `--force`) for the
+/// next run to skip.
 fn budget_stop_message(
     max_usd: f64,
+    spent_usd: f64,
+    next_usd: Option<f64>,
     not_done: usize,
     total: usize,
     described_now: usize,
     caching: bool,
 ) -> String {
-    let stopped =
-        format!("Stopped at --max-cost ${max_usd:.2}: {not_done} of {total} videos not described.");
+    let why = match next_usd {
+        Some(next) => format!(
+            " {} spent; the next video could cost up to {} (its answer counted at full length, \
+             though it usually costs a fraction of that), which would pass the cap. Each video \
+             needs that much room before it is sent, so a cap close to --estimate's total can \
+             stop a video or two early.",
+            dollars(spent_usd),
+            dollars(next)
+        ),
+        None => format!(" {} spent.", dollars(spent_usd)),
+    };
+    let stopped = format!(
+        "Stopped at --max-cost {}: {not_done} of {total} videos not described.{why}",
+        dollars(max_usd)
+    );
     if caching {
         format!("{stopped} Raise --max-cost and run again with --resume to continue.")
     } else if described_now > 0 {
@@ -543,6 +558,14 @@ fn budget_stop_message(
     } else {
         format!("{stopped} Raise --max-cost, and add --resume to save each video as it is done.")
     }
+}
+
+/// US dollars with as many decimals as they need, from 2 to 4: `$5.00`, `$0.03`, `$0.0143`.
+fn dollars(usd: f64) -> String {
+    let text = format!("{usd:.4}");
+    let (whole, cents) = text.split_once('.').unwrap_or((&text, "0000"));
+    let cents = cents.trim_end_matches('0');
+    format!("${whole}.{cents:0<2}")
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1254,23 +1277,42 @@ mod tests {
     /// output.
     #[test]
     fn a_budget_stop_says_what_to_do_and_whether_anything_was_saved() {
-        let resumable = budget_stop_message(5.0, 120, 400, 280, true);
-        eprintln!("{resumable}");
+        // `--max-cost 0.03` on tests/clips (estimated at $0.025 in all): two described, then
+        // the third's bound does not fit next to what they cost.
+        let near_estimate = budget_stop_message(0.03, 0.0143, Some(0.0231), 2, 4, 2, true);
+        eprintln!("{near_estimate}");
         assert_eq!(
-            resumable,
-            "Stopped at --max-cost $5.00: 120 of 400 videos not described. Raise --max-cost and \
-             run again with --resume to continue."
+            near_estimate,
+            "Stopped at --max-cost $0.03: 2 of 4 videos not described. $0.0143 spent; the next \
+             video could cost up to $0.0231 (its answer counted at full length, though it usually \
+             costs a fraction of that), which would pass the cap. Each video needs that much room \
+             before it is sent, so a cap close to --estimate's total can stop a video or two \
+             early. Raise --max-cost and run again with --resume to continue."
         );
-        let unsaved = budget_stop_message(5.0, 120, 400, 280, false);
+        let unsaved = budget_stop_message(5.0, 4.98, Some(0.09), 120, 400, 280, false);
         eprintln!("{unsaved}");
+        assert!(
+            unsaved.starts_with("Stopped at --max-cost $5.00"),
+            "{unsaved}"
+        );
         assert!(
             unsaved.contains("The 280 described in this run were not saved"),
             "{unsaved}"
         );
         assert!(unsaved.contains("add --resume"), "{unsaved}");
-        let nothing = budget_stop_message(0.01, 4, 4, 0, false);
+        let nothing = budget_stop_message(0.01, 0.0, Some(0.0231), 4, 4, 0, false);
         eprintln!("{nothing}");
+        assert!(nothing.contains("$0.00 spent"), "{nothing}");
         assert!(nothing.contains("Raise --max-cost"), "{nothing}");
+    }
+
+    #[test]
+    fn dollars_show_as_many_decimals_as_they_need() {
+        assert_eq!(dollars(5.0), "$5.00");
+        assert_eq!(dollars(0.03), "$0.03");
+        assert_eq!(dollars(0.025), "$0.025");
+        assert_eq!(dollars(0.01432), "$0.0143");
+        assert_eq!(dollars(0.0), "$0.00");
     }
 
     #[test]
