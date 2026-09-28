@@ -134,9 +134,9 @@ pub enum AiError {
     Network(String),
     /// No answer within the request timeout. Not retried: the provider may have billed it.
     Timeout,
-    /// The request could not be sent as asked: the provider refused it (its own message), or it
+    /// The request could not be sent as asked: the provider refused it (its own message), it
     /// could not even be built for something only the caller can fix (e.g. a request needing a
-    /// parameter this client has no way to send yet).
+    /// parameter this client has no way to send yet), or retries and rate-limit waits ran out.
     Rejected(String),
     /// The answer could not be read.
     BadAnswer(String),
@@ -312,10 +312,29 @@ mod tests {
 
     #[test]
     fn retries_are_exhausted_then_fails_with_the_last_reason() {
-        let result = retry_loop(&fast_retries(), "Test", &AtomicBool::new(false), || {
-            Attempt::Retry("still failing".to_string())
-        });
-        assert_eq!(result, Err(AiError::Network("still failing".to_string())));
+        // A different reason each call, so the assertion can't pass on the first or a hardcoded
+        // one: it must be whichever `Retry` used up the final delay.
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        let result = retry_loop(
+            &fast_retries(),
+            "Test",
+            &AtomicBool::new(false),
+            move || {
+                let mut n = seen.lock().expect("lock");
+                *n += 1;
+                Attempt::Retry(format!("attempt {n} failed"))
+            },
+        );
+        assert_eq!(
+            result,
+            Err(AiError::Network("attempt 4 failed".to_string()))
+        );
+        assert_eq!(
+            *calls.lock().expect("lock"),
+            4,
+            "3 delays, then it gives up"
+        );
     }
 
     #[test]

@@ -352,6 +352,19 @@ mod tests {
         assert_eq!(result, Err(AiError::OutOfCredit("OpenAI".to_string())));
     }
 
+    /// A 429 with no quota code (a plain rate limit) waits instead of failing — unlike
+    /// `insufficient_quota` just above. Direct against `classify`, the same way
+    /// `anthropic::tests::a_429_waits_as_long_as_retry_after_says` checks Anthropic's mapping.
+    #[test]
+    fn a_plain_429_is_rate_limited_not_out_of_credit() {
+        let wait = |retry_after| match classify(429, retry_after, "{}", Duration::from_secs(30)) {
+            Attempt::RateLimited(wait) => wait,
+            _ => panic!("a plain 429 waits"),
+        };
+        assert_eq!(wait(Some(Duration::from_secs(5))), Duration::from_secs(5));
+        assert_eq!(wait(None), Duration::from_secs(30));
+    }
+
     #[test]
     fn a_rejected_key_stops_the_job() {
         let (result, _) = complete(vec![http("401 Unauthorized", "", "{}")]);
