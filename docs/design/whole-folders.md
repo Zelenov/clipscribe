@@ -114,27 +114,50 @@ next `--resume` rather than left stale.
 | Deterministic, resumable | Yes (embeddings cacheable) | No: a rerun can regroup differently | Yes: fingerprints cached with each clip, grouping a pure function of them |
 | Labels | Need text from elsewhere | Natural | From the existing descriptions |
 
-### Recommendation: perceptual fingerprints, labels from the descriptions
+### Recommendation: fingerprints and the descriptions' words, together
 
-Chosen. The issue asks for clips "that show the same scene or activity" in a folder of one
-shoot. A perceptual fingerprint finds the same *shot*: the same clip exported or re-muxed twice,
-stored sideways, brighter or darker, and — by construction, though not yet measured on real
-footage — a camera that did not move (a tripod left in place, retakes from the same position). It
-does not find the same place once the framing changes: see "Measured" below. It costs nothing, runs offline,
-is deterministic (so a resumed run groups exactly as a full one would), and it extends machinery
-the crate already has instead of adding the heaviest dependency it would ever carry: CLIP would
-bring a tensor runtime, a 90–340 MB model download and new build steps on three platforms into a
-crate that frename embeds, for semantics the descriptions already carry in words. Asking Claude
-needs nothing new either, but it is the only option that costs money again on each run, is not
-reproducible, stops fitting one request around 1,500 clips, and can only group what one sentence
-per stretch happened to mention.
+Chosen: two free signals, either of which joins two stretches.
 
-What it cannot do, stated plainly: group the same place filmed from a moved or zoomed camera (on
-the test footage, a 1.25× zoom is already 0.36 away and a 20 % pan 0.60, both far past the 0.2
-threshold), group the same activity filmed in visibly different places (two different kitchens),
-or follow a small subject moving over an empty background (its 8×8 grid changes with the
-subject's position). That is where CLIP would win; if the owner wants it later, it
-fits as an optional cargo feature behind the same `group_clips` output shape.
+- **Perceptual fingerprints** find the same *shot*: the same clip exported or re-muxed twice,
+  stored sideways, brighter or darker, and — by construction, though not yet measured on real
+  footage — a camera that did not move (a tripod left in place, retakes from the same position).
+  They do not find the same place once the framing changes: see "Measured" below.
+- **The descriptions' words** find the same subject or activity said in much the same words,
+  whatever the camera did: every clip grouping sees has already been described, so comparing its
+  summary and moments costs nothing — no request, no model, no dependency, a few string
+  operations per stretch. This is the option the first version of this design left out; the
+  review pointed out it is the cheapest of all, and it covers exactly what the fingerprints
+  cannot (on the test footage, a zoom or a pan of the same shot is joined by its words, not its
+  pictures). It cannot replace the fingerprints: two exports of one clip can be described in
+  different words, and a blank or wordless description says nothing.
+
+Both are deterministic (a resumed run groups exactly as a full one would: the fingerprints and
+descriptions are both in the cache) and extend what the crate already has instead of adding the
+heaviest dependency it would ever carry: CLIP would bring a tensor runtime, a 90–340 MB model
+download and new build steps on three platforms into a crate that frename embeds. Asking Claude
+to group needs nothing new either, but it is the only option that costs money again on each run,
+is not reproducible, and stops fitting one request around 1,500 clips.
+
+What it cannot do, stated plainly:
+
+- The word signal knows only what the descriptions say. It joins two clips when their
+  descriptions share enough words, which also happens for **the same place or person with
+  something else happening** (a hiker walking a ridge and a man biking the same ridge at sunset
+  share most of their words) and for **different things described with the same generic words**
+  (on the test patterns, a black-and-white pinwheel and black-and-white rings "around the
+  centre": a real false positive, below). It misses the same activity described in different
+  words ("chops onions" and "slicing an onion" barely make it). Whether a group is the same
+  "scene or activity" is only as good as the descriptions' wording.
+- Its stemming is crude (the first four letters of each word) and its stop words are English
+  only; in the other description languages only the length rule drops function words.
+- Groups are connected sets (single linkage): with the word signal, a chain of clips each close in
+  words to the next can join clips that have little in common end to end. On a large folder of
+  one shoot described in similar words (every clip a "hiker on a trail"), expect some large
+  groups.
+- Neither signal groups the same activity filmed in visibly different places *and* described in
+  different words, or follows a small subject moving over an empty background. That is where
+  CLIP would win; if the owner wants it later, it fits as an optional cargo feature behind the
+  same `group_clips` output shape.
 
 The 8×8 grid is a **block-mean-value hash**, one of the four perceptual image hashes benchmarked
 by Zauner ([thesis][zauner]); the key-frame design (`docs/design/key-frames.md`) already uses it for
@@ -148,6 +171,16 @@ the test clips (below):
 - **Rotation.** The distance is the smallest of the four 90° rotations of one grid, so a phone clip
   stored sideways, or a portrait re-export of the same shot, matches its landscape original. (The
   grid is square, so rotating it is exact: the cells of a rotated frame are the rotated cells.)
+
+The words are compared as sets (the **Jaccard index**: shared words over all words), after
+lower-casing, splitting at anything that is not a letter or digit, dropping words under four
+letters (articles and prepositions in all six description languages) and a short English list
+of longer function words and words about the footage itself ("camera", "shot", "scene", …), and
+cutting each word to its first four letters — truncation stemming, language-blind: "goat" and
+"goats", "hiker" and "hikes", "красной" and "красная" come out the same. The segment-merging
+check of `MomentsMode::Important` (`merge_same_description`) compares whole descriptions for
+equality after trimming and lower-casing; that is a different question (is this the same
+sentence?), so it is left as it is rather than shared.
 
 ### The algorithm
 
@@ -164,59 +197,85 @@ the test clips (below):
    at 0, the last ends at the clip's duration.
 4. **Stretch signature.** The mean of its non-blank frames' normalised grids, normalised again. A
    stretch of only blank frames has none.
-5. **Groups.** Two stretches (in any clips, or the same clip) with signatures closer than 0.2 are
-   the same scene; groups are the connected sets (union-find, i.e. single linkage). A stretch
-   without a signature is a group of its own. Group ids count from 1 in order of first appearance
-   (videos in input order, stretches in time order), so the same inputs always get the same ids.
-6. **Labels.** The group's medoid (the stretch with the smallest total distance to the other
-   members, the first on a tie) names it: the clip's description segment covering at least half of
-   that stretch, else the clip's summary. No extra request.
-7. **Per clip and per segment.** A clip's group is the one covering most of its duration; each
+5. **Stretch words.** The words of the description segments that overlap this stretch more than
+   any other, plus the clip's summary when the stretch is the whole clip or no segment falls in
+   it. Fewer than 3 distinct words: nothing to compare.
+6. **Groups.** Two stretches are joined when their signatures are closer than 0.2 (the same
+   shot), or when they are in different clips and their words' Jaccard index is at least 0.25.
+   Two stretches of one clip are never joined by words (they often carry the same summary). A
+   stretch without a signature (blank) is a group of its own, whatever its words. Groups are the
+   connected sets (union-find, i.e. single linkage). Group ids count from 1 in order of first
+   appearance (videos in input order, stretches in time order), so the same inputs always get the
+   same ids.
+7. **Labels.** The group's medoid (the stretch with the smallest total distance to the other
+   members, each pair's distance being the closer of its two signals, each over its threshold;
+   the first on a tie) names it: the clip's description segment covering at least half of that
+   stretch, else the clip's summary. No extra request.
+8. **Per clip and per segment.** A clip's group is the one covering most of its duration; each
    description segment gets the group of the stretch overlapping it most.
 
-Pairwise comparison is O(n²) over stretches with 256 multiply-adds per pair (four rotations × 64):
-10,000 stretches ≈ 50 M pairs ≈ 13 G multiply-adds, seconds in a release build. Beyond that a
-nearest-neighbour index would be the next step; not needed for "thousands of clips".
+Pairwise comparison is O(n²) over stretches: 256 multiply-adds for the pictures (four rotations ×
+64) and a merge of two sorted lists of a dozen or two word ids for the words. 10,000 stretches ≈
+50 M pairs, seconds in a release build. Beyond that a nearest-neighbour index would be the next
+step; not needed for "thousands of clips".
 
 ### Measured on the test clips (provisional)
 
-The thresholds are **provisional**: calibrated only on near-duplicates of one real video and on
-synthetic patterns. There is no real hard positive (the same place re-shot, a moved tripod, a
-retake) or hard negative (two different real scenes from one shoot) among the fixtures, so the
-0.2 threshold is not validated on either; retuning it is a later issue with real footage in hand.
+The thresholds are **provisional**: the pictures' is calibrated only on near-duplicates of one real
+video and on synthetic patterns, the words' only on descriptions written for the tests in the
+style the model writes them — **not on real model output**: no live key was available where this
+was developed, and the mock server answers every clip with the same sentence. There is no real
+hard positive (the same place re-shot, a moved tripod, a retake) or hard negative (two different
+real scenes from one shoot) among the fixtures, so neither threshold is validated on either;
+retuning them is a later issue with real footage and its real descriptions in hand.
 
 The four clips in `tests/clips/` are the same footage (a rotating Earth at night): the MP4, the
 MOV and the WebM are one video in three containers, `rotated-90.mp4` its first 6 s with a 90°
 rotation tag. The closest thing to a hard positive the fixtures allow is that footage *re-framed*:
 its first 6 s cropped and scaled back up, as a zoomed or panned camera would see it. Different
 scenes are `videotestsrc` patterns. All of these are made in-process with GStreamer by the test
-`grouping_distances_on_the_test_clips` (`src/folder.rs`), which prints this table:
+`grouping_distances_on_the_test_clips` (`src/folder.rs`), which gives each a description in
+different words (as two requests would) and prints this table:
 
 ```sh
 cargo test --lib grouping_distances -- --nocapture
 ```
 
-The distance is the one `group_clips` joins by: `1 − r` between stretch signatures, best of the
-four rotations, closest pair of stretches.
+The pictures' distance is the one `group_clips` joins by: `1 − r` between stretch signatures,
+best of the four rotations, closest pair of stretches. The words' is the Jaccard index.
 
-| From the MP4 to | distance | grouped (< 0.2) |
+| From the MP4 to | pictures | words | grouped by |
+|---|---|---|---|
+| MOV / WebM (same video, other container) | 0.000–0.001 | 0.31–0.38 | both |
+| `rotated-90.mp4` | 0.022 | 0.64 | both |
+| itself zoomed 1.25× (centre crop) | 0.355 | 0.58 | **words** |
+| itself panned 20 % (left crop) | 0.598 | 0.73 | **words** |
+| itself panned 40 % | 0.702 | 0.50 | **words** |
+| `smpte`, `gradient`, `circular` | 0.84–0.89 | 0.00–0.07 | no |
+| `ball`, `pinwheel` | 0.95–0.98 | 0.00 | no |
+| **Between patterns** | | | |
+| `smpte` vs `gradient` (the closest pictures) | 0.359 | 0.00 | no |
+| `pinwheel` vs `circular` ("black and white … the centre") | 0.991 | 0.33 | **words: a false positive** |
+| every other pair | 0.59–1.01 | 0.00–0.22 | no |
+
+So the pictures' 0.2 sits between "the same shot" (≤ 0.02) and "anything else" (≥ 0.36), and
+re-framing the same scene counts as "anything else" there; the words bring the re-framed footage
+back. Raw mean absolute difference, as key frames use it, could not have told the shots apart:
+Earth vs `ball` is 0.067 there, Earth vs its own rotation 0.032.
+
+The words' threshold comes from `text_similarity_of_descriptions` (`src/groups.rs`, `cargo test
+--lib text_similarity -- --nocapture`): 19 descriptions of a day's shoot — five subjects each
+described twice as a re-shoot would be (another position or zoom), one pair in Russian, and seven
+other clips of the same shoot, some at the same place as a subject.
+
+| Pairs | Jaccard | at 0.25 |
 |---|---|---|
-| MOV / WebM (same video, other container) | 0.000–0.001 | yes |
-| `rotated-90.mp4` | 0.022 | yes |
-| itself zoomed 1.25× (centre crop) | 0.355 | **no** |
-| itself panned 20 % (left crop) | 0.598 | **no** |
-| itself panned 40 % | 0.702 | no |
-| `smpte`, `gradient`, `circular` | 0.84–0.89 | no |
-| `ball`, `pinwheel` | 0.95–0.98 | no |
-| **Between patterns** | | |
-| `smpte` vs `gradient` (the closest pair) | 0.359 | no |
-| every other pair | 0.59–1.01 | no |
+| The same subject filmed again (6 pairs) | 0.27–0.50 (onion 0.27, tent 0.29, waves 0.30, hiker 0.31, goats 0.43, Russian hiker 0.50) | all joined |
+| The same place or person, something else happening (5 pairs) | 0.21–0.50 (hiker walking vs biking the same ridge 0.50) | 3 of 5 joined |
+| Different subjects (160 pairs) | 0.00–0.18 (the closest: the same hiker drinking from a stream) | none joined |
 
-So on what could be measured, 0.2 sits between "the same shot" (≤ 0.02) and "anything else"
-(≥ 0.36), and re-framing the same scene already counts as "anything else". Raw mean absolute
-difference, as key frames use it, could not have told the shots apart: Earth vs `ball` is 0.067
-there, Earth vs its own rotation 0.032.
-
+0.25 sits in the gap between 0.18 and 0.27, nearer the re-shoots, to keep joins of different
+subjects rare; the margin is thin on both sides, which is why it is provisional.
 ## 3. The folder run
 
 ### Concurrency and rate limits
@@ -245,8 +304,10 @@ Anthropic's 28 px tiles, or for OpenAI the larger of its two published schemes, 
 tile and 1.62 per 32 px patch) and the prompt text (bytes / 3.5, an overestimate for English and
 for Cyrillic alike), plus 10 %, and output at the request's `max_tokens`, the most it can be
 billed for. When an answer comes back, the reservation is replaced by its real cost; a failed
-request releases it; a timeout — the one failure the provider may have billed without saying how
-much — keeps the whole bound as spent.
+request releases it; a timeout, or an answer that came back but could not be read at all
+(`AiError::BadAnswer`: the two failures the provider may have billed without the error saying how
+much) keeps the whole bound as spent — a conservative estimate, since `AiError` carries no usage
+and changing that would change a public type.
 
 **Waiting for the others.** The bound is typically four or five times what a clip really costs
 (the answer is counted at 4,000 or 16,000 tokens and is usually a few hundred). So with several
@@ -272,9 +333,9 @@ What it does not guarantee:
   reachable from where this crate is developed; see `docs/design/openai-provider.md`). The
   answer's slack covers a small error there, but it is not a proven bound.
 - **A retried attempt may have been billed.** A lost connection *after* the request was sent, or
-  an answer that could not be read, is retried (as it always was for a single `describe`); if the
-  provider billed that first attempt, the run never learns of it, and only the last attempt's
-  usage is counted. A timeout, the common case, is not retried and is counted at its bound.
+  a 5xx, is retried (as it always was for a single `describe`); if the provider billed that first
+  attempt, the run never learns of it, and only the last attempt's usage is counted. A timeout,
+  the common case, and an unreadable answer are not retried and are counted at their bound.
 
 The cap counts only what the run itself spends: cached clips are free. A resumed run with the same
 `--max-cost` gets the full amount again.
@@ -291,7 +352,9 @@ key, no credit, a spend limit), stop describing new clips. The clips left are st
 the cache (`cached_clip`) and served from it when it has them — they cost nothing and are already
 on disk, so a `--resume --max-cost` run that hits the cap still prints and groups every clip
 described before; only the clips that would need a request are `NotStarted`. `FolderRun::stopped`
-says why the run stopped.
+says why the run stopped. That policy lives in one function, `serve_after_stop`, which
+`describe_folder` calls for the clips it did not take up and the CLI calls for the folders after
+the one that stopped.
 
 ## 4. API
 
@@ -308,6 +371,9 @@ Always built (no GStreamer):
   `Reserved::{Yes(Reservation), OverBudget, Cancelled}`; `Reservation::settle(actual_usd)`;
   `spent_usd()`, `max_usd()`; `request_cost_bound(model, &request)`.
 - `cached_clip(video, &cache, &run, &options)`: what the cache has for a video, nothing sent.
+- `serve_after_stop(videos, cache, &run, &options, &stop, on_event)`: the clips a stopped run did
+  not take up, served from the cache (or `NotStarted`; nothing at all after a cancel).
+- `Budget::refused_usd()`: the bound of the last request found over budget, for a message.
 - `group_clips(&[&DescribedClip])` → `Grouping { groups: Vec<Group { id, label, stretches }>,
   clips: Vec<ClipGroups { group, stretches: Vec<Stretch { start_s, end_s, group }>, segments }> }`.
 
@@ -363,10 +429,14 @@ many clips came from the cache.
   `describe_folder`. Every cache is opened before anything is sent.
 - `--resume` and `--force` exclude each other; `--cache-dir` needs one of them. `--at` and
   `--estimate` take none of the folder-run options.
-- A budget stop says the cap and what to do: `Stopped at --max-cost $5.00: 120 of 400 videos not
-  described. Raise --max-cost and run again with --resume to continue.` Without `--resume` or
-  `--force` nothing was saved, and the message says so: the videos described in this run were
-  not saved, so running again pays for them again too.
+- A budget stop says the cap, what was spent, why it stopped short of the cap, and what to do:
+  `Stopped at --max-cost $0.03: 2 of 4 videos not described. $0.0143 spent; the next video could
+  cost up to $0.0231 (its answer counted at full length, though it usually costs a fraction of
+  that), which would pass the cap. Each video needs that much room before it is sent, so a cap
+  close to --estimate's total can stop a video or two early. Raise --max-cost and run again with
+  --resume to continue.` Without `--resume` or `--force` nothing was saved, and the message says
+  so: the videos described in this run were not saved, so running again pays for them again
+  too. `--max-cost`'s help says the same about a cap close to `--estimate`'s total.
 - The exit code is 1 whenever a video was not described (failed, over budget, not started,
   cancelled), as a failure was before.
 
@@ -384,9 +454,12 @@ many clips came from the cache.
 - Rate gate: a 429 on one thread holds back another thread's next attempt (synchronised on the
   gate's state, not a sleep).
 - Grouping: synthetic grids (a scene, its rotation, another scene, a blank clip, a clip with a
-  cut) and, on Linux, the real test clips (one group) plus `videotestsrc` clips made in-process
-  (their own groups — this half always runs, no `gst-launch-1.0` needed), and the distance table
-  above.
+  cut); clips whose pictures differ joined by their descriptions, never two stretches of one clip
+  or a blank one; the word table above; and, on Linux, the real test clips (one group) plus
+  `videotestsrc` clips made in-process (their own groups — this half always runs, no
+  `gst-launch-1.0` needed), and the distance table above.
+- An unreadable answer counts its bound as spent; after a stop, the clips left are finished in
+  order (none after a cancel).
 - Folder run, on Linux with a mock HTTP server (the `TcpListener` pattern of the other tests):
   an interrupted run (cancelled after its first clip) resumes and sends only the rest; a third run
   sends nothing; `--force` sends everything again; a budget below one clip's bound sends nothing and
@@ -398,8 +471,9 @@ many clips came from the cache.
 
 ## Decisions made without the owner
 
-- **Perceptual fingerprints for grouping**, labels from the existing descriptions — see
-  "Recommendation" above. CLIP stays a possible optional feature later, not a default dependency.
+- **Perceptual fingerprints and the descriptions' words for grouping**, either one joining,
+  labels from the existing descriptions — see "Recommendation" above. CLIP stays a possible
+  optional feature later, not a default dependency.
 - **The cache is opt-in** (`--resume`/`--force`), not written by every run: a plain run keeps
   having no side effects on the footage folder. Consequence: pass `--resume` from the first run
   on, or the first run's results are not there to resume from.
@@ -425,14 +499,19 @@ many clips came from the cache.
   segment is then mapped to the stretch it overlaps most.
 - **Every stretch gets a group**, a singleton when nothing matches, so every clip and segment has
   an id; blank stretches are always singletons.
-- **Single linkage** (connected components) rather than average linkage: simple, deterministic, and
-  what "the same scene" means for near-duplicates; the known risk — a chain of gradually changing
-  shots merging — is bounded by the strict 0.2 threshold.
+- **Single linkage** (connected components) rather than average linkage: simple and deterministic.
+  The known risk — a chain of gradually changing shots, or of clips each described much like the
+  next, merging — is bounded for the pictures by the strict 0.2 threshold; for the words it is
+  real on a large folder described in similar words (see "What it cannot do").
 - **JSON stays an array** of per-clip objects; group data is added to each clip, not a new top-level
   object.
-- **Thresholds are fixed constants** (0.2 same scene, 0.5 + 0.05 cut, 4 blank), not options, and
-  provisional: measured above on near-duplicates, re-framings and synthetic patterns only;
-  retuning is a later issue with real footage in hand.
+- **Thresholds are fixed constants** (0.2 same shot, 0.25 shared words with at least 3 words,
+  0.5 + 0.05 cut, 4 blank), not options, and provisional: measured above on near-duplicates,
+  re-framings, synthetic patterns and descriptions written for the tests only; retuning is a
+  later issue with real footage and real descriptions in hand.
+- **Words never join two stretches of one clip, nor a blank stretch**: stretches of one clip
+  often carry the same summary, and a blank stretch's words ("a black screen") would gather every
+  black leader of a folder into one group.
 
 [defaulthasher]: https://doc.rust-lang.org/std/collections/hash_map/struct.DefaultHasher.html
 [fnv]: http://www.isthe.com/chongo/tech/comp/fnv/

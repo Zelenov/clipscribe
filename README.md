@@ -124,25 +124,30 @@ as soon as one video failed or was not started: keep the index, as above.
 - **Several at once.** `RunOptions::jobs` clips (default 4) are in flight; a rate limit on one
   pauses all of them.
 - **Budget.** Before each request, `Budget` sets aside the most it can cost (the answer counted at
-  its longest). A request that does not fit only because of the others in flight waits for them
-  to settle (they usually cost a fraction of what they set aside); one that could pass the cap
-  even alone is not sent, the clip comes back `ClipOutcome::OverBudget`, and no new clip is
-  described — the clips left are still served from the cache when it has them. The cap holds as
-  long as each request is billed at most once and within its bound; OpenAI's image billing is
-  taken from its published formulas, and a request retried after a lost connection may, rarely,
-  have been billed twice.
+  its longest, so several times what it usually costs). A request that does not fit only because
+  of the others in flight waits for them to settle; one that could pass the cap even alone is not
+  sent, the clip comes back `ClipOutcome::OverBudget`, and no new clip is described — the clips
+  left are still served from the cache when it has them (`serve_after_stop`, also for a loop over
+  several folders), and `Budget::refused_usd` says what the refused clip could have cost. A
+  timeout or an unreadable answer counts as its whole bound, since it may have been billed. The
+  cap holds as long as each request is billed at most once and within its bound; OpenAI's image
+  billing is taken from its published formulas, and a request retried after a lost connection
+  may, rarely, have been billed twice.
 - **Outcomes.** `FolderRun::clips` has a `ClipOutcome` per video, in order (`Described`, `Cached`,
   `Failed`, `OverBudget`, `NotStarted`), with `usage` (what this run spent) and `stopped` (why it
   stopped early, if it did). `FolderEvent`s arrive from the worker threads, for a progress display.
   A `Cached` clip's `usage` is what it cost when it was first described, not part of this run's.
-- **Grouping.** `group_clips` puts clips, and stretches within them, that show the same scene in
-  one `Group`, with a label taken from the descriptions. It compares 8×8 brightness grids of the
-  frames already sent (whatever the exposure, and turned sideways too), so it costs nothing,
-  runs offline and gives the same groups every time. It finds the same *shot* — duplicates,
-  re-exports, a clip stored sideways, a camera that did not move — not the same place once the
-  camera moved or zoomed (a 1.25× zoom of the same footage is already a different group), and
-  not the same activity in a different place. Its thresholds are provisional: measured on
-  near-duplicates and synthetic patterns, not yet on real retakes.
+- **Grouping.** `group_clips` puts clips, and stretches within them, in one `Group` when they look
+  like the same shot or their descriptions say much the same thing, with a label taken from the
+  descriptions. The pictures (8×8 brightness grids of the frames already sent, whatever the
+  exposure, turned sideways too) find duplicates, re-exports, a clip stored sideways and a
+  camera that did not move. The descriptions' words (shared words over all words, common words
+  dropped) find the same subject or activity filmed again from elsewhere or zoomed, as long as
+  the descriptions say it in similar words — and they also join the same place with something
+  else happening, or different things described with the same generic words ("black and white",
+  "the centre"). Both cost nothing, run offline and give the same groups every time. Both
+  thresholds are provisional: measured on near-duplicates, synthetic patterns and descriptions
+  written for the tests, not yet on real retakes and real descriptions.
 
 To build your own loop instead, the parts are public: `CacheKey`, `Cache::get`/`put`,
 `cached_clip`, `describe_clip` (one clip, within a `Budget`), `Budget::reserve_or_wait` and

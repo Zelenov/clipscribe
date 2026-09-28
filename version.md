@@ -9,13 +9,15 @@
 - `--max-cost USD`: a budget cap. Before each request the most it can cost is set aside; a video
   that does not fit only because of others in flight waits for them, and one that could take the
   run past the cap even alone is not sent, and no new video is described (videos already in the
-  cache are still shown). The message says the cap and what to do next. Library: `Budget`
-  (`reserve_or_wait`, `Reserved`), `request_cost_bound`, `cached_clip`.
-- `--groups`: groups similar footage (videos, and stretches within them, showing the same shot:
-  duplicates, re-exports, a camera that did not move — not the same place filmed from a moved or
-  zoomed camera), each group with a label from the descriptions, at no extra cost. Text ends with a `Groups:`
-  section; JSON clip objects gain `group`, `group_label`, `stretches`, and each moment a `group`.
-  Library: `group_clips`.
+  cache are still shown). The message says the cap, what was spent, what the next video could
+  have cost and what to do next. Library: `Budget` (`reserve_or_wait`, `Reserved`,
+  `refused_usd`), `request_cost_bound`, `cached_clip`, `serve_after_stop`.
+- `--groups`: groups similar footage — videos, and stretches within them, that look like the same
+  shot (duplicates, re-exports, a camera that did not move) or whose descriptions share enough
+  words (the same subject or activity even after the camera moved or zoomed; sometimes also the
+  same place with something else happening) — each group with a label from the descriptions, at
+  no extra cost. Text ends with a `Groups:` section; JSON clip objects gain `group`,
+  `group_label`, `stretches`, and each moment a `group`. Library: `group_clips`.
 - Library: `describe_folder` runs a whole folder with `FolderEvent`s for a progress display;
   `describe_clip` describes one clip within a `Budget`; `find_videos` lists a folder's videos.
 
