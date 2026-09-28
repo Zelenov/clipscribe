@@ -104,6 +104,8 @@ pub struct Budget {
 struct Spending {
     spent: f64,
     reserved: f64,
+    /// The bound of the last request [`Budget::reserve_or_wait`] found over budget.
+    refused: Option<f64>,
     /// How many times [`Budget::reserve_or_wait`] had to wait for other reservations to settle.
     waits: usize,
 }
@@ -143,6 +145,13 @@ impl Budget {
         self.lock().spent
     }
 
+    /// What the last request found [`Reserved::OverBudget`] by [`Budget::reserve_or_wait`] could
+    /// have cost (its bound, see [`request_cost_bound`]), in US dollars: why a run stopped short of
+    /// the cap. `None` when no request was refused.
+    pub fn refused_usd(&self) -> Option<f64> {
+        self.lock().refused
+    }
+
     /// Set aside `usd` for a request about to be sent, or `None` when what is spent, what is set
     /// aside for other requests and `usd` together would pass the cap: then the request must not be
     /// sent now. Never waits; see [`Budget::reserve_or_wait`] for a request that should wait for
@@ -178,6 +187,7 @@ impl Budget {
                     .is_none_or(|max| state.spent + others + usd <= max)
             };
             if !fits(&state, 0.0) {
+                state.refused = Some(usd);
                 return Reserved::OverBudget;
             }
             if fits(&state, state.reserved) {
@@ -226,7 +236,7 @@ pub struct Reservation<'a> {
 }
 
 impl Reservation<'_> {
-    /// What was set aside.
+    /// What was set aside, in US dollars.
     pub fn usd(&self) -> f64 {
         self.usd
     }
@@ -459,6 +469,47 @@ pub fn cached_clip(
     cache.get(&key)
 }
 
+/// What becomes of the clips a run did not take up because it stopped for `stop`: `videos` are
+/// those clips, each with its index for the events. After [`Stop::OverBudget`] or [`Stop::Job`],
+/// each is looked up in `cache` ([`cached_clip`]: nothing is sent) and served
+/// ([`ClipOutcome::Cached`]) when it is there, else left [`ClipOutcome::NotStarted`]; `on_event`
+/// gets `Started` for a cached one and `Finished` for each, in the order given, so a display
+/// showing clips in order can move past them. After [`Stop::Cancelled`] every one is
+/// `NotStarted`, with no lookup and no event: Ctrl+C means stop now.
+///
+/// [`describe_folder`] does this for its own clips; a program running several folders one after
+/// another (each with its own cache, one [`Budget`]) calls it for the folders after the one that
+/// stopped.
+pub fn serve_after_stop<'v>(
+    videos: impl IntoIterator<Item = (usize, &'v Path)>,
+    cache: Option<&crate::Cache>,
+    run: &RunOptions,
+    options: &crate::Options,
+    stop: &Stop,
+    on_event: &dyn Fn(FolderEvent<'_>),
+) -> Vec<ClipOutcome> {
+    videos
+        .into_iter()
+        .map(|(index, video)| {
+            if *stop == Stop::Cancelled {
+                return ClipOutcome::NotStarted;
+            }
+            let outcome = cache
+                .and_then(|cache| cached_clip(video, cache, run, options))
+                .map_or(ClipOutcome::NotStarted, ClipOutcome::Cached);
+            if matches!(outcome, ClipOutcome::Cached(_)) {
+                on_event(FolderEvent::Started { index, video });
+            }
+            on_event(FolderEvent::Finished {
+                index,
+                video,
+                outcome: &outcome,
+            });
+            outcome
+        })
+        .collect()
+}
+
 #[cfg(feature = "frames")]
 pub use run::{describe_clip, describe_folder};
 
@@ -469,23 +520,26 @@ mod run {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        cached_clip, request_cost_bound, Budget, ClipOutcome, DescribedClip, FolderEvent,
+        request_cost_bound, serve_after_stop, Budget, ClipOutcome, DescribedClip, FolderEvent,
         FolderRun, FrameFingerprint, Reserved, RunOptions, Stop,
     };
     use crate::cache::{Cache, CacheKey, ClipRecord};
-    use crate::describe::{build_request, parse_answer, Frame};
+    use crate::describe::{build_request, parse_answer, FrameSampling};
+    use crate::frames::{self, Sampled};
     use crate::provider::{AiError, AiProvider, AiRequest, AiUsage, RateGate};
     use crate::tags::{build_combined_request, parse_combined_answer, Tag};
-    use crate::{srt, Cue, Error, Options, Stage};
+    use crate::{srt, Cue, Error, Options, Stage, MAX_DURATION_S};
 
     /// Describe the clip at `video` like [`crate::describe`] (or [`crate::describe_with_tags`]
     /// when `vocabulary` is given), keeping its frames' fingerprints for [`crate::group_clips`],
     /// within `budget`: once its frames are read, the request's upper bound
     /// ([`super::request_cost_bound`]) is reserved first ([`Budget::reserve_or_wait`]: waiting
     /// for other requests in flight on the same budget to settle when only they are in the way),
-    /// and `Ok(None)` means it could not fit even then, so nothing was sent. A timeout counts its
-    /// whole bound as spent (it may have been billed); any other failure spends nothing but a bad
-    /// answer's usage.
+    /// and `Ok(None)` means it could not fit even then, so nothing was sent. A timeout, and an
+    /// answer that came back but could not be read at all ([`crate::AiError::BadAnswer`]), count
+    /// the whole bound as spent (either may have been billed, for an amount the error does not
+    /// carry); an answer read but unusable ([`Error::BadAnswer`]) counts its real usage; any other
+    /// failure spends nothing.
     ///
     /// [`crate::describe`] and [`crate::describe_with_tags`] are this with a budget without a
     /// cap: one clip is always asked for the same way.
@@ -510,9 +564,10 @@ mod run {
 
     /// A clip's frames, read, and the request made from them: everything before a request is sent.
     pub(crate) struct Prepared {
+        /// The clip's length, in seconds.
         pub(crate) duration_s: f64,
-        pub(crate) frames: Vec<Frame>,
-        pub(crate) fingerprints: Vec<Vec<u8>>,
+        /// One per frame in the request, in time order, for grouping.
+        pub(crate) fingerprints: Vec<FrameFingerprint>,
         pub(crate) request: AiRequest,
     }
 
@@ -526,8 +581,13 @@ mod run {
         cancel: &AtomicBool,
         on_stage: &mut impl FnMut(Stage),
     ) -> Result<Prepared, Error> {
-        let (duration_s, frames, fingerprints) =
-            crate::read_frames(video, options.frame_sampling, cancel, on_stage)?;
+        let (
+            duration_s,
+            Sampled {
+                frames,
+                fingerprints,
+            },
+        ) = read_frames(video, options.frame_sampling, cancel, on_stage)?;
         let request = match vocabulary {
             Some(vocabulary) => build_combined_request(
                 options.model,
@@ -549,10 +609,34 @@ mod run {
         };
         Ok(Prepared {
             duration_s,
-            frames,
             fingerprints,
             request,
         })
+    }
+
+    /// The length of the clip at `video`, in seconds, and the frames a whole-clip description is
+    /// made from, each with its fingerprint.
+    fn read_frames(
+        video: &Path,
+        sampling: FrameSampling,
+        cancel: &AtomicBool,
+        on_stage: &mut impl FnMut(Stage),
+    ) -> Result<(f64, Sampled), Error> {
+        let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
+        let duration_s = clip
+            .duration_s()
+            .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
+        if duration_s > MAX_DURATION_S {
+            return Err(Error::TooLong(duration_s));
+        }
+        match clip.sample_with_fingerprints(duration_s, sampling, cancel, |done, total| {
+            on_stage(Stage::Frame { done, total })
+        }) {
+            Ok(Some(sampled)) if !sampled.frames.is_empty() => Ok((duration_s, sampled)),
+            Ok(Some(_)) => Err(Error::Unreadable("no frames".to_string())),
+            Ok(None) => Err(Error::Cancelled),
+            Err(e) => Err(Error::Unreadable(e)),
+        }
     }
 
     /// One clip's request, with a given client.
@@ -577,7 +661,6 @@ mod run {
             let options = self.options;
             let Prepared {
                 duration_s,
-                frames,
                 fingerprints,
                 request,
             } = prepare(
@@ -601,9 +684,12 @@ mod run {
             on_stage(Stage::Asking);
             let response = match self.provider.complete(&request, self.cancel) {
                 Ok(response) => response,
-                Err(AiError::Timeout) => {
+                // Both may have been billed without saying how much: a timeout, and an answer
+                // that came back but could not be read (its usage is not carried by the error).
+                // The whole bound counts as spent, a conservative estimate.
+                Err(e @ (AiError::Timeout | AiError::BadAnswer(_))) => {
                     reservation.settle(bound);
-                    return Err(Error::Ai(AiError::Timeout));
+                    return Err(Error::Ai(e));
                 }
                 Err(AiError::Cancelled) => return Err(Error::Cancelled),
                 Err(e) => return Err(Error::Ai(e)),
@@ -626,14 +712,7 @@ mod run {
                 tags,
                 usage: response.usage,
                 duration_s,
-                frames: frames
-                    .iter()
-                    .zip(fingerprints)
-                    .map(|(frame, fingerprint)| FrameFingerprint {
-                        time_s: frame.time_s,
-                        fingerprint,
-                    })
-                    .collect(),
+                frames: fingerprints,
             }))
         }
     }
@@ -692,10 +771,9 @@ mod run {
             make_provider: &(dyn Fn() -> Result<Box<dyn AiProvider>, Error> + Sync),
             on_event: &(dyn Fn(FolderEvent<'_>) + Sync),
         ) -> FolderRun {
-            let outcomes: Vec<Mutex<ClipOutcome>> = videos
-                .iter()
-                .map(|_| Mutex::new(ClipOutcome::NotStarted))
-                .collect();
+            // `None`: not taken up (the run stopped first).
+            let outcomes: Vec<Mutex<Option<ClipOutcome>>> =
+                videos.iter().map(|_| Mutex::new(None)).collect();
             let next = AtomicUsize::new(0);
             let halt = AtomicBool::new(false);
             let stopped: Mutex<Option<Stop>> = Mutex::new(None);
@@ -719,25 +797,8 @@ mod run {
                                 break;
                             };
                             if halt.load(Ordering::Relaxed) {
-                                // Stopped: what the cache has costs nothing, the rest waits for
-                                // the next run.
-                                let outcome = self
-                                    .cache
-                                    .and_then(|cache| {
-                                        cached_clip(video, cache, self.run, self.options)
-                                    })
-                                    .map_or(ClipOutcome::NotStarted, ClipOutcome::Cached);
-                                if matches!(outcome, ClipOutcome::Cached(_)) {
-                                    on_event(FolderEvent::Started { index, video });
-                                }
-                                on_event(FolderEvent::Finished {
-                                    index,
-                                    video,
-                                    outcome: &outcome,
-                                });
-                                *outcomes[index].lock().unwrap_or_else(|e| e.into_inner()) =
-                                    outcome;
-                                continue;
+                                // Left for `serve_after_stop`, once the clips in flight are done.
+                                break;
                             }
                             on_event(FolderEvent::Started { index, video });
                             let outcome = match &provider {
@@ -766,7 +827,8 @@ mod run {
                                 video,
                                 outcome: &outcome,
                             });
-                            *outcomes[index].lock().unwrap_or_else(|e| e.into_inner()) = outcome;
+                            *outcomes[index].lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(outcome);
                         }
                     });
                 }
@@ -774,11 +836,29 @@ mod run {
             if self.cancel.load(Ordering::Relaxed) {
                 stop(Stop::Cancelled);
             }
-            let clips: Vec<ClipOutcome> = outcomes
+            let stopped = stopped.into_inner().unwrap_or_else(|e| e.into_inner());
+            let mut clips: Vec<Option<ClipOutcome>> = outcomes
                 .into_iter()
                 .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
                 .collect();
-            let stopped = stopped.into_inner().unwrap_or_else(|e| e.into_inner());
+            let left: Vec<usize> = (0..clips.len()).filter(|&i| clips[i].is_none()).collect();
+            if let Some(why) = stopped.as_ref().filter(|_| !left.is_empty()) {
+                let served = serve_after_stop(
+                    left.iter().map(|&i| (i, videos[i].as_path())),
+                    self.cache,
+                    self.run,
+                    self.options,
+                    why,
+                    on_event,
+                );
+                for (i, outcome) in left.into_iter().zip(served) {
+                    clips[i] = Some(outcome);
+                }
+            }
+            let clips: Vec<ClipOutcome> = clips
+                .into_iter()
+                .map(|c| c.unwrap_or(ClipOutcome::NotStarted))
+                .collect();
             // A run that was stopped only after its last clip started still did everything.
             let stopped = stopped.filter(|_| {
                 clips
@@ -973,6 +1053,38 @@ mod tests {
         );
     }
 
+    /// After a budget stop every clip left is finished (not started, with no cache to serve it
+    /// from), in order, so a display can move past them; after a cancel nothing more happens.
+    #[test]
+    fn after_a_stop_the_clips_left_are_finished_in_order_unless_cancelled() {
+        let videos = [PathBuf::from("a.mp4"), PathBuf::from("b.mp4")];
+        let options = crate::Options {
+            api_key: String::new(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: crate::FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+        };
+        let finished = Mutex::new(Vec::new());
+        let on_event = |event: FolderEvent<'_>| {
+            if let FolderEvent::Finished { index, .. } = event {
+                finished.lock().expect("lock").push(index);
+            }
+        };
+        let left = || videos.iter().enumerate().map(|(i, v)| (i + 3, v.as_path()));
+        let run = RunOptions::default();
+        let served = serve_after_stop(left(), None, &run, &options, &Stop::OverBudget, &on_event);
+        assert_eq!(served, [ClipOutcome::NotStarted, ClipOutcome::NotStarted]);
+        assert_eq!(*finished.lock().expect("lock"), [3, 4]);
+        let served = serve_after_stop(left(), None, &run, &options, &Stop::Cancelled, &on_event);
+        assert_eq!(served.len(), 2);
+        assert_eq!(
+            finished.lock().expect("lock").len(),
+            2,
+            "no event after a cancel"
+        );
+    }
+
     /// A request that does not fit only because of another one in flight waits for it to settle
     /// (for much less than it set aside, as requests do) and then goes ahead; one that could not
     /// fit even alone is over budget at once.
@@ -984,6 +1096,11 @@ mod tests {
         assert!(
             matches!(budget.reserve_or_wait(1.5, &cancel), Reserved::OverBudget),
             "too much even alone: no wait"
+        );
+        assert_eq!(
+            budget.refused_usd(),
+            Some(1.5),
+            "remembered for the message"
         );
         let (sent, got) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
@@ -1068,12 +1185,12 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        /// A local server answering every request with a description, on as many connections at
-        /// once as come in, holding each answer up to `wait` for another request to overlap it:
-        /// how many requests it got, and the most it had in work at the same time.
         /// When a held answer may go.
         type Release = Arc<dyn Fn() -> bool + Send + Sync>;
 
+        /// A local server answering every request with a description, on as many connections at
+        /// once as come in, holding each answer up to `wait` for another request to overlap it:
+        /// how many requests it got, and the most it had in work at the same time.
         struct Server {
             url: String,
             requests: Arc<AtomicUsize>,
@@ -1404,6 +1521,7 @@ mod tests {
             assert_eq!(run.stopped, Some(Stop::OverBudget));
             assert_eq!(server.requests.load(Ordering::SeqCst), 0);
             assert_eq!(budget.spent_usd(), 0.0);
+            assert_eq!(budget.refused_usd(), Some(bounds[0]), "what did not fit");
             assert!(cache.is_empty());
 
             // Room for the first clip, and then not for the second's bound on top of what the
@@ -1426,6 +1544,44 @@ mod tests {
             assert_eq!(kinds(&run), ["described", "over budget"]);
             assert_eq!(server.requests.load(Ordering::SeqCst), 1);
             assert!(one_clip.spent_usd() <= cap);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An answer that came back but could not be read may have been billed, and the error
+        /// does not say for how much: like a timeout, its whole bound counts as spent, so a
+        /// run of them cannot go past the cap uncounted.
+        #[test]
+        fn an_unreadable_answer_counts_its_bound_as_spent() {
+            struct Unreadable;
+            impl AiProvider for Unreadable {
+                fn complete(
+                    &self,
+                    _: &crate::provider::AiRequest,
+                    _: &AtomicBool,
+                ) -> Result<crate::provider::AiResponse, crate::AiError> {
+                    Err(crate::AiError::BadAnswer("not JSON: {".to_string()))
+                }
+            }
+            let (dir, videos) = folder("bad-answer", &["rotated-90.mp4"]);
+            let budget = Budget::new(None);
+            let run = Runner {
+                cache: None,
+                run: &RunOptions::default(),
+                options: &options(),
+                budget: &budget,
+                cancel: &AtomicBool::new(false),
+            }
+            .go(
+                &videos,
+                &|| -> Result<Box<dyn AiProvider>, Error> { Ok(Box::new(Unreadable)) },
+                &|_| {},
+            );
+            assert_eq!(kinds(&run), ["failed"]);
+            assert!(
+                (budget.spent_usd() - bound(&videos[0])).abs() < 1e-12,
+                "{} spent",
+                budget.spent_usd()
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1789,15 +1945,7 @@ mod tests {
                         tags: None,
                         usage: AiUsage::default(),
                         duration_s: prepared.duration_s,
-                        frames: prepared
-                            .frames
-                            .iter()
-                            .zip(prepared.fingerprints)
-                            .map(|(f, fingerprint)| FrameFingerprint {
-                                time_s: f.time_s,
-                                fingerprint,
-                            })
-                            .collect(),
+                        frames: prepared.fingerprints,
                     }
                 })
                 .collect();

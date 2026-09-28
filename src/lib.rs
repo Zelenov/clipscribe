@@ -52,9 +52,9 @@ use std::time::Duration;
 pub use cache::{cache_path, Cache, CacheKey, ClipRecord, FileIdentity, CACHE_FILE_NAME};
 pub use describe::*;
 pub use folder::{
-    cached_clip, find_videos, request_cost_bound, Budget, ClipOutcome, DescribedClip, FolderEvent,
-    FolderRun, FrameFingerprint, Reservation, Reserved, RunOptions, Stop, DEFAULT_JOBS,
-    VIDEO_EXTENSIONS,
+    cached_clip, find_videos, request_cost_bound, serve_after_stop, Budget, ClipOutcome,
+    DescribedClip, FolderEvent, FolderRun, FrameFingerprint, Reservation, Reserved, RunOptions,
+    Stop, DEFAULT_JOBS, VIDEO_EXTENSIONS,
 };
 #[cfg(feature = "frames")]
 pub use folder::{describe_clip, describe_folder};
@@ -182,36 +182,6 @@ fn gated_provider_for(
                 .map_err(Error::Ai)?
                 .with_rate_gate(gate),
         )),
-    }
-}
-
-/// The frames a whole-clip description is made from, with the length of the clip and each
-/// frame's fingerprint (see [`FrameFingerprint`]): for [`describe_clip`], which [`describe`] and
-/// [`describe_with_tags`] go through.
-#[cfg(feature = "frames")]
-#[allow(clippy::type_complexity)]
-fn read_frames(
-    video: &std::path::Path,
-    sampling: FrameSampling,
-    cancel: &std::sync::atomic::AtomicBool,
-    on_stage: &mut impl FnMut(Stage),
-) -> Result<(f64, Vec<Frame>, Vec<Vec<u8>>), Error> {
-    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
-    let duration_s = clip
-        .duration_s()
-        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
-    if duration_s > MAX_DURATION_S {
-        return Err(Error::TooLong(duration_s));
-    }
-    match clip.sample_with_fingerprints(duration_s, sampling, cancel, |done, total| {
-        on_stage(Stage::Frame { done, total })
-    }) {
-        Ok(Some((frames, fingerprints))) if !frames.is_empty() => {
-            Ok((duration_s, frames, fingerprints))
-        }
-        Ok(Some(_)) => Err(Error::Unreadable("no frames".to_string())),
-        Ok(None) => Err(Error::Cancelled),
-        Err(e) => Err(Error::Unreadable(e)),
     }
 }
 
