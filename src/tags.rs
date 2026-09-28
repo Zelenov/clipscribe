@@ -322,7 +322,7 @@ pub fn parse_tags_only_answer(
     match response.stop_reason.as_str() {
         "end_turn" => {}
         "max_tokens" => return Err("The answer was too long".to_string()),
-        "refusal" => return Err("Claude declined to suggest tags".to_string()),
+        "refusal" => return Err("The model declined to suggest tags".to_string()),
         other => return Err(format!("The model stopped early ({other})")),
     }
     let tags = parse_tag_suggestions(&response.json["tags"], vocabulary, duration_s);

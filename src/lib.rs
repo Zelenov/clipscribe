@@ -34,6 +34,7 @@ pub mod anthropic;
 mod describe;
 #[cfg(feature = "frames")]
 pub mod frames;
+pub mod openai;
 pub mod provider;
 pub mod srt;
 mod tags;
@@ -41,7 +42,7 @@ mod tags;
 use std::time::Duration;
 
 pub use describe::*;
-pub use provider::{AiError, AiUsage};
+pub use provider::{AiError, AiProvider, AiUsage, Provider};
 pub use tags::*;
 
 /// One subtitle cue, sent with the frames so the description knows what is said.
@@ -55,7 +56,8 @@ pub struct Cue {
 /// How a clip is described.
 #[derive(Clone, PartialEq)]
 pub struct Options {
-    /// An Anthropic API key.
+    /// The API key for `model`'s provider (see [`Model::provider`]): an Anthropic key for an
+    /// Anthropic model, an OpenAI key for a GPT model.
     pub api_key: String,
     pub model: Model,
     pub language: SummaryLanguage,
@@ -132,6 +134,18 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The client for `options.model`'s provider.
+fn provider_for(options: &Options) -> Result<Box<dyn provider::AiProvider>, Error> {
+    match options.model.provider {
+        Provider::Anthropic => Ok(Box::new(
+            anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?,
+        )),
+        Provider::OpenAi => Ok(Box::new(
+            openai::OpenAi::new(options.api_key.clone()).map_err(Error::Ai)?,
+        )),
+    }
+}
+
 /// Describe the video at `video`, with its `subtitles` (empty when it has none). `cancel` is
 /// checked between frames and while waiting for the answer; `on_stage` follows along.
 #[cfg(feature = "frames")]
@@ -142,8 +156,6 @@ pub fn describe(
     cancel: &std::sync::atomic::AtomicBool,
     mut on_stage: impl FnMut(Stage),
 ) -> Result<Described, Error> {
-    use provider::AiProvider;
-
     let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
     let duration_s = clip
         .duration_s()
@@ -169,7 +181,7 @@ pub fn describe(
         options.moments,
     );
     on_stage(Stage::Asking);
-    let provider = anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?;
+    let provider = provider_for(options)?;
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
@@ -211,8 +223,6 @@ pub fn describe_with_tags(
     cancel: &std::sync::atomic::AtomicBool,
     mut on_stage: impl FnMut(Stage),
 ) -> Result<DescribedWithTags, Error> {
-    use provider::AiProvider;
-
     let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
     let duration_s = clip
         .duration_s()
@@ -239,7 +249,7 @@ pub fn describe_with_tags(
         options.moments,
     );
     on_stage(Stage::Asking);
-    let provider = anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?;
+    let provider = provider_for(options)?;
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
@@ -274,8 +284,6 @@ pub fn suggest_tags(
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<TagSuggestions, Error> {
-    use provider::AiProvider;
-
     let request = build_tags_only_request(
         options.model,
         description,
@@ -283,7 +291,7 @@ pub fn suggest_tags(
         vocabulary,
         duration_s,
     );
-    let provider = anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?;
+    let provider = provider_for(options)?;
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
@@ -387,7 +395,7 @@ mod tests {
         let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
             Ok(described) => described,
             // The key works but its account cannot pay: nothing about the code to test.
-            Err(Error::Ai(e @ (AiError::OutOfCredit | AiError::LimitReached(_)))) => {
+            Err(Error::Ai(e @ (AiError::OutOfCredit(_) | AiError::LimitReached(_)))) => {
                 eprintln!("live test skipped: {}", e.reason());
                 return;
             }
@@ -405,6 +413,54 @@ mod tests {
         assert!(!d.summary.is_empty());
         // `Important` mode may legitimately return no segments at all for this clip (a single
         // continuous shot with nothing standing out) — that is the feature, not a failure.
+        assert!(d
+            .segments
+            .iter()
+            .all(|s| s.start_s >= 0.0 && s.end_s <= described.duration_s));
+    }
+
+    /// The same request as [`live_description_of_a_test_clip`], through OpenAI instead: only
+    /// when `OPENAI_API_KEY` is set (never in CI without that secret, and not reachable at all
+    /// from this crate's own development environment — `api.openai.com` is blocked there; see
+    /// `docs/design/openai-provider.md`).
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn live_description_of_a_test_clip_with_openai() {
+        let Some(api_key) = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+        else {
+            eprintln!("OPENAI_API_KEY not set: live OpenAI test skipped");
+            return;
+        };
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/clips/file_example_MP4_480_1_5MG.mp4");
+        let options = Options {
+            api_key: api_key.trim().to_string(),
+            model: Model::from_id("gpt-4.1-mini"),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+        };
+        let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
+            Ok(described) => described,
+            // The key works but its account cannot pay: nothing about the code to test.
+            Err(Error::Ai(e @ (AiError::OutOfCredit(_) | AiError::LimitReached(_)))) => {
+                eprintln!("live OpenAI test skipped: {}", e.reason());
+                return;
+            }
+            Err(e) => panic!("answer: {e:?}"),
+        };
+        eprintln!(
+            "live (openai): {} frames, usage {:?} (estimated {:?}), cost ${:.4}\n{:#?}",
+            described.frames,
+            described.usage,
+            estimate_usage(options.model, described.duration_s, 0),
+            options.model.cost_usd(described.usage),
+            described.description
+        );
+        let d = &described.description;
+        assert!(!d.summary.is_empty());
         assert!(d
             .segments
             .iter()
