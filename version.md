@@ -1,4 +1,4 @@
-# NEXT
+# 0.2.0
 ## Added
 - Key frames: by default, frames are chosen where the picture changes the most in each window of
   the clip's frame budget, instead of a blind fixed interval — a static shot no longer spends the
