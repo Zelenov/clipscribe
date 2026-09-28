@@ -61,6 +61,16 @@ Oversampling by 4 means roughly 4× the seeks of today for the same clip length 
 work; there is no separate cheap pre-pass, so the CPU cost is "today's per-frame seek cost, four
 times".
 
+Memory cost: holding every candidate's decoded pixels until selection (rather than one at a time)
+peaks around 100 MB for a clip long enough to hit the 240-candidate cap (240 × ~420 KB for a
+512×288 decoded frame) — bounded regardless of clip length, since the cap does not grow with
+`duration_s`, but a real increase over today's roughly one-frame-at-a-time footprint. Accepted for
+this version: 100 MB is unremarkable next to a video-editing desktop app's own footprint (frename
+decodes and displays full video frames itself), and avoiding it would mean either re-seeking to
+re-decode the chosen frames after selection (paying the seek cost twice) or fingerprinting from a
+separate, smaller decode (a second GStreamer pipeline per clip) — both add complexity for a cost
+this version does not need to pay yet.
+
 ### Selection
 
 `describe::select_key_frames(candidates, max_frames)` splits the candidates into `max_frames`
@@ -110,7 +120,8 @@ gets `--frames keyframes|interval` (default `keyframes`).
   into runtime parameters touches `sample_times`, `frame_count`, `estimate_usage`,
   `candidate_times` and every caller (CLI, library, both feature-off builds), which is a
   separably-useful change on its own and not needed to fix "static shots waste the budget" (the
-  actual problem this issue describes). Filed as a follow-up idea rather than folded in here.
+  actual problem this issue describes). Not folded into this PR; worth its own `idea` issue if a
+  user asks for it, rather than filed speculatively here.
 - **Fingerprint size (8×8) and oversampling factor (4×) are fixed constants, not configurable.**
   They are implementation detail of the scoring, not something a user needs to reach for; a future
   issue can retune them with real-world evidence if key frames prove not sharp enough.

@@ -209,7 +209,9 @@ impl Clip {
     /// `describe::FrameSampling`) — skipped in favour of `sample_times` when the frame budget
     /// ([`frame_count`]) is 0 or 1, since there is then no window to choose a frame within.
     /// Stops with `Ok(None)` when `cancel` is set between two frames. `on_frame(done, total)`
-    /// follows along.
+    /// follows along, `total` always the number of frames that will actually be sent (as before
+    /// key frames existed) even though `KeyFrames` decodes more candidates than that to choose
+    /// from.
     pub fn sample(
         &self,
         duration_s: f64,
@@ -217,20 +219,26 @@ impl Clip {
         cancel: &AtomicBool,
         mut on_frame: impl FnMut(usize, usize),
     ) -> Result<Option<Vec<Frame>>, String> {
-        let times = match sampling {
-            FrameSampling::Interval => sample_times(duration_s),
-            FrameSampling::KeyFrames if frame_count(duration_s) <= 1 => sample_times(duration_s),
-            FrameSampling::KeyFrames => candidate_times(duration_s),
+        // Below two frames' worth of budget there is no window to choose a frame within, so
+        // `KeyFrames` has nothing to add over `Interval`.
+        let key_frames = sampling == FrameSampling::KeyFrames && frame_count(duration_s) > 1;
+        let times = if key_frames {
+            candidate_times(duration_s)
+        } else {
+            sample_times(duration_s)
         };
         let orientation = self.orientation();
         let interval = match times.as_slice() {
             [a, b, ..] => b - a,
             _ => duration_s,
         };
-        let total = times.len();
+        // The frame budget `on_frame`'s `total` reports: same meaning as before key frames
+        // existed, even though `times` (the candidates to decode) can be denser than that.
+        let frame_budget = frame_count(duration_s).max(1);
+        let candidate_total = times.len().max(1);
         let mut candidates: Vec<(f64, image::RgbImage)> = Vec::new();
         for (i, time_s) in times.into_iter().enumerate() {
-            on_frame(i, total);
+            on_frame(i * frame_budget / candidate_total, frame_budget);
             if cancel.load(Ordering::Relaxed) {
                 return Ok(None);
             }
@@ -255,18 +263,14 @@ impl Clip {
             }
             candidates.push((pts, image));
         }
-        let chosen: Vec<usize> = match sampling {
-            FrameSampling::Interval => (0..candidates.len()).collect(),
-            FrameSampling::KeyFrames if frame_count(duration_s) <= 1 => {
-                (0..candidates.len()).collect()
-            }
-            FrameSampling::KeyFrames => {
-                let fingerprints: Vec<(f64, Vec<u8>)> = candidates
-                    .iter()
-                    .map(|(t, image)| (*t, fingerprint(image)))
-                    .collect();
-                select_key_frames(&fingerprints, frame_count(duration_s))
-            }
+        let chosen: Vec<usize> = if key_frames {
+            let fingerprints: Vec<(f64, Vec<u8>)> = candidates
+                .iter()
+                .map(|(t, image)| (*t, fingerprint(image)))
+                .collect();
+            select_key_frames(&fingerprints, frame_count(duration_s))
+        } else {
+            (0..candidates.len()).collect()
         };
         chosen
             .into_iter()
@@ -563,6 +567,37 @@ mod tests {
         }
     }
 
+    /// `on_frame`'s `total` is always the real frame budget (`frame_count`), the same meaning it
+    /// had before key frames existed, even though `KeyFrames` decodes many more candidates than
+    /// that: frename shows this number and sizes its progress ETA from it, so it must still match
+    /// how many frames actually get sent, not how many candidates got decoded along the way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn progress_total_is_the_frame_budget_not_the_candidate_count() {
+        let path = ci_clips().into_iter().next().expect("a test clip");
+        let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+        let duration = clip.duration_s().expect("duration");
+        let budget = frame_count(duration);
+        let mut totals_seen = Vec::new();
+        let frames = clip
+            .sample(
+                duration,
+                FrameSampling::KeyFrames,
+                &AtomicBool::new(false),
+                |_, total| {
+                    totals_seen.push(total);
+                },
+            )
+            .expect("frames")
+            .expect("not cancelled");
+        assert!(!totals_seen.is_empty());
+        assert!(
+            totals_seen.iter().all(|&t| t == budget),
+            "{totals_seen:?} vs budget {budget}"
+        );
+        assert_eq!(frames.len(), budget, "the budget the caller was shown");
+    }
+
     /// A clip whose sound runs longer than its picture gives the frames of the picture.
     #[cfg(target_os = "linux")]
     #[test]
@@ -616,6 +651,65 @@ mod tests {
             "{:?}",
             frames.iter().map(|f| f.time_s).collect::<Vec<_>>()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Below two frames' worth of budget (`frame_count(duration_s) <= 1`), `KeyFrames` takes
+    /// `sample_times`'s single midpoint frame directly, the same as `Interval` — there is no
+    /// window to choose a frame within — on a real decoded clip, not just the pure-math check in
+    /// `describe::tests`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_very_short_clip_gets_sample_times_midpoint_frame_with_key_frames_too() {
+        let dir =
+            std::env::temp_dir().join(format!("clipscribe-frames-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let clip_path = dir.join("very-short.mkv");
+        let made = std::process::Command::new("gst-launch-1.0")
+            .args([
+                "-q",
+                "videotestsrc",
+                "num-buffers=10",
+                "!",
+                "video/x-raw,framerate=10/1,width=64,height=48",
+                "!",
+                "jpegenc",
+                "!",
+                "matroskamux",
+                "!",
+                "filesink",
+            ])
+            .arg(format!("location={}", clip_path.display()))
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("gst-launch-1.0 could not make the test clip: skipped");
+            return;
+        }
+        let clip = Clip::open(&clip_path, Duration::from_secs(20)).expect("opens");
+        let duration = clip.duration_s().expect("duration");
+        assert!(duration < 2.0, "1 s clip: {duration}");
+        assert_eq!(frame_count(duration), 1);
+        let key_frames = clip
+            .sample(
+                duration,
+                FrameSampling::KeyFrames,
+                &AtomicBool::new(false),
+                |_, _| {},
+            )
+            .expect("frames")
+            .expect("not cancelled");
+        let interval_frames = clip
+            .sample(
+                duration,
+                FrameSampling::Interval,
+                &AtomicBool::new(false),
+                |_, _| {},
+            )
+            .expect("frames")
+            .expect("not cancelled");
+        assert_eq!(key_frames.len(), 1);
+        assert_eq!(key_frames[0].time_s, interval_frames[0].time_s);
+        assert_eq!(key_frames[0].time_s, sample_times(duration)[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
