@@ -103,6 +103,19 @@ pub enum FrameSampling {
     Interval,
 }
 
+/// How many moments (segments) a description gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MomentsMode {
+    /// Only moments that stand out: none at all for a static or uniform clip (the summary is
+    /// enough then), one per clearly different part of the clip otherwise. `max_segments` stays
+    /// an upper bound, never a target to fill.
+    #[default]
+    Important,
+    /// Today's behaviour before this mode existed: the model is asked to cover the whole clip in
+    /// consecutive stretches, and the extra `Important`-only validation is skipped.
+    Full,
+}
+
 /// The language descriptions are written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SummaryLanguage {
@@ -393,21 +406,45 @@ pub fn schema() -> Value {
 }
 
 /// The request to `model` describing a clip `duration_s` long from its frames and subtitles.
+/// `moments` picks the instructions for how many segments to return: see [`MomentsMode`].
 pub fn build_request(
     model: Model,
     frames: &[Frame],
     subtitles: &[Cue],
     duration_s: f64,
     language: SummaryLanguage,
+    moments: MomentsMode,
 ) -> AiRequest {
     let has_subtitles = !subtitles.is_empty();
+    let moments_instruction = match moments {
+        MomentsMode::Important => format!(
+            "Then, at most {} segments (start_s and end_s in seconds, inside 0–{:.0}) for \
+             whatever is worth a video editor's attention on its own, in one short sentence \
+             each with the key details (place, action, camera, people, objects, on-screen \
+             text). An empty list is the right answer when nothing stands out: a static shot, \
+             someone talking to camera, or walking while talking, with nothing changing. A \
+             small or vague change is not a segment. Add a segment for a stretch that clearly \
+             stands out from the rest of the clip (an event, a different activity, something \
+             unexpected), and for each part when the clip is made of clearly different parts \
+             (a different place, look, shot type or activity) — the editor needs the cut \
+             points. Never a segment that covers the whole clip: that is what the summary is \
+             for.",
+            max_segments(duration_s),
+            duration_s,
+        ),
+        MomentsMode::Full => format!(
+            "Then at most {} segments: consecutive stretches of the clip (start_s and end_s in \
+             seconds, inside 0–{:.0}) with what happens in each, in one short sentence with the \
+             key details (place, action, camera, people, objects, on-screen text). Merge \
+             stretches where nothing changes.",
+            max_segments(duration_s),
+            duration_s,
+        ),
+    };
     let mut instructions = format!(
         "You describe a video clip for a video editor who has not watched it. It is {} long. \
          You get frames sampled from it, each preceded by its time as t=m:ss{}.\n\
-         Answer with a one-sentence summary of the whole clip, then at most {} segments: \
-         consecutive stretches of the clip (start_s and end_s in seconds, inside 0–{:.0}) with \
-         what happens in each, in one short sentence with the key details (place, action, \
-         camera, people, objects, on-screen text). Merge stretches where nothing changes.\n\
+         Answer with a one-sentence summary of the whole clip. {moments_instruction}\n\
          Stay factual: describe only what is seen and said. Do not guess who people are.\n{}",
         format_time(duration_s),
         if has_subtitles {
@@ -415,8 +452,6 @@ pub fn build_request(
         } else {
             ""
         },
-        max_segments(duration_s),
-        duration_s,
         language.instruction(has_subtitles),
     );
     if has_subtitles {
@@ -446,8 +481,15 @@ pub fn build_request(
 
 /// Read an answer about a clip `duration_s` long. Segments outside the clip, empty or
 /// backwards are dropped, the rest sorted; an answer the model did not finish or with an
-/// empty summary is an error with the reason for the failed list.
-pub fn parse_answer(response: &AiResponse, duration_s: f64) -> Result<Description, String> {
+/// empty summary is an error with the reason for the failed list. In [`MomentsMode::Important`],
+/// a segment covering almost the whole clip is dropped (that is the summary's job) and adjacent
+/// segments whose descriptions say the same thing are merged — signs the model tiled the
+/// timeline instead of picking out what matters; [`MomentsMode::Full`] skips both.
+pub fn parse_answer(
+    response: &AiResponse,
+    duration_s: f64,
+    moments: MomentsMode,
+) -> Result<Description, String> {
     match response.stop_reason.as_str() {
         "end_turn" => {}
         "max_tokens" => return Err("The answer was too long".to_string()),
@@ -483,11 +525,36 @@ pub fn parse_answer(response: &AiResponse, duration_s: f64) -> Result<Descriptio
         })
         .unwrap_or_default();
     segments.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+    if moments == MomentsMode::Important {
+        segments.retain(|s| (s.end_s - s.start_s) < 0.9 * duration_s);
+        segments = merge_same_description(segments);
+    }
     segments.truncate(max_segments(duration_s));
     Ok(Description {
         summary: summary.to_string(),
         segments,
     })
+}
+
+/// Merge adjacent segments (already sorted by `start_s`) whose descriptions are the same once
+/// trimmed and lower-cased, into one spanning both and keeping the first description — a sign
+/// the model tiled the timeline with near-identical sentences instead of picking out what
+/// matters. One pass: a tiling model repeats itself between neighbouring stretches, not across
+/// the whole answer.
+fn merge_same_description(segments: Vec<Segment>) -> Vec<Segment> {
+    let mut merged: Vec<Segment> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let same_as_last = merged.last().is_some_and(|last: &Segment| {
+            last.description.trim().to_lowercase() == segment.description.trim().to_lowercase()
+        });
+        if same_as_last {
+            let last = merged.last_mut().expect("checked above");
+            last.end_s = last.end_s.max(segment.end_s);
+        } else {
+            merged.push(segment);
+        }
+    }
+    merged
 }
 
 /// `m:ss` below an hour, `h:mm:ss` from an hour on. Seconds are rounded down.
@@ -679,6 +746,7 @@ mod tests {
             &subtitles,
             4.0,
             SummaryLanguage::SameAsSubtitles,
+            MomentsMode::Important,
         );
         assert_eq!(request.model, "claude-haiku-4-5");
         let AiContent::Text(instructions) = &request.content[0] else {
@@ -700,12 +768,49 @@ mod tests {
             &[],
             4.0,
             SummaryLanguage::SameAsSubtitles,
+            MomentsMode::Important,
         );
         let AiContent::Text(instructions) = &silent.content[0] else {
             panic!("instructions first");
         };
         assert!(instructions.contains("Write in English."));
         assert!(!instructions.contains("Subtitles:"));
+    }
+
+    #[test]
+    fn important_mode_asks_for_only_what_stands_out_and_full_mode_asks_to_cover_the_clip() {
+        let frames = vec![Frame {
+            time_s: 0.0,
+            jpeg: vec![1],
+        }];
+        let important = build_request(
+            MODELS[0],
+            &frames,
+            &[],
+            30.0,
+            SummaryLanguage::English,
+            MomentsMode::Important,
+        );
+        let AiContent::Text(instructions) = &important.content[0] else {
+            panic!("instructions first");
+        };
+        assert!(instructions.contains("An empty list is the right answer"));
+        assert!(!instructions.contains("Merge stretches where nothing changes"));
+
+        let full = build_request(
+            MODELS[0],
+            &frames,
+            &[],
+            30.0,
+            SummaryLanguage::English,
+            MomentsMode::Full,
+        );
+        let AiContent::Text(instructions) = &full.content[0] else {
+            panic!("instructions first");
+        };
+        assert!(instructions.contains("consecutive stretches"));
+        assert!(instructions.contains("Merge stretches where nothing changes"));
+        assert!(!instructions.contains("An empty list is the right answer"));
     }
 
     #[test]
@@ -718,7 +823,8 @@ mod tests {
             {"start_s": 20.0, "end_s": 31.0, "description": "Clamped"},
             {"start_s": 1.0, "end_s": 2.0, "description": "  "}
         ]});
-        let d = parse_answer(&response(answer, "end_turn"), 30.0).expect("description");
+        let d = parse_answer(&response(answer, "end_turn"), 30.0, MomentsMode::Full)
+            .expect("description");
         assert_eq!(d.summary, "A walk.");
         let names: Vec<&str> = d.segments.iter().map(|s| s.description.as_str()).collect();
         assert_eq!(names, ["First", "Second", "Clamped"]);
@@ -728,13 +834,123 @@ mod tests {
     #[test]
     fn an_empty_summary_or_an_early_stop_fails() {
         let empty = json!({"summary": "", "segments": []});
-        assert!(parse_answer(&response(empty, "end_turn"), 10.0).is_err());
+        assert!(parse_answer(&response(empty, "end_turn"), 10.0, MomentsMode::Important).is_err());
         let fine = json!({"summary": "x", "segments": []});
         assert_eq!(
-            parse_answer(&response(fine.clone(), "max_tokens"), 10.0),
+            parse_answer(
+                &response(fine.clone(), "max_tokens"),
+                10.0,
+                MomentsMode::Important
+            ),
             Err("The answer was too long".to_string())
         );
-        assert!(parse_answer(&response(fine, "refusal"), 10.0).is_err());
+        assert!(parse_answer(&response(fine, "refusal"), 10.0, MomentsMode::Important).is_err());
+    }
+
+    #[test]
+    fn important_mode_accepts_an_empty_segment_list() {
+        let answer = json!({"summary": "A static shot.", "segments": []});
+        let d = parse_answer(&response(answer, "end_turn"), 10.0, MomentsMode::Important)
+            .expect("description");
+        assert!(d.segments.is_empty());
+    }
+
+    #[test]
+    fn important_mode_drops_a_whole_clip_segment_but_full_mode_keeps_it() {
+        let answer = json!({"summary": "A walk.", "segments": [
+            {"start_s": 0.0, "end_s": 29.0, "description": "The whole clip"}
+        ]});
+        let d = parse_answer(
+            &response(answer.clone(), "end_turn"),
+            30.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert!(d.segments.is_empty(), "{:?}", d.segments);
+        let d = parse_answer(&response(answer, "end_turn"), 30.0, MomentsMode::Full)
+            .expect("description");
+        assert_eq!(d.segments.len(), 1, "full mode keeps it");
+    }
+
+    #[test]
+    fn important_mode_merges_adjacent_segments_with_the_same_description() {
+        let answer = json!({"summary": "A walk.", "segments": [
+            {"start_s": 0.0, "end_s": 5.0, "description": "A dog runs by."},
+            {"start_s": 5.0, "end_s": 10.0, "description": " a dog runs by. "},
+            {"start_s": 20.0, "end_s": 25.0, "description": "A cat sleeps."}
+        ]});
+        let d = parse_answer(&response(answer, "end_turn"), 30.0, MomentsMode::Important)
+            .expect("description");
+        assert_eq!(d.segments.len(), 2, "{:?}", d.segments);
+        assert_eq!(d.segments[0].start_s, 0.0);
+        assert_eq!(d.segments[0].end_s, 10.0, "spans both merged segments");
+        assert_eq!(
+            d.segments[0].description, "A dog runs by.",
+            "keeps the first wording"
+        );
+        assert_eq!(d.segments[1].description, "A cat sleeps.");
+    }
+
+    /// Printed with `cargo test important_moments_sample -- --nocapture`, for the PR's sample
+    /// output: no live API key is needed since this exercises the prompt text and the validation
+    /// rules directly, not a real answer.
+    #[test]
+    fn important_moments_sample() {
+        let frames = vec![Frame {
+            time_s: 0.0,
+            jpeg: vec![1],
+        }];
+        let important = build_request(
+            MODELS[0],
+            &frames,
+            &[],
+            30.0,
+            SummaryLanguage::English,
+            MomentsMode::Important,
+        );
+        let AiContent::Text(important_instructions) = &important.content[0] else {
+            panic!("instructions first");
+        };
+        eprintln!("--- important prompt ---\n{important_instructions}");
+
+        let full = build_request(
+            MODELS[0],
+            &frames,
+            &[],
+            30.0,
+            SummaryLanguage::English,
+            MomentsMode::Full,
+        );
+        let AiContent::Text(full_instructions) = &full.content[0] else {
+            panic!("instructions first");
+        };
+        eprintln!("--- full prompt ---\n{full_instructions}");
+
+        let static_shot = json!({"summary": "A goat stands in a field, unmoving.", "segments": [
+            {"start_s": 0.0, "end_s": 29.0, "description": "A goat stands in a field."}
+        ]});
+        let d = parse_answer(
+            &response(static_shot, "end_turn"),
+            30.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        eprintln!(
+            "--- static clip, important mode: whole-clip segment dropped ---\nsummary: {}\nsegments: {:?}",
+            d.summary, d.segments
+        );
+
+        let tiled = json!({"summary": "A market street.", "segments": [
+            {"start_s": 0.0, "end_s": 10.0, "description": "People walk through the market."},
+            {"start_s": 10.0, "end_s": 20.0, "description": "people walk through the market."},
+            {"start_s": 20.0, "end_s": 25.0, "description": "A vendor weighs saffron for a customer."}
+        ]});
+        let d = parse_answer(&response(tiled, "end_turn"), 25.0, MomentsMode::Important)
+            .expect("description");
+        eprintln!(
+            "--- tiled answer, important mode: repeated segments merged ---\nsegments: {:?}",
+            d.segments
+        );
     }
 
     #[test]

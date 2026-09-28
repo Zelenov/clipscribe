@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use clipscribe::{
     describe, describe_with_tags, estimate_tags_usage, estimate_usage, format_time, frames,
     parse_vocabulary, srt, AiUsage, Described, DescribedWithTags, Error, FrameSampling, Model,
-    Options, Stage, SummaryLanguage, Tag, MAX_DURATION_S, MODELS,
+    MomentsMode, Options, Stage, SummaryLanguage, Tag, MAX_DURATION_S, MODELS,
 };
 use serde_json::json;
 
@@ -47,6 +47,11 @@ struct Cli {
     /// the same request as the description.
     #[arg(long)]
     tags: Option<PathBuf>,
+
+    /// How many moments (segments) a description gets: important (only what stands out, possibly
+    /// none) or full (the whole clip in consecutive stretches, today's old behaviour).
+    #[arg(long, value_enum, default_value_t = MomentsArg::Important)]
+    moments: MomentsArg,
 
     /// Do not send the `.srt` next to each video.
     #[arg(long)]
@@ -90,6 +95,21 @@ impl FramesArg {
         match self {
             Self::Keyframes => FrameSampling::KeyFrames,
             Self::Interval => FrameSampling::Interval,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MomentsArg {
+    Important,
+    Full,
+}
+
+impl MomentsArg {
+    fn mode(self) -> MomentsMode {
+        match self {
+            Self::Important => MomentsMode::Important,
+            Self::Full => MomentsMode::Full,
         }
     }
 }
@@ -148,6 +168,7 @@ fn main() -> ExitCode {
         model,
         language: cli.language,
         frame_sampling: cli.frames.sampling(),
+        moments: cli.moments.mode(),
     };
 
     let mut results = Vec::new();

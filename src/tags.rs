@@ -171,8 +171,10 @@ pub fn build_combined_request(
     vocabulary: &[Tag],
     duration_s: f64,
     language: describe::SummaryLanguage,
+    moments: describe::MomentsMode,
 ) -> AiRequest {
-    let mut request = describe::build_request(model, frames, subtitles, duration_s, language);
+    let mut request =
+        describe::build_request(model, frames, subtitles, duration_s, language, moments);
     let Some(AiContent::Text(instructions)) = request.content.first_mut() else {
         unreachable!(
             "describe::build_request always starts its content with the instructions text"
@@ -297,8 +299,9 @@ pub fn parse_combined_answer(
     response: &AiResponse,
     duration_s: f64,
     vocabulary: &[Tag],
+    moments: describe::MomentsMode,
 ) -> Result<(Description, TagSuggestions), String> {
-    let description = describe::parse_answer(response, duration_s)?;
+    let description = describe::parse_answer(response, duration_s, moments)?;
     let tags = parse_tag_suggestions(&response.json["tags"], vocabulary, duration_s);
     let new_tag_ideas = parse_new_tag_ideas(&response.json["new_tag_ideas"]);
     Ok((
@@ -456,6 +459,7 @@ mod tests {
             &vocabulary(),
             10.0,
             describe::SummaryLanguage::English,
+            describe::MomentsMode::Important,
         );
         let AiContent::Text(instructions) = &request.content[0] else {
             panic!("instructions first");
@@ -503,9 +507,13 @@ mod tests {
             ],
             "new_tag_ideas": ["Tractor", "  ", "Tractor"]
         });
-        let (description, tags) =
-            parse_combined_answer(&response(answer, "end_turn"), 10.0, &vocabulary())
-                .expect("parsed");
+        let (description, tags) = parse_combined_answer(
+            &response(answer, "end_turn"),
+            10.0,
+            &vocabulary(),
+            describe::MomentsMode::Important,
+        )
+        .expect("parsed");
         assert_eq!(description.summary, "A farm.");
         assert_eq!(tags.tags.len(), 2, "{:?}", tags.tags);
         let goat = tags.tags.iter().find(|t| t.name == "Goat").expect("goat");

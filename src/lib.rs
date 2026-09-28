@@ -1,21 +1,22 @@
 //! Describe what happens in a video clip, and when, with Claude.
 //!
 //! In: a video file, its subtitles if it has any, and [`Options`] (API key, model, language,
-//! frame sampling). Out: a [`Description`] (a one-sentence summary and time-ranged key moments)
-//! and what the request cost. Frames are key frames by default (at most 60, 512 px, JPEG, in
-//! memory only), one per equal-sized window of the clip where the picture changes the most (see
-//! [`FrameSampling`]), and sent with the subtitles in one request; see [`build_request`] for the
-//! prompt.
+//! frame sampling, moments mode). Out: a [`Description`] (a one-sentence summary and, by default,
+//! only the moments worth an editor's attention — see [`MomentsMode`]) and what the request cost.
+//! Frames are key frames by default (at most 60, 512 px, JPEG, in memory only), one per
+//! equal-sized window of the clip where the picture changes the most (see [`FrameSampling`]), and
+//! sent with the subtitles in one request; see [`build_request`] for the prompt.
 //!
 //! ```no_run
 //! use std::sync::atomic::AtomicBool;
-//! use clipscribe::{describe, FrameSampling, Options, SummaryLanguage, MODELS};
+//! use clipscribe::{describe, FrameSampling, MomentsMode, Options, SummaryLanguage, MODELS};
 //!
 //! let options = Options {
 //!     api_key: std::env::var("ANTHROPIC_API_KEY").unwrap(),
 //!     model: MODELS[0],
 //!     language: SummaryLanguage::English,
 //!     frame_sampling: FrameSampling::KeyFrames,
+//!     moments: MomentsMode::Important,
 //! };
 //! let described = describe("clip.mp4".as_ref(), &[], &options, &AtomicBool::new(false), |_| {})
 //!     .expect("described");
@@ -60,6 +61,8 @@ pub struct Options {
     pub language: SummaryLanguage,
     /// How the clip's frames are chosen; see [`FrameSampling`].
     pub frame_sampling: FrameSampling,
+    /// How many moments (segments) a description gets; see [`MomentsMode`].
+    pub moments: MomentsMode,
 }
 
 impl std::fmt::Debug for Options {
@@ -70,6 +73,7 @@ impl std::fmt::Debug for Options {
             .field("model", &self.model.id)
             .field("language", &self.language)
             .field("frame_sampling", &self.frame_sampling)
+            .field("moments", &self.moments)
             .finish()
     }
 }
@@ -162,6 +166,7 @@ pub fn describe(
         subtitles,
         duration_s,
         options.language,
+        options.moments,
     );
     on_stage(Stage::Asking);
     let provider = anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?;
@@ -169,9 +174,11 @@ pub fn describe(
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
     })?;
-    let description = parse_answer(&response, duration_s).map_err(|reason| Error::BadAnswer {
-        reason,
-        usage: response.usage,
+    let description = parse_answer(&response, duration_s, options.moments).map_err(|reason| {
+        Error::BadAnswer {
+            reason,
+            usage: response.usage,
+        }
     })?;
     Ok(Described {
         description,
@@ -229,6 +236,7 @@ pub fn describe_with_tags(
         vocabulary,
         duration_s,
         options.language,
+        options.moments,
     );
     on_stage(Stage::Asking);
     let provider = anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?;
@@ -237,12 +245,12 @@ pub fn describe_with_tags(
         e => Error::Ai(e),
     })?;
     let (description, tags) =
-        parse_combined_answer(&response, duration_s, vocabulary).map_err(|reason| {
-            Error::BadAnswer {
+        parse_combined_answer(&response, duration_s, vocabulary, options.moments).map_err(
+            |reason| Error::BadAnswer {
                 reason,
                 usage: response.usage,
-            }
-        })?;
+            },
+        )?;
     Ok(DescribedWithTags {
         description,
         tags,
@@ -303,6 +311,7 @@ mod tests {
             model: Model::default(),
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
         };
         let result = describe(&fake, &[], &options, &AtomicBool::new(false), |_| {});
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
@@ -321,6 +330,7 @@ mod tests {
             model: Model::default(),
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
         };
         let vocabulary = vec![Tag {
             name: "Goat".to_string(),
@@ -345,6 +355,7 @@ mod tests {
             model: Model::default(),
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
         };
         let debug = format!("{options:?}");
         assert!(!debug.contains("secret"));
@@ -371,6 +382,7 @@ mod tests {
             model: Model::default(),
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
         };
         let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
             Ok(described) => described,
