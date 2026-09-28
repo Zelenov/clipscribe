@@ -173,9 +173,12 @@ pub fn build_combined_request(
     language: describe::SummaryLanguage,
 ) -> AiRequest {
     let mut request = describe::build_request(model, frames, subtitles, duration_s, language);
-    if let Some(AiContent::Text(instructions)) = request.content.first_mut() {
-        instructions.push_str(&tag_instructions(vocabulary));
-    }
+    let Some(AiContent::Text(instructions)) = request.content.first_mut() else {
+        unreachable!(
+            "describe::build_request always starts its content with the instructions text"
+        );
+    };
+    instructions.push_str(&tag_instructions(vocabulary));
     request.schema = combined_schema();
     request
 }

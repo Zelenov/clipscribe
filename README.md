@@ -75,7 +75,7 @@ code is 1 when a video failed.
 `--tags tags.txt` matches each clip against a closed vocabulary — one tag per line in the file,
 `name — hint` (the hint is optional) — instead of the model inventing tags freely. Each suggestion
 gets a confidence and, when it does not apply to the whole clip, the time ranges where it does; a
-tag never suggested outside the vocabulary, but the model may add short, unscored `new_tag_ideas`
+tag is never suggested outside the vocabulary, but the model may add short, unscored `new_tag_ideas`
 for anything worth tagging that the vocabulary does not cover.
 
 ```

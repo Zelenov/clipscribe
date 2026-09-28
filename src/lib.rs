@@ -256,7 +256,8 @@ pub fn describe_with_tags(
 /// [`describe_with_tags`]): no video is read, so this works without the `frames` feature, from
 /// `description` and `duration_s` alone. Cheaper than [`describe_with_tags`], but blind to
 /// anything `description`'s summary and segments left out. `cancel` is checked while waiting for
-/// the answer.
+/// the answer. Like `describe`, a bad answer is still billed: [`Error::BadAnswer`] carries the
+/// usage so the caller can still account for it.
 pub fn suggest_tags(
     description: &Description,
     duration_s: f64,
@@ -264,7 +265,7 @@ pub fn suggest_tags(
     vocabulary: &[Tag],
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<TagSuggestions, AiError> {
+) -> Result<TagSuggestions, Error> {
     use provider::AiProvider;
 
     let request = build_tags_only_request(
@@ -274,9 +275,15 @@ pub fn suggest_tags(
         vocabulary,
         duration_s,
     );
-    let provider = anthropic::Anthropic::new(options.api_key.clone())?;
-    let response = provider.complete(&request, cancel)?;
-    parse_tags_only_answer(&response, vocabulary, duration_s).map_err(AiError::BadAnswer)
+    let provider = anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?;
+    let response = provider.complete(&request, cancel).map_err(|e| match e {
+        AiError::Cancelled => Error::Cancelled,
+        e => Error::Ai(e),
+    })?;
+    parse_tags_only_answer(&response, vocabulary, duration_s).map_err(|reason| Error::BadAnswer {
+        reason,
+        usage: response.usage,
+    })
 }
 
 #[cfg(test)]
@@ -298,6 +305,35 @@ mod tests {
             frame_sampling: FrameSampling::KeyFrames,
         };
         let result = describe(&fake, &[], &options, &AtomicBool::new(false), |_| {});
+        assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn a_video_file_with_tags_that_is_not_a_video_is_unreadable() {
+        let dir = std::env::temp_dir().join(format!("clipscribe-lib-tags-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let fake = dir.join("fake.mp4");
+        std::fs::write(&fake, b"not a movie").expect("write");
+        let options = Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+        };
+        let vocabulary = vec![Tag {
+            name: "Goat".to_string(),
+            hint: None,
+        }];
+        let result = describe_with_tags(
+            &fake,
+            &[],
+            &vocabulary,
+            &options,
+            &AtomicBool::new(false),
+            |_| {},
+        );
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
