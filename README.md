@@ -39,8 +39,8 @@ with its `bin` on `PATH`). Or build it with `cargo install clipscribe`.
   `--frames interval` goes back to one frame every 2 s, spread evenly on a longer clip.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
   description knows what is said.
-- One request goes to the Anthropic Messages API; the answer is structured JSON, and moments
-  outside the clip are dropped. Clips over 30 minutes are refused.
+- One request goes to Claude (Anthropic) or ChatGPT (OpenAI, `--provider openai`); the answer is
+  structured JSON, and moments outside the clip are dropped. Clips over 30 minutes are refused.
 - Moments (segments) default to **important**: none at all for a static or uniform clip (the
   summary already covers it), one per clearly different or standout part otherwise — never a
   moment that just tiles the timeline. `--moments full` goes back to always covering the whole
@@ -48,7 +48,8 @@ with its `bin` on `PATH`). Or build it with `cargo install clipscribe`.
 
 ## Command line
 
-You need an [Anthropic API key](https://console.anthropic.com/) and GStreamer (see
+You need an [Anthropic API key](https://console.anthropic.com/) (or an
+[OpenAI key](https://platform.openai.com/api-keys) with `--provider openai`) and GStreamer (see
 [Building](#building)).
 
 ```sh
@@ -57,11 +58,13 @@ clipscribe clip.mp4 other.mov          # describe
 clipscribe footage/ --json > out.json  # every video in a folder, as JSON
 clipscribe footage/ --estimate         # what it would cost; nothing is sent
 clipscribe clip.mp4 --tags tags.txt    # also suggest tags from a vocabulary (see below)
+clipscribe clip.mp4 --provider openai  # use ChatGPT instead (needs OPENAI_API_KEY)
 ```
 
 | Option | |
 |---|---|
-| `--model haiku\|sonnet\|opus` | Claude Haiku 4.5 (default; about $10 per 1000 one-minute clips), Sonnet 5 or Opus 5 (notice more, cost more). |
+| `--provider anthropic\|openai` | `anthropic` (default): Claude. `openai`: ChatGPT. |
+| `--model` | `--provider anthropic`: `haiku` (default; about $10 per 1000 one-minute clips), `sonnet` or `opus` (notice more, cost more). `--provider openai`: `gpt-4.1-mini` (default) or `gpt-4.1`. |
 | `--language` | `subtitles` (default: the subtitles' language, English if none), `en`, `ru`, `uk`, `de`, `es`, `fr`. |
 | `--frames keyframes\|interval` | `keyframes` (default: one per window of the clip where the picture changes the most) or `interval` (one every 2 s, spread evenly on a longer clip). |
 | `--moments important\|full` | `important` (default: only what stands out, possibly none) or `full` (the whole clip in consecutive stretches, today's old behaviour). |
@@ -69,7 +72,7 @@ clipscribe clip.mp4 --tags tags.txt    # also suggest tags from a vocabulary (se
 | `--no-subtitles` | Do not send the `.srt`. |
 | `--json` | One JSON array: `file`, `duration_s`, `frames`, `summary`, `moments[{start_s, end_s, description}]`, `model`, `usage`, `cost_usd` — with `--tags`, also `tags[{name, confidence, ranges[{start_s, end_s}]}]` and `new_tag_ideas`. |
 | `--estimate` | Price the videos from their lengths only. |
-| `--api-key` | Instead of `ANTHROPIC_API_KEY`. |
+| `--api-key` | Instead of `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. |
 
 Progress goes to stderr, results to stdout, and the tokens and cost of the run to stderr at the
 end. Ctrl+C stops the video in work. A rejected key or an empty balance stops the batch. The exit
@@ -136,13 +139,17 @@ returning a `DescribedWithTags`. `suggest_tags(description, duration_s, subtitle
 cheaper, no video read, works without the `frames` feature — at the cost of not seeing anything
 the description itself left out. `estimate_tags_usage` prices either.
 
+Every entry of `MODELS` carries its `Provider` (`Anthropic` or `OpenAi`); `options.api_key` is
+read against whichever provider `options.model` belongs to, so switching to a GPT model is just
+picking a different `MODELS` entry and an OpenAI key — nothing else about the call changes.
+
 ### Features
 
 | Feature | |
 |---|---|
 | `cli` (default) | The `clipscribe` binary (clap, ctrlc). Implies `frames`. |
 | `frames` (default) | GStreamer frame reading and `describe`. |
-| none | Models, languages, request and answer types, the estimate, `srt` and the Anthropic client, with no GStreamer. |
+| none | Models, languages, request and answer types, the estimate, `srt` and both providers' clients, with no GStreamer. |
 
 ## Building
 

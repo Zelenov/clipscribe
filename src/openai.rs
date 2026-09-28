@@ -1,4 +1,6 @@
-//! Claude through Anthropic's Messages API, over plain HTTP (there is no official Rust SDK).
+//! ChatGPT through OpenAI's Chat Completions API, over plain HTTP — the same shape
+//! [`crate::anthropic`] uses, translated to OpenAI's request, response and error bodies. See
+//! `docs/design/openai-provider.md` for why this endpoint and these models.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -7,26 +9,21 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::provider::{
-    AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, CONNECT_TIMEOUT,
+    timeout_for, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, RetryPolicy,
+    CONNECT_TIMEOUT,
 };
 
-/// Kept for anyone already naming `anthropic::RetryPolicy`: the type now lives in
-/// [`crate::provider`], shared with the OpenAI client, since none of it was ever
-/// Anthropic-specific.
-pub use crate::provider::{timeout_for, RetryPolicy};
+const API_URL: &str = "https://api.openai.com";
 
-const API_URL: &str = "https://api.anthropic.com";
-const API_VERSION: &str = "2023-06-01";
-
-/// The Anthropic provider, for one key.
-pub struct Anthropic {
+/// The OpenAI provider, for one key.
+pub struct OpenAi {
     key: String,
     base_url: String,
     retry: RetryPolicy,
     client: reqwest::blocking::Client,
 }
 
-impl Anthropic {
+impl OpenAi {
     pub fn new(key: String) -> Result<Self, AiError> {
         Self::with_endpoint(key, API_URL.to_string(), RetryPolicy::default())
     }
@@ -50,31 +47,37 @@ impl Anthropic {
     }
 
     fn body(request: &AiRequest) -> Value {
+        // No model in `MODELS` gives OpenAI a `Model.effort`: none of the two picked reason. If
+        // that changes, this needs an actual field name for it; guessing at one now would be
+        // worse than an assertion that catches the day it matters.
+        debug_assert!(
+            request.effort.is_none(),
+            "no OpenAI model sets an effort; add support for it here first"
+        );
         let content: Vec<Value> = request
             .content
             .iter()
             .map(|block| match block {
                 AiContent::Text(text) => json!({"type": "text", "text": text}),
                 AiContent::Jpeg(bytes) => json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                    }
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!(
+                            "data:image/jpeg;base64,{}",
+                            base64::engine::general_purpose::STANDARD.encode(bytes)
+                        ),
+                    },
                 }),
             })
             .collect();
-        let mut output_config =
-            json!({"format": {"type": "json_schema", "schema": request.schema}});
-        if let Some(effort) = request.effort {
-            output_config["effort"] = json!(effort);
-        }
         json!({
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_completion_tokens": request.max_tokens,
             "messages": [{"role": "user", "content": content}],
-            "output_config": output_config,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "strict": true, "schema": request.schema},
+            },
         })
     }
 
@@ -105,7 +108,7 @@ enum Attempt {
     RateLimited(Duration),
 }
 
-impl AiProvider for Anthropic {
+impl AiProvider for OpenAi {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError> {
         let body = Self::body(request).to_string();
         let mut retries = self.retry.delays.iter();
@@ -115,7 +118,7 @@ impl AiProvider for Anthropic {
                 Attempt::Done(result) => return result,
                 Attempt::RateLimited(_) if rate_limited >= self.retry.max_rate_limit_waits => {
                     return Err(AiError::Rejected(
-                        "Anthropic's rate limit was still reached after many waits".to_string(),
+                        "OpenAI's rate limit was still reached after many waits".to_string(),
                     ));
                 }
                 Attempt::RateLimited(wait) => {
@@ -136,20 +139,19 @@ impl AiProvider for Anthropic {
     }
 }
 
-impl Anthropic {
+impl OpenAi {
     fn attempt(&self, body: &str) -> Attempt {
         let sent = self
             .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.key)
-            .header("anthropic-version", API_VERSION)
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.key))
             .header("content-type", "application/json")
             .timeout(timeout_for(self.retry.answer_timeout, body.len()))
             .body(body.to_string())
             .send();
         let response = match sent {
             Ok(response) => response,
-            // Nothing reached Anthropic yet: safe to try again.
+            // Nothing reached OpenAI yet: safe to try again.
             Err(e) if e.is_connect() => return Attempt::Retry(format!("connection failed: {e}")),
             // The request could not even be built (e.g. a pasted key with a control character):
             // trying again cannot help, and it is not the network.
@@ -189,49 +191,53 @@ fn classify(
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| format!("HTTP {status}"));
+    let code = json["error"]["code"].as_str().unwrap_or_default();
     match status {
         200 => Attempt::Done(parse_message(&json)),
-        401 | 403 => Attempt::Done(Err(AiError::KeyRejected("Anthropic".to_string()))),
-        402 => Attempt::Done(Err(AiError::OutOfCredit("Anthropic".to_string()))),
-        400 if message.to_lowercase().contains("credit balance") => {
-            Attempt::Done(Err(AiError::OutOfCredit("Anthropic".to_string())))
+        401 | 403 => Attempt::Done(Err(AiError::KeyRejected("OpenAI".to_string()))),
+        // OpenAI signals "no credit left" through a 429 with this error code, not a distinct
+        // HTTP status the way Anthropic's 402 does.
+        429 if code == "insufficient_quota" => {
+            Attempt::Done(Err(AiError::OutOfCredit("OpenAI".to_string())))
         }
-        400 if is_limit(&message) => Attempt::Done(Err(AiError::LimitReached(message))),
         429 => Attempt::RateLimited(retry_after.unwrap_or(rate_limit_wait)),
-        500 | 502 | 503 | 529 => Attempt::Retry(format!("HTTP {status}: {message}")),
+        500 | 502 | 503 | 504 => Attempt::Retry(format!("HTTP {status}: {message}")),
         _ => Attempt::Done(Err(AiError::Rejected(message))),
     }
 }
 
-/// Whether a 400's message is about a usage or spend limit of the account, which every later
-/// request would hit too.
-fn is_limit(message: &str) -> bool {
-    let message = message.to_lowercase();
-    ["usage limit", "spend limit", "spending limit"]
-        .iter()
-        .any(|phrase| message.contains(phrase))
-}
-
-/// Read a Messages API answer: the JSON in its text block, why it stopped, and its usage.
+/// Read a Chat Completions answer: the JSON in its message, why it stopped, and its usage.
 fn parse_message(json: &Value) -> Result<AiResponse, AiError> {
     let usage = AiUsage {
-        input_tokens: json["usage"]["input_tokens"].as_u64().unwrap_or(0),
-        output_tokens: json["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        input_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+        output_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
     };
-    let stop_reason = json["stop_reason"].as_str().unwrap_or_default().to_string();
-    let text: String = json["content"]
-        .as_array()
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter(|b| b["type"] == "text")
-                .filter_map(|b| b["text"].as_str())
-                .collect()
-        })
+    let message = &json["choices"][0]["message"];
+    // A structured-output refusal is its own field, not a `finish_reason`: OpenAI still answers
+    // with `finish_reason: "stop"` when it declines to fill the schema.
+    if let Some(refusal) = message["refusal"].as_str() {
+        if !refusal.is_empty() {
+            return Ok(AiResponse {
+                json: Value::Null,
+                stop_reason: "refusal".to_string(),
+                usage,
+            });
+        }
+    }
+    let finish_reason = json["choices"][0]["finish_reason"]
+        .as_str()
         .unwrap_or_default();
-    // A model that stopped early (max_tokens, refusal) may have written no valid JSON; the
+    let stop_reason = match finish_reason {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "content_filter" => "refusal",
+        other => other,
+    }
+    .to_string();
+    let text = message["content"].as_str().unwrap_or_default();
+    // A model that stopped early (max_completion_tokens) may have written no valid JSON; the
     // caller fails the file with the stop reason and still counts the usage.
-    let answer = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let answer = serde_json::from_str(text).unwrap_or(Value::Null);
     if answer.is_null() && stop_reason == "end_turn" {
         return Err(AiError::BadAnswer(format!("not JSON: {text}")));
     }
@@ -292,7 +298,7 @@ mod tests {
         http(
             "200 OK",
             "",
-            r#"{"content":[{"type":"text","text":"{\"summary\":\"S\",\"segments\":[]}"}],"stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":20}}"#,
+            r#"{"choices":[{"message":{"content":"{\"summary\":\"S\",\"segments\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20}}"#,
         )
     }
 
@@ -308,7 +314,7 @@ mod tests {
 
     fn request() -> AiRequest {
         AiRequest {
-            model: "claude-haiku-4-5".to_string(),
+            model: "gpt-4.1-mini".to_string(),
             content: vec![
                 AiContent::Text("hi".to_string()),
                 AiContent::Jpeg(vec![1, 2]),
@@ -321,27 +327,22 @@ mod tests {
 
     fn complete(responses: Vec<String>) -> (Result<AiResponse, AiError>, usize) {
         let (url, count) = server(responses);
-        let provider = Anthropic::with_endpoint("k".into(), url, fast_retries()).expect("client");
+        let provider = OpenAi::with_endpoint("k".into(), url, fast_retries()).expect("client");
         let result = provider.complete(&request(), &AtomicBool::new(false));
         let n = *count.lock().expect("lock");
         (result, n)
     }
 
     #[test]
-    fn the_body_carries_images_and_the_schema() {
-        let body = Anthropic::body(&request());
-        assert_eq!(body["messages"][0]["content"][1]["source"]["data"], "AQI=");
-        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
-        assert!(body.get("thinking").is_none());
-        assert!(
-            body["output_config"].get("effort").is_none(),
-            "Haiku 4.5 rejects it"
+    fn the_body_carries_images_and_the_schema_as_a_data_url() {
+        let body = OpenAi::body(&request());
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/jpeg;base64,AQI="
         );
-        let body = Anthropic::body(&AiRequest {
-            effort: Some("low"),
-            ..request()
-        });
-        assert_eq!(body["output_config"]["effort"], "low");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["max_completion_tokens"], 10);
     }
 
     #[test]
@@ -349,8 +350,33 @@ mod tests {
         let (result, n) = complete(vec![ok()]);
         let response = result.expect("answer");
         assert_eq!(response.json["summary"], "S");
+        assert_eq!(response.stop_reason, "end_turn");
         assert_eq!(response.usage.input_tokens, 100);
+        assert_eq!(response.usage.output_tokens, 20);
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_structured_output_refusal_is_its_own_field_not_a_finish_reason() {
+        let refused = http(
+            "200 OK",
+            "",
+            r#"{"choices":[{"message":{"refusal":"I can't help with that."},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":5}}"#,
+        );
+        let (result, _) = complete(vec![refused]);
+        let response = result.expect("still a response, not a transport error");
+        assert_eq!(response.stop_reason, "refusal");
+        assert!(response.json.is_null());
+    }
+
+    #[test]
+    fn a_length_finish_reason_becomes_max_tokens() {
+        let body = r#"{"choices":[{"message":{"content":"{\"summ"},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4000}}"#;
+        let (result, _) = complete(vec![http("200 OK", "", body)]);
+        let response = result.expect("response");
+        assert_eq!(response.stop_reason, "max_tokens");
+        assert!(response.json.is_null());
+        assert_eq!(response.usage.output_tokens, 4000);
     }
 
     #[test]
@@ -369,12 +395,28 @@ mod tests {
     }
 
     #[test]
-    fn overloaded_is_retried_three_times_then_fails() {
+    fn insufficient_quota_stops_the_job_as_out_of_credit() {
+        let body = r#"{"error":{"message":"You exceeded your current quota.","code":"insufficient_quota"}}"#;
+        let (result, _) = complete(vec![http("429 Too Many Requests", "", body)]);
+        assert_eq!(result, Err(AiError::OutOfCredit("OpenAI".to_string())));
+    }
+
+    #[test]
+    fn a_rejected_key_stops_the_job() {
+        let (result, _) = complete(vec![http("401 Unauthorized", "", "{}")]);
+        assert_eq!(result, Err(AiError::KeyRejected("OpenAI".to_string())));
+        assert!(AiError::KeyRejected("OpenAI".to_string())
+            .stops_job()
+            .is_some());
+    }
+
+    #[test]
+    fn a_server_error_is_retried_three_times_then_fails() {
         let overloaded = || {
             http(
-                "529 Overloaded",
+                "503 Service Unavailable",
                 "",
-                r#"{"error":{"message":"Overloaded"}}"#,
+                r#"{"error":{"message":"The server is overloaded."}}"#,
             )
         };
         let (result, n) = complete(vec![overloaded(), overloaded(), ok()]);
@@ -385,32 +427,6 @@ mod tests {
         assert_eq!(n, 4);
     }
 
-    #[test]
-    fn a_rejected_key_or_no_credit_stops_the_job() {
-        let (result, _) = complete(vec![http("401 Unauthorized", "", "{}")]);
-        assert_eq!(result, Err(AiError::KeyRejected("Anthropic".to_string())));
-        assert!(AiError::KeyRejected("Anthropic".to_string())
-            .stops_job()
-            .is_some());
-        let credit = r#"{"error":{"message":"Your credit balance is too low to access the Anthropic API."}}"#;
-        let (result, _) = complete(vec![http("400 Bad Request", "", credit)]);
-        assert_eq!(result, Err(AiError::OutOfCredit("Anthropic".to_string())));
-    }
-
-    #[test]
-    fn a_reached_spend_limit_stops_the_job_with_the_apis_message() {
-        let body = r#"{"error":{"message":"You have reached your specified workspace API usage limits."}}"#;
-        let (result, _) = complete(vec![http("400 Bad Request", "", body)]);
-        let Err(error) = result else {
-            panic!("an error");
-        };
-        assert!(matches!(error, AiError::LimitReached(_)));
-        assert!(error
-            .stops_job()
-            .is_some_and(|s| s.contains("usage limits")));
-    }
-
-    /// A request that got no answer in time may have been billed: it is not sent again.
     #[test]
     fn a_timeout_is_not_retried() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -424,7 +440,7 @@ mod tests {
                 held.push(stream); // read nothing, answer nothing
             }
         });
-        let provider = Anthropic::with_endpoint("k".into(), url, fast_retries()).expect("client");
+        let provider = OpenAi::with_endpoint("k".into(), url, fast_retries()).expect("client");
         let result = provider.complete(&request(), &AtomicBool::new(false));
         assert_eq!(result, Err(AiError::Timeout));
         std::thread::sleep(Duration::from_millis(100));
@@ -440,61 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn a_429_waits_as_long_as_retry_after_says() {
-        let wait = |retry_after| match classify(429, retry_after, "{}", Duration::from_secs(30)) {
-            Attempt::RateLimited(wait) => wait,
-            _ => panic!("a 429 waits"),
-        };
-        assert_eq!(wait(Some(Duration::from_secs(7))), Duration::from_secs(7));
-        assert_eq!(wait(None), Duration::from_secs(30));
-        let (url, count) = server(vec![
-            http("429 Too Many Requests", "Retry-After: 1\r\n", "{}"),
-            ok(),
-        ]);
-        let slow_default = RetryPolicy {
-            rate_limit_wait: Duration::from_secs(60),
-            ..fast_retries()
-        };
-        let provider = Anthropic::with_endpoint("k".into(), url, slow_default).expect("client");
-        let started = std::time::Instant::now();
-        assert!(provider
-            .complete(&request(), &AtomicBool::new(false))
-            .is_ok());
-        let waited = started.elapsed();
-        assert!(
-            waited >= Duration::from_secs(1) && waited < Duration::from_secs(30),
-            "the header's 1 s, not the 60 s default: {waited:?}"
-        );
-        assert_eq!(*count.lock().expect("lock"), 2);
-    }
-
-    #[test]
-    fn the_timeout_grows_with_the_upload() {
-        let answer = Duration::from_secs(120);
-        assert_eq!(timeout_for(answer, 0), Duration::from_secs(120));
-        assert_eq!(timeout_for(answer, 3_000_000), Duration::from_secs(180));
-    }
-
-    #[test]
-    fn another_400_fails_the_file_with_the_apis_message() {
-        let body = r#"{"error":{"message":"image too large"}}"#;
-        let (result, n) = complete(vec![http("400 Bad Request", "", body)]);
-        assert_eq!(
-            result,
-            Err(AiError::Rejected("image too large".to_string()))
-        );
-        assert!(AiError::Rejected(String::new()).stops_job().is_none());
-        assert_eq!(n, 1);
-    }
-
-    #[test]
     fn a_cancel_during_a_wait_ends_the_request() {
         let (url, _) = server(vec![http(
             "429 Too Many Requests",
             "retry-after: 30\r\n",
             "{}",
         )]);
-        let provider = Anthropic::with_endpoint("k".into(), url, fast_retries()).expect("client");
+        let provider = OpenAi::with_endpoint("k".into(), url, fast_retries()).expect("client");
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         std::thread::spawn(move || {
@@ -510,12 +478,13 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_before_the_answer_keeps_the_usage() {
-        let body = r#"{"content":[{"type":"text","text":"{\"summ"}],"stop_reason":"max_tokens","usage":{"input_tokens":5,"output_tokens":4000}}"#;
-        let (result, _) = complete(vec![http("200 OK", "", body)]);
-        let response = result.expect("response");
-        assert_eq!(response.stop_reason, "max_tokens");
-        assert!(response.json.is_null());
-        assert_eq!(response.usage.output_tokens, 4000);
+    fn another_400_fails_the_file_with_the_apis_message() {
+        let body = r#"{"error":{"message":"image too large"}}"#;
+        let (result, n) = complete(vec![http("400 Bad Request", "", body)]);
+        assert_eq!(
+            result,
+            Err(AiError::Rejected("image too large".to_string()))
+        );
+        assert_eq!(n, 1);
     }
 }

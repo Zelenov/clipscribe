@@ -1,3 +1,21 @@
+# NEXT
+## Added
+- ChatGPT (OpenAI) as a second provider: `--provider anthropic|openai` (default `anthropic`)
+  picks the AI service; `--model` gains `gpt-4.1-mini` (the OpenAI default) and `gpt-4.1`, and
+  `--api-key` falls back to `OPENAI_API_KEY` instead of `ANTHROPIC_API_KEY` when `--provider
+  openai` is set.
+
+## Changed
+- Library: `Model` has a new field `provider: Provider` (`Anthropic` or `OpenAi`); every entry of
+  `MODELS` already sets it, so this only matters if you build a `Model` yourself instead of
+  picking one from `MODELS`.
+- Library: `AiError::KeyRejected` and `AiError::OutOfCredit` changed from unit variants to
+  `KeyRejected(String)` / `OutOfCredit(String)`, the provider's display name ("Anthropic" or
+  "OpenAI"), so `AiError::reason()`/`stops_job()` no longer always say "Anthropic". Match them
+  with a binding (`KeyRejected(provider)`) instead of the bare variant name.
+- Library: `anthropic::RetryPolicy` moved to `provider::RetryPolicy` (re-exported from
+  `anthropic` too, so existing code naming it still compiles).
+
 # 0.4.0
 ## Added
 - Only important moments: by default, a description's moments (segments) cover only what stands

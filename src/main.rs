@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use clipscribe::{
     describe, describe_with_tags, estimate_tags_usage, estimate_usage, format_time, frames,
     parse_vocabulary, srt, AiUsage, Described, DescribedWithTags, Error, FrameSampling, Model,
-    MomentsMode, Options, Stage, SummaryLanguage, Tag, MAX_DURATION_S, MODELS,
+    MomentsMode, Options, Provider, Stage, SummaryLanguage, Tag, MAX_DURATION_S, MODELS,
 };
 use serde_json::json;
 
@@ -25,13 +25,19 @@ struct Cli {
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 
-    /// Anthropic API key.
-    #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
+    /// Which AI service to use.
+    #[arg(long, value_enum, default_value_t = ProviderArg::Anthropic)]
+    provider: ProviderArg,
+
+    /// The API key for --provider, or ANTHROPIC_API_KEY / OPENAI_API_KEY.
+    #[arg(long)]
     api_key: Option<String>,
 
-    /// The model: haiku is the cheapest and fine for most clips; sonnet and opus notice more.
-    #[arg(long, value_enum, default_value_t = ModelArg::Haiku)]
-    model: ModelArg,
+    /// The model: with anthropic (default), haiku is the cheapest and fine for most clips,
+    /// sonnet and opus notice more; with openai, gpt-4.1-mini is the cheapest, gpt-4.1 notices
+    /// more. Defaults to the chosen provider's cheapest model.
+    #[arg(long, value_enum)]
+    model: Option<ModelArg>,
 
     /// The language of the descriptions: subtitles (the subtitles' language, English if
     /// none), en, ru, uk, de, es or fr.
@@ -66,21 +72,97 @@ struct Cli {
     estimate: bool,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum ProviderArg {
+    Anthropic,
+    #[value(name = "openai")]
+    OpenAi,
+}
+
+impl ProviderArg {
+    fn provider(self) -> Provider {
+        match self {
+            Self::Anthropic => Provider::Anthropic,
+            Self::OpenAi => Provider::OpenAi,
+        }
+    }
+
+    /// The environment variable `--api-key` falls back to, when this provider is chosen.
+    fn env_var(self) -> &'static str {
+        match self {
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::OpenAi => "OPENAI_API_KEY",
+        }
+    }
+
+    /// This provider's cheapest model, used when `--model` is not given.
+    fn default_model(self) -> ModelArg {
+        match self {
+            Self::Anthropic => ModelArg::Haiku,
+            Self::OpenAi => ModelArg::Gpt41Mini,
+        }
+    }
+
+    /// The exact string `--provider` accepts for this value.
+    fn cli_value(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderArg {
+    /// The provider's proper name (`Anthropic`, `OpenAI`), for prose; see [`Self::cli_value`]
+    /// for the flag's own value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.provider().label())
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ModelArg {
     Haiku,
     Sonnet,
     Opus,
+    #[value(name = "gpt-4.1-mini")]
+    Gpt41Mini,
+    #[value(name = "gpt-4.1")]
+    Gpt41,
 }
 
 impl ModelArg {
-    fn model(self) -> Model {
-        let id = match self {
+    fn id(self) -> &'static str {
+        match self {
             Self::Haiku => "claude-haiku-4-5",
             Self::Sonnet => "claude-sonnet-5",
             Self::Opus => "claude-opus-5",
-        };
+            Self::Gpt41Mini => "gpt-4.1-mini",
+            Self::Gpt41 => "gpt-4.1",
+        }
+    }
+
+    fn model(self) -> Model {
+        let id = self.id();
         MODELS.into_iter().find(|m| m.id == id).unwrap_or_default()
+    }
+
+    /// The exact string `--model` accepts for this value (matching the `#[value(name = ...)]`
+    /// overrides above, where there are any).
+    fn cli_value(self) -> &'static str {
+        match self {
+            Self::Haiku => "haiku",
+            Self::Sonnet => "sonnet",
+            Self::Opus => "opus",
+            Self::Gpt41Mini => "gpt-4.1-mini",
+            Self::Gpt41 => "gpt-4.1",
+        }
+    }
+}
+
+impl std::fmt::Display for ModelArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.cli_value())
     }
 }
 
@@ -114,6 +196,22 @@ impl MomentsArg {
     }
 }
 
+/// `model_arg`, or `provider_arg`'s own default model when not given; an error when `model_arg`
+/// belongs to a different provider than `provider_arg`.
+fn resolve_model(model_arg: Option<ModelArg>, provider_arg: ProviderArg) -> Result<Model, String> {
+    let model_arg = model_arg.unwrap_or_else(|| provider_arg.default_model());
+    let model = model_arg.model();
+    if model.provider != provider_arg.provider() {
+        return Err(format!(
+            "--model {model_arg} is an {} model, not {provider_arg}: drop --model or pick one \
+             for --provider {}",
+            model.provider.label(),
+            provider_arg.cli_value(),
+        ));
+    }
+    Ok(model)
+}
+
 fn parse_language(name: &str) -> Result<SummaryLanguage, String> {
     SummaryLanguage::ALL
         .into_iter()
@@ -144,7 +242,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let model = cli.model.model();
+    let model = match resolve_model(cli.model, cli.provider) {
+        Ok(model) => model,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let vocabulary = match &cli.tags {
         Some(path) => match load_vocabulary(path) {
             Ok(vocabulary) => Some(vocabulary),
@@ -158,8 +262,16 @@ fn main() -> ExitCode {
     if cli.estimate {
         return estimate(&videos, model, cli.no_subtitles, vocabulary.as_deref());
     }
-    let Some(api_key) = cli.api_key.clone().filter(|k| !k.trim().is_empty()) else {
-        eprintln!("error: no API key: set ANTHROPIC_API_KEY or pass --api-key");
+    let api_key = cli
+        .api_key
+        .clone()
+        .or_else(|| std::env::var(cli.provider.env_var()).ok())
+        .filter(|k| !k.trim().is_empty());
+    let Some(api_key) = api_key else {
+        eprintln!(
+            "error: no API key: set {} or pass --api-key",
+            cli.provider.env_var()
+        );
         return ExitCode::from(2);
     };
     let _ = ctrlc::set_handler(|| CANCEL.store(true, Ordering::Relaxed));
@@ -577,5 +689,28 @@ mod tests {
         // difference: only videos run with `--tags` get these extra fields at all.
         assert!(json.get("summary").is_some());
         assert!(json.get("moments").is_some());
+    }
+
+    #[test]
+    fn resolve_model_picks_each_providers_own_default_when_none_is_given() {
+        let anthropic = resolve_model(None, ProviderArg::Anthropic).expect("default");
+        assert_eq!(anthropic.id, "claude-haiku-4-5");
+        let openai = resolve_model(None, ProviderArg::OpenAi).expect("default");
+        assert_eq!(openai.id, "gpt-4.1-mini");
+    }
+
+    #[test]
+    fn resolve_model_accepts_a_model_matching_its_provider() {
+        let model = resolve_model(Some(ModelArg::Gpt41), ProviderArg::OpenAi).expect("matches");
+        assert_eq!(model.id, "gpt-4.1");
+    }
+
+    #[test]
+    fn resolve_model_rejects_a_model_from_the_other_provider() {
+        let error =
+            resolve_model(Some(ModelArg::Haiku), ProviderArg::OpenAi).expect_err("mismatch");
+        assert!(error.contains("--model haiku"), "{error}");
+        assert!(error.contains("Anthropic"), "{error}");
+        assert!(error.contains("--provider openai"), "{error}");
     }
 }

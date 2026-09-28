@@ -3,14 +3,19 @@
 
 use serde_json::{json, Value};
 
-use super::provider::{AiContent, AiRequest, AiResponse, AiUsage};
+use super::provider::{AiContent, AiRequest, AiResponse, AiUsage, Provider};
 use crate::Cue;
 
-/// The models descriptions can be written with, cheapest first; the first is the default.
-/// Sonnet and Opus think before answering: at low effort, since describing frames needs little
-/// reasoning, with room for the thinking in their answer budget.
-pub const MODELS: [Model; 3] = [
+/// The models descriptions can be written with. Anthropic's three come first, cheapest to
+/// strongest, and `MODELS[0]` (Claude Haiku 4.5) is the crate's default regardless of what
+/// follows; the two OpenAI models after them are *not* cheaper-than-Haiku-implies-default, since
+/// picking a provider (`Options.model.provider`, the CLI's `--provider`) is a separate, explicit
+/// choice from picking a model. Sonnet and Opus think before answering: at low effort, since
+/// describing frames needs little reasoning, with room for the thinking in their answer budget;
+/// neither GPT-4.1 model has a reasoning setting, so their `effort` stays `None`, like Haiku's.
+pub const MODELS: [Model; 5] = [
     Model {
+        provider: Provider::Anthropic,
         id: "claude-haiku-4-5",
         label: "Claude Haiku 4.5",
         input_usd_per_mtok: 1.0,
@@ -20,6 +25,7 @@ pub const MODELS: [Model; 3] = [
         answer_tokens: 600,
     },
     Model {
+        provider: Provider::Anthropic,
         id: "claude-sonnet-5",
         label: "Claude Sonnet 5",
         input_usd_per_mtok: 2.0,
@@ -29,6 +35,7 @@ pub const MODELS: [Model; 3] = [
         answer_tokens: 1500,
     },
     Model {
+        provider: Provider::Anthropic,
         id: "claude-opus-5",
         label: "Claude Opus 5",
         input_usd_per_mtok: 5.0,
@@ -37,9 +44,32 @@ pub const MODELS: [Model; 3] = [
         max_answer_tokens: 16000,
         answer_tokens: 1500,
     },
+    Model {
+        provider: Provider::OpenAi,
+        id: "gpt-4.1-mini",
+        label: "GPT-4.1 mini",
+        input_usd_per_mtok: 0.40,
+        output_usd_per_mtok: 1.60,
+        effort: None,
+        max_answer_tokens: 4000,
+        answer_tokens: 600,
+    },
+    Model {
+        provider: Provider::OpenAi,
+        id: "gpt-4.1",
+        label: "GPT-4.1",
+        input_usd_per_mtok: 2.0,
+        output_usd_per_mtok: 8.0,
+        effort: None,
+        max_answer_tokens: 4000,
+        answer_tokens: 600,
+    },
 ];
 
-/// When the prices in [`MODELS`] were checked.
+/// When the prices in [`MODELS`] were checked. The two OpenAI models were priced from training
+/// data, not a live quote: `api.openai.com` and OpenAI's own docs are both blocked from the
+/// environment this crate is developed in (see `docs/design/openai-provider.md`). Confirm them
+/// against OpenAI's current pricing before relying on `--estimate` for `--provider openai`.
 pub const PRICES_CHECKED: &str = "2026-09-26";
 
 /// Clips longer than this are skipped.
@@ -66,6 +96,9 @@ const WHOLE_CLIP_FRACTION: f64 = 0.9;
 /// A model, its prices and how it is asked.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Model {
+    /// Which AI service this model belongs to; picks the client [`crate::describe`] and friends
+    /// build from [`Options::api_key`](crate::Options::api_key).
+    pub provider: Provider,
     pub id: &'static str,
     /// The name the panel and the settings show.
     pub label: &'static str,
@@ -499,7 +532,7 @@ pub fn parse_answer(
     match response.stop_reason.as_str() {
         "end_turn" => {}
         "max_tokens" => return Err("The answer was too long".to_string()),
-        "refusal" => return Err("Claude declined to describe it".to_string()),
+        "refusal" => return Err("The model declined to describe it".to_string()),
         other => return Err(format!("The model stopped early ({other})")),
     }
     let summary = response.json["summary"].as_str().unwrap_or_default().trim();
@@ -719,6 +752,20 @@ mod tests {
             "Claude Haiku 4.5 ($1 / $5 per M tokens)"
         );
         assert!(MODELS[0].effort.is_none(), "Haiku 4.5 rejects effort");
+    }
+
+    #[test]
+    fn openai_models_are_in_the_list_with_no_effort_setting() {
+        let mini = Model::from_id("gpt-4.1-mini");
+        assert_eq!(mini.provider, Provider::OpenAi);
+        assert!(mini.effort.is_none(), "GPT-4.1 does not reason");
+        let full = Model::from_id("gpt-4.1");
+        assert_eq!(full.provider, Provider::OpenAi);
+        assert!(
+            full.input_usd_per_mtok > mini.input_usd_per_mtok,
+            "the stronger one costs more"
+        );
+        assert_eq!(MODELS[0].provider, Provider::Anthropic, "still the default");
     }
 
     #[test]
