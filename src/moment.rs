@@ -35,20 +35,20 @@ pub fn moment_schema() -> Value {
 }
 
 /// The request to `model` naming and describing the moment at `at_s`, from the frames
-/// [`crate::frames::Clip::sample_moment`] read around it and any subtitle lines that overlap
-/// [`MOMENT_WINDOW_S`] of it.
+/// [`crate::frames::Clip::sample_moment`] read `window_s` around it and any subtitle lines that
+/// overlap that same window.
 pub fn build_moment_request(
     model: Model,
     frames: &[Frame],
     subtitles: &[Cue],
     at_s: f64,
+    window_s: f64,
     language: SummaryLanguage,
 ) -> AiRequest {
     let nearby: Vec<&Cue> = subtitles
         .iter()
         .filter(|cue| {
-            cue.start.as_secs_f64() <= at_s + MOMENT_WINDOW_S
-                && cue.end.as_secs_f64() >= at_s - MOMENT_WINDOW_S
+            cue.start.as_secs_f64() <= at_s + window_s && cue.end.as_secs_f64() >= at_s - window_s
         })
         .collect();
     let has_subtitles = !nearby.is_empty();
@@ -151,6 +151,7 @@ mod tests {
             &[frame(9.0), frame(10.0), frame(11.0)],
             &subtitles,
             10.0,
+            MOMENT_WINDOW_S,
             SummaryLanguage::English,
         );
         let AiContent::Text(instructions) = &request.content[0] else {
@@ -171,12 +172,43 @@ mod tests {
             &[frame(10.0)],
             &[],
             10.0,
+            MOMENT_WINDOW_S,
             SummaryLanguage::English,
         );
         let AiContent::Text(instructions) = &request.content[0] else {
             panic!("instructions first");
         };
         assert!(!instructions.contains("Subtitles"), "{instructions}");
+    }
+
+    #[test]
+    fn a_wider_window_pulls_in_a_cue_the_default_window_excludes() {
+        let subtitles = vec![cue(7.5, 8.0, "further away")];
+        let narrow = build_moment_request(
+            Model::default(),
+            &[frame(10.0)],
+            &subtitles,
+            10.0,
+            MOMENT_WINDOW_S,
+            SummaryLanguage::English,
+        );
+        let AiContent::Text(instructions) = &narrow.content[0] else {
+            panic!("instructions first");
+        };
+        assert!(!instructions.contains("further away"), "{instructions}");
+
+        let wide = build_moment_request(
+            Model::default(),
+            &[frame(10.0)],
+            &subtitles,
+            10.0,
+            3.0,
+            SummaryLanguage::English,
+        );
+        let AiContent::Text(instructions) = &wide.content[0] else {
+            panic!("instructions first");
+        };
+        assert!(instructions.contains("further away"), "{instructions}");
     }
 
     #[test]
@@ -206,5 +238,74 @@ mod tests {
             parse_moment_answer(&cut_off),
             Err("The answer was too long".to_string())
         );
+    }
+
+    /// The real path end to end: a frame read from a test clip with
+    /// [`crate::frames::Clip::sample_moment`], a request built from it, sent to a mock server,
+    /// and the answer parsed back — not just the request/answer shapes on their own.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn a_moment_round_trips_through_a_mock_server_with_a_real_frame() {
+        use crate::anthropic::{Anthropic, RetryPolicy};
+        use crate::frames::Clip;
+        use crate::provider::AiProvider;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/clips/file_example_MP4_480_1_5MG.mp4");
+        let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+        let frames = clip
+            .sample_moment(2.0, MOMENT_WINDOW_S, &AtomicBool::new(false))
+            .expect("sampled")
+            .expect("not cancelled");
+        assert!(!frames.is_empty());
+        drop(clip);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            let answer = r#"{"content":[{"type":"text","text":"{\"name\":\"Opening frame\",\"description\":\"The clip's opening frame.\"}"}],"stop_reason":"end_turn","usage":{"input_tokens":500,"output_tokens":20}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                answer.len(),
+                answer
+            );
+            let _ = reader.get_mut().write_all(response.as_bytes());
+        });
+
+        let request = build_moment_request(
+            Model::default(),
+            &frames,
+            &[],
+            2.0,
+            MOMENT_WINDOW_S,
+            SummaryLanguage::English,
+        );
+        let provider =
+            Anthropic::with_endpoint("k".to_string(), url, RetryPolicy::default()).expect("client");
+        let response = provider
+            .complete(&request, &AtomicBool::new(false))
+            .expect("answer");
+        let moment = parse_moment_answer(&response).expect("parsed");
+        assert_eq!(moment.name, "Opening frame");
+        assert_eq!(moment.description, "The clip's opening frame.");
     }
 }

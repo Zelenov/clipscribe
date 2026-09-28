@@ -11,7 +11,7 @@ use clipscribe::{
     describe, describe_moment, describe_with_tags, estimate_tags_usage, estimate_usage,
     format_time, frames, parse_vocabulary, srt, AiUsage, Described, DescribedMoment,
     DescribedWithTags, Error, FrameSampling, Model, MomentsMode, Options, Provider, Stage,
-    SummaryLanguage, Tag, MAX_DURATION_S, MODELS,
+    SummaryLanguage, Tag, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
 };
 use serde_json::json;
 
@@ -76,6 +76,12 @@ struct Cli {
     /// video, instead of describing the whole clip. Fast and cheap: one small request.
     #[arg(long, value_parser = parse_at, conflicts_with_all = ["tags", "estimate", "frames", "moments"])]
     at: Option<f64>,
+
+    /// How far around --at to read frames and nearby subtitles from, in seconds each way.
+    /// Defaults to a window close enough that the moment is still recognisably the same action,
+    /// far enough to show which way it is moving.
+    #[arg(long, requires = "at")]
+    window: Option<f64>,
 }
 
 /// A timestamp: `h:mm:ss.f`, `m:ss.f`, or plain seconds, all with the fraction optional.
@@ -275,6 +281,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if cli.at.is_some() && videos.len() != 1 {
+        eprintln!("error: --at takes exactly one video, not {}", videos.len());
+        return ExitCode::from(2);
+    }
     let vocabulary = match &cli.tags {
         Some(path) => match load_vocabulary(path) {
             Ok(vocabulary) => Some(vocabulary),
@@ -310,7 +320,16 @@ fn main() -> ExitCode {
     };
 
     if let Some(at_s) = cli.at {
-        return describe_one_moment(&videos, at_s, &options, cli.no_subtitles, cli.json, model);
+        let window_s = cli.window.unwrap_or(MOMENT_WINDOW_S);
+        return describe_one_moment(
+            &videos[0],
+            at_s,
+            window_s,
+            &options,
+            cli.no_subtitles,
+            cli.json,
+            model,
+        );
     }
 
     let mut results = Vec::new();
@@ -409,20 +428,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// `--at`: name and describe the moment at `at_s` in the one video `--at` requires, instead of
-/// describing a whole clip.
+/// `--at`: name and describe the moment at `at_s` in `video`, instead of describing a whole clip.
 fn describe_one_moment(
-    videos: &[PathBuf],
+    video: &Path,
     at_s: f64,
+    window_s: f64,
     options: &Options,
     no_subtitles: bool,
     json: bool,
     model: Model,
 ) -> ExitCode {
-    let [video] = videos else {
-        eprintln!("error: --at takes exactly one video, not {}", videos.len());
-        return ExitCode::from(2);
-    };
     let subtitles = if no_subtitles {
         Vec::new()
     } else {
@@ -431,7 +446,7 @@ fn describe_one_moment(
             Vec::new()
         })
     };
-    match describe_moment(video, at_s, &subtitles, options, &CANCEL) {
+    match describe_moment(video, at_s, window_s, &subtitles, options, &CANCEL) {
         Ok(described) => {
             if json {
                 println!(
@@ -817,6 +832,15 @@ mod tests {
         assert_eq!(json["at_s"], 83.4);
         assert_eq!(json["name"], "Goat crosses path");
         assert_eq!(json["usage"]["input_tokens"], 620);
+    }
+
+    /// Printed with `cargo test moment_to_json_pretty -- --nocapture`, for the PR's `--at --json`
+    /// sample output: no live API key is needed since this exercises the CLI's own formatting,
+    /// not a real answer.
+    #[test]
+    fn moment_to_json_pretty_prints_like_the_cli_does() {
+        let json = moment_to_json(Path::new("hike.mp4"), 83.4, &sample_moment(), MODELS[0]);
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
     }
 
     #[test]

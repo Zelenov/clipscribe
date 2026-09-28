@@ -308,31 +308,41 @@ pub fn suggest_tags(
 #[derive(Debug, Clone, PartialEq)]
 pub struct DescribedMoment {
     pub moment: Moment,
+    /// What the request was billed for; see [`Model::cost_usd`].
     pub usage: AiUsage,
 }
 
 /// Name and describe the frame at `at_s` in `video`, for a marker there, instead of describing
-/// the whole clip ([`describe`]): reads the frame plus a few around it
-/// ([`frames::Clip::sample_moment`], [`MOMENT_WINDOW_S`]) and any subtitle lines that overlap
-/// that window, and asks for a short name and a one-to-two sentence description in one small,
-/// fast request. `cancel` is checked between frames and while waiting for the answer.
+/// the whole clip ([`describe`]): reads the frame plus `window_s` on each side of it
+/// ([`frames::Clip::sample_moment`]) and any subtitle lines that overlap that same window, and
+/// asks for a short name and a one-to-two sentence description in one small, fast request.
+/// [`MOMENT_WINDOW_S`] is a reasonable default for `window_s`. `cancel` is checked between
+/// frames and while waiting for the answer.
 #[cfg(feature = "frames")]
 pub fn describe_moment(
     video: &std::path::Path,
     at_s: f64,
+    window_s: f64,
     subtitles: &[Cue],
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<DescribedMoment, Error> {
     let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
-    let frames = match clip.sample_moment(at_s, MOMENT_WINDOW_S, cancel) {
+    let frames = match clip.sample_moment(at_s, window_s, cancel) {
         Ok(Some(frames)) if !frames.is_empty() => frames,
         Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
         Ok(None) => return Err(Error::Cancelled),
         Err(e) => return Err(Error::Unreadable(e)),
     };
     drop(clip);
-    let request = build_moment_request(options.model, &frames, subtitles, at_s, options.language);
+    let request = build_moment_request(
+        options.model,
+        &frames,
+        subtitles,
+        at_s,
+        window_s,
+        options.language,
+    );
     let provider = provider_for(options)?;
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
