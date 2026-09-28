@@ -2,16 +2,17 @@
 //! [`crate::anthropic`] uses, translated to OpenAI's request, response and error bodies. See
 //! `docs/design/openai-provider.md` for why this endpoint and these models.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::provider::{
-    timeout_for, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, RetryPolicy,
-    CONNECT_TIMEOUT,
+    self, timeout_for, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, Provider,
+    RetryPolicy, CONNECT_TIMEOUT,
 };
+use provider::Attempt;
 
 const API_URL: &str = "https://api.openai.com";
 
@@ -46,14 +47,16 @@ impl OpenAi {
         })
     }
 
-    fn body(request: &AiRequest) -> Value {
-        // No model in `MODELS` gives OpenAI a `Model.effort`: none of the two picked reason. If
-        // that changes, this needs an actual field name for it; guessing at one now would be
-        // worse than an assertion that catches the day it matters.
-        debug_assert!(
-            request.effort.is_none(),
-            "no OpenAI model sets an effort; add support for it here first"
-        );
+    /// Fails (even in a release build, unlike a `debug_assert!`) if `request.effort` is set: no
+    /// model in `MODELS` gives OpenAI one today (neither picked model reasons), so there is no
+    /// field name to put it in yet. Guessing at one now would silently drop it; refusing the
+    /// request is the safer failure the day a reasoning OpenAI model is added here.
+    fn body(request: &AiRequest) -> Result<Value, AiError> {
+        if request.effort.is_some() {
+            return Err(AiError::Rejected(
+                "this OpenAI model has no effort parameter implemented yet".to_string(),
+            ));
+        }
         let content: Vec<Value> = request
             .content
             .iter()
@@ -70,7 +73,7 @@ impl OpenAi {
                 }),
             })
             .collect();
-        json!({
+        Ok(json!({
             "model": request.model,
             "max_completion_tokens": request.max_tokens,
             "messages": [{"role": "user", "content": content}],
@@ -78,64 +81,16 @@ impl OpenAi {
                 "type": "json_schema",
                 "json_schema": {"name": "answer", "strict": true, "schema": request.schema},
             },
-        })
+        }))
     }
-
-    /// Sleep `wait` in steps, returning `Cancelled` as soon as the flag is set.
-    fn wait(&self, wait: Duration, cancel: &AtomicBool) -> Result<(), AiError> {
-        let mut left = wait;
-        while !left.is_zero() {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(AiError::Cancelled);
-            }
-            let step = left.min(self.retry.step);
-            std::thread::sleep(step);
-            left -= step;
-        }
-        if cancel.load(Ordering::Relaxed) {
-            return Err(AiError::Cancelled);
-        }
-        Ok(())
-    }
-}
-
-/// What to do after one attempt.
-enum Attempt {
-    Done(Result<AiResponse, AiError>),
-    /// Retry after the policy's next delay, if any is left.
-    Retry(String),
-    /// Wait this long, then try again without using up a retry.
-    RateLimited(Duration),
 }
 
 impl AiProvider for OpenAi {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError> {
-        let body = Self::body(request).to_string();
-        let mut retries = self.retry.delays.iter();
-        let mut rate_limited = 0;
-        loop {
-            match self.attempt(&body) {
-                Attempt::Done(result) => return result,
-                Attempt::RateLimited(_) if rate_limited >= self.retry.max_rate_limit_waits => {
-                    return Err(AiError::Rejected(
-                        "OpenAI's rate limit was still reached after many waits".to_string(),
-                    ));
-                }
-                Attempt::RateLimited(wait) => {
-                    rate_limited += 1;
-                    log::info!("ai: rate limited, waiting {} s", wait.as_secs());
-                    self.wait(wait, cancel)?;
-                }
-                Attempt::Retry(why) => {
-                    rate_limited = 0;
-                    let Some(delay) = retries.next() else {
-                        return Err(AiError::Network(why));
-                    };
-                    log::warn!("ai: {why}; retrying in {} s", delay.as_secs());
-                    self.wait(*delay, cancel)?;
-                }
-            }
-        }
+        let body = Self::body(request)?.to_string();
+        provider::retry_loop(&self.retry, Provider::OpenAi.label(), cancel, || {
+            self.attempt(&body)
+        })
     }
 }
 
@@ -194,12 +149,14 @@ fn classify(
     let code = json["error"]["code"].as_str().unwrap_or_default();
     match status {
         200 => Attempt::Done(parse_message(&json)),
-        401 | 403 => Attempt::Done(Err(AiError::KeyRejected("OpenAI".to_string()))),
+        401 | 403 => Attempt::Done(Err(AiError::KeyRejected(
+            Provider::OpenAi.label().to_string(),
+        ))),
         // OpenAI signals "no credit left" through a 429 with this error code, not a distinct
         // HTTP status the way Anthropic's 402 does.
-        429 if code == "insufficient_quota" => {
-            Attempt::Done(Err(AiError::OutOfCredit("OpenAI".to_string())))
-        }
+        429 if code == "insufficient_quota" => Attempt::Done(Err(AiError::OutOfCredit(
+            Provider::OpenAi.label().to_string(),
+        ))),
         429 => Attempt::RateLimited(retry_after.unwrap_or(rate_limit_wait)),
         500 | 502 | 503 | 504 => Attempt::Retry(format!("HTTP {status}: {message}")),
         _ => Attempt::Done(Err(AiError::Rejected(message))),
@@ -253,6 +210,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     /// A local HTTP server answering each request with the next canned response, recording
@@ -335,7 +293,7 @@ mod tests {
 
     #[test]
     fn the_body_carries_images_and_the_schema_as_a_data_url() {
-        let body = OpenAi::body(&request());
+        let body = OpenAi::body(&request()).expect("no effort set");
         assert_eq!(
             body["messages"][0]["content"][1]["image_url"]["url"],
             "data:image/jpeg;base64,AQI="
@@ -343,6 +301,16 @@ mod tests {
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert_eq!(body["max_completion_tokens"], 10);
+    }
+
+    #[test]
+    fn a_request_with_an_effort_is_rejected_instead_of_silently_dropping_it() {
+        let request = AiRequest {
+            effort: Some("low"),
+            ..request()
+        };
+        let error = OpenAi::body(&request).expect_err("no OpenAI model reasons yet");
+        assert!(matches!(error, AiError::Rejected(_)));
     }
 
     #[test]

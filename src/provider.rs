@@ -15,7 +15,9 @@ pub enum Provider {
 }
 
 impl Provider {
-    /// The name used in error messages and the CLI's `--provider` values.
+    /// The proper name used in error messages (`AiError::reason`, `stops_job`) and
+    /// `retry_loop`'s own rate-limit message. Not the CLI's `--provider` value (lowercase, e.g.
+    /// `"openai"`), which the `clipscribe` binary's own `ProviderArg` owns instead.
     pub fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
@@ -174,4 +176,70 @@ impl AiError {
 /// checked during waits between retries.
 pub trait AiProvider {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError>;
+}
+
+/// What one HTTP attempt decided, for [`retry_loop`]. Every provider's own `classify` builds
+/// this from its response; nothing past this point is provider-specific.
+pub(crate) enum Attempt {
+    Done(Result<AiResponse, AiError>),
+    /// Retry after the policy's next delay, if any is left.
+    Retry(String),
+    /// Wait this long, then try again without using up a retry.
+    RateLimited(Duration),
+}
+
+/// Sleep `duration` in steps, returning `Cancelled` as soon as `cancel` is set.
+fn wait(retry: &RetryPolicy, duration: Duration, cancel: &AtomicBool) -> Result<(), AiError> {
+    use std::sync::atomic::Ordering;
+
+    let mut left = duration;
+    while !left.is_zero() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(AiError::Cancelled);
+        }
+        let step = left.min(retry.step);
+        std::thread::sleep(step);
+        left -= step;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AiError::Cancelled);
+    }
+    Ok(())
+}
+
+/// The retry loop every [`AiProvider`] runs: keeps calling `attempt` (one HTTP round-trip,
+/// classified into an [`Attempt`]) until it is done, retrying a transient failure after
+/// `retry`'s next delay and waiting out rate limits without spending one. `provider_label`
+/// names who ran out of retries or waits (see [`Provider::label`]).
+pub(crate) fn retry_loop(
+    retry: &RetryPolicy,
+    provider_label: &str,
+    cancel: &AtomicBool,
+    mut attempt: impl FnMut() -> Attempt,
+) -> Result<AiResponse, AiError> {
+    let mut retries = retry.delays.iter();
+    let mut rate_limited = 0;
+    loop {
+        match attempt() {
+            Attempt::Done(result) => return result,
+            Attempt::RateLimited(_) if rate_limited >= retry.max_rate_limit_waits => {
+                return Err(AiError::Rejected(format!(
+                    "{provider_label}'s rate limit was still reached after many waits"
+                )));
+            }
+            Attempt::RateLimited(duration) => {
+                rate_limited += 1;
+                log::info!("ai: rate limited, waiting {} s", duration.as_secs());
+                wait(retry, duration, cancel)?;
+            }
+            Attempt::Retry(why) => {
+                rate_limited = 0;
+                let Some(delay) = retries.next() else {
+                    return Err(AiError::Network(why));
+                };
+                log::warn!("ai: {why}; retrying in {} s", delay.as_secs());
+                wait(retry, *delay, cancel)?;
+            }
+        }
+    }
 }

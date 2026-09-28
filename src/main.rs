@@ -103,12 +103,14 @@ impl ProviderArg {
         }
     }
 
-    /// The exact string `--provider` accepts for this value.
-    fn cli_value(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAi => "openai",
-        }
+    /// The exact string `--provider` accepts for this value, straight from clap's own
+    /// `ValueEnum` (the same source `--help`'s `[possible values: ...]` reads), so it can never
+    /// drift from the `#[value(name = ...)]` override above.
+    fn cli_value(self) -> String {
+        self.to_possible_value()
+            .expect("every ProviderArg variant has a value")
+            .get_name()
+            .to_string()
     }
 }
 
@@ -147,22 +149,19 @@ impl ModelArg {
         MODELS.into_iter().find(|m| m.id == id).unwrap_or_default()
     }
 
-    /// The exact string `--model` accepts for this value (matching the `#[value(name = ...)]`
-    /// overrides above, where there are any).
-    fn cli_value(self) -> &'static str {
-        match self {
-            Self::Haiku => "haiku",
-            Self::Sonnet => "sonnet",
-            Self::Opus => "opus",
-            Self::Gpt41Mini => "gpt-4.1-mini",
-            Self::Gpt41 => "gpt-4.1",
-        }
+    /// The exact string `--model` accepts for this value, straight from clap's own `ValueEnum`
+    /// (see [`ProviderArg::cli_value`]).
+    fn cli_value(self) -> String {
+        self.to_possible_value()
+            .expect("every ModelArg variant has a value")
+            .get_name()
+            .to_string()
     }
 }
 
 impl std::fmt::Display for ModelArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.cli_value())
+        f.write_str(&self.cli_value())
     }
 }
 

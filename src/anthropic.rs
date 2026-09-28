@@ -1,14 +1,15 @@
 //! Claude through Anthropic's Messages API, over plain HTTP (there is no official Rust SDK).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::provider::{
-    AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, CONNECT_TIMEOUT,
+    self, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, Provider, CONNECT_TIMEOUT,
 };
+use provider::Attempt;
 
 /// Kept for anyone already naming `anthropic::RetryPolicy`: the type now lives in
 /// [`crate::provider`], shared with the OpenAI client, since none of it was ever
@@ -77,62 +78,14 @@ impl Anthropic {
             "output_config": output_config,
         })
     }
-
-    /// Sleep `wait` in steps, returning `Cancelled` as soon as the flag is set.
-    fn wait(&self, wait: Duration, cancel: &AtomicBool) -> Result<(), AiError> {
-        let mut left = wait;
-        while !left.is_zero() {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(AiError::Cancelled);
-            }
-            let step = left.min(self.retry.step);
-            std::thread::sleep(step);
-            left -= step;
-        }
-        if cancel.load(Ordering::Relaxed) {
-            return Err(AiError::Cancelled);
-        }
-        Ok(())
-    }
-}
-
-/// What to do after one attempt.
-enum Attempt {
-    Done(Result<AiResponse, AiError>),
-    /// Retry after the policy's next delay, if any is left.
-    Retry(String),
-    /// Wait this long, then try again without using up a retry.
-    RateLimited(Duration),
 }
 
 impl AiProvider for Anthropic {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError> {
         let body = Self::body(request).to_string();
-        let mut retries = self.retry.delays.iter();
-        let mut rate_limited = 0;
-        loop {
-            match self.attempt(&body) {
-                Attempt::Done(result) => return result,
-                Attempt::RateLimited(_) if rate_limited >= self.retry.max_rate_limit_waits => {
-                    return Err(AiError::Rejected(
-                        "Anthropic's rate limit was still reached after many waits".to_string(),
-                    ));
-                }
-                Attempt::RateLimited(wait) => {
-                    rate_limited += 1;
-                    log::info!("ai: rate limited, waiting {} s", wait.as_secs());
-                    self.wait(wait, cancel)?;
-                }
-                Attempt::Retry(why) => {
-                    rate_limited = 0;
-                    let Some(delay) = retries.next() else {
-                        return Err(AiError::Network(why));
-                    };
-                    log::warn!("ai: {why}; retrying in {} s", delay.as_secs());
-                    self.wait(*delay, cancel)?;
-                }
-            }
-        }
+        provider::retry_loop(&self.retry, Provider::Anthropic.label(), cancel, || {
+            self.attempt(&body)
+        })
     }
 }
 
@@ -191,11 +144,15 @@ fn classify(
         .unwrap_or_else(|| format!("HTTP {status}"));
     match status {
         200 => Attempt::Done(parse_message(&json)),
-        401 | 403 => Attempt::Done(Err(AiError::KeyRejected("Anthropic".to_string()))),
-        402 => Attempt::Done(Err(AiError::OutOfCredit("Anthropic".to_string()))),
-        400 if message.to_lowercase().contains("credit balance") => {
-            Attempt::Done(Err(AiError::OutOfCredit("Anthropic".to_string())))
-        }
+        401 | 403 => Attempt::Done(Err(AiError::KeyRejected(
+            Provider::Anthropic.label().to_string(),
+        ))),
+        402 => Attempt::Done(Err(AiError::OutOfCredit(
+            Provider::Anthropic.label().to_string(),
+        ))),
+        400 if message.to_lowercase().contains("credit balance") => Attempt::Done(Err(
+            AiError::OutOfCredit(Provider::Anthropic.label().to_string()),
+        )),
         400 if is_limit(&message) => Attempt::Done(Err(AiError::LimitReached(message))),
         429 => Attempt::RateLimited(retry_after.unwrap_or(rate_limit_wait)),
         500 | 502 | 503 | 529 => Attempt::Retry(format!("HTTP {status}: {message}")),
@@ -247,6 +204,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     /// A local HTTP server answering each request with the next canned response, recording

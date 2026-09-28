@@ -15,6 +15,8 @@
   with a binding (`KeyRejected(provider)`) instead of the bare variant name.
 - Library: `anthropic::RetryPolicy` moved to `provider::RetryPolicy` (re-exported from
   `anthropic` too, so existing code naming it still compiles).
+- A request the model refused now says "The model declined to describe it" / "...suggest tags"
+  instead of naming Claude specifically, since the same message covers both providers.
 
 # 0.4.0
 ## Added

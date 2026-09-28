@@ -418,4 +418,52 @@ mod tests {
             .iter()
             .all(|s| s.start_s >= 0.0 && s.end_s <= described.duration_s));
     }
+
+    /// The same request as [`live_description_of_a_test_clip`], through OpenAI instead: only
+    /// when `OPENAI_API_KEY` is set (never in CI without that secret, and not reachable at all
+    /// from this crate's own development environment — `api.openai.com` is blocked there; see
+    /// `docs/design/openai-provider.md`).
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn live_description_of_a_test_clip_with_openai() {
+        let Some(api_key) = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+        else {
+            eprintln!("OPENAI_API_KEY not set: live OpenAI test skipped");
+            return;
+        };
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/clips/file_example_MP4_480_1_5MG.mp4");
+        let options = Options {
+            api_key: api_key.trim().to_string(),
+            model: Model::from_id("gpt-4.1-mini"),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+        };
+        let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
+            Ok(described) => described,
+            // The key works but its account cannot pay: nothing about the code to test.
+            Err(Error::Ai(e @ (AiError::OutOfCredit(_) | AiError::LimitReached(_)))) => {
+                eprintln!("live OpenAI test skipped: {}", e.reason());
+                return;
+            }
+            Err(e) => panic!("answer: {e:?}"),
+        };
+        eprintln!(
+            "live (openai): {} frames, usage {:?} (estimated {:?}), cost ${:.4}\n{:#?}",
+            described.frames,
+            described.usage,
+            estimate_usage(options.model, described.duration_s, 0),
+            options.model.cost_usd(described.usage),
+            described.description
+        );
+        let d = &described.description;
+        assert!(!d.summary.is_empty());
+        assert!(d
+            .segments
+            .iter()
+            .all(|s| s.start_s >= 0.0 && s.end_s <= described.duration_s));
+    }
 }
