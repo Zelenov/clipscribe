@@ -413,13 +413,7 @@ fn main() -> ExitCode {
         );
     }
     if total != AiUsage::default() {
-        eprintln!(
-            "{} in / {} out tokens, about ${:.4} with {}",
-            total.input_tokens,
-            total.output_tokens,
-            model.cost_usd(total),
-            model.label
-        );
+        print_usage(total, model);
     }
     if failed || CANCEL.load(Ordering::Relaxed) {
         ExitCode::FAILURE
@@ -449,21 +443,18 @@ fn describe_one_moment(
     match describe_moment(video, at_s, window_s, &subtitles, options, &CANCEL) {
         Ok(described) => {
             if json {
+                // `--json` prints an array with one object per video (see its own --help text);
+                // `--at` only ever runs on one video, but the shape stays an array so a script
+                // built for the general case can treat --at output the same way.
+                let value = vec![moment_to_json(video, at_s, &described, model)];
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&moment_to_json(video, at_s, &described, model))
-                        .unwrap_or_default()
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
                 );
             } else {
                 print_moment(video, at_s, &described, model);
             }
-            eprintln!(
-                "{} in / {} out tokens, about ${:.4} with {}",
-                described.usage.input_tokens,
-                described.usage.output_tokens,
-                model.cost_usd(described.usage),
-                model.label
-            );
+            print_usage(described.usage, model);
             ExitCode::SUCCESS
         }
         Err(Error::Cancelled) => {
@@ -475,6 +466,17 @@ fn describe_one_moment(
             ExitCode::FAILURE
         }
     }
+}
+
+/// The tokens and cost line printed on stderr after a run, for a batch's total or one moment.
+fn print_usage(usage: AiUsage, model: Model) {
+    eprintln!(
+        "{} in / {} out tokens, about ${:.4} with {}",
+        usage.input_tokens,
+        usage.output_tokens,
+        model.cost_usd(usage),
+        model.label
+    );
 }
 
 fn print_moment(video: &Path, at_s: f64, described: &DescribedMoment, model: Model) {
@@ -836,10 +838,16 @@ mod tests {
 
     /// Printed with `cargo test moment_to_json_pretty -- --nocapture`, for the PR's `--at --json`
     /// sample output: no live API key is needed since this exercises the CLI's own formatting,
-    /// not a real answer.
+    /// not a real answer. `--at --json` wraps the one moment in a one-element array, like
+    /// `--json` does for every video in the general case.
     #[test]
     fn moment_to_json_pretty_prints_like_the_cli_does() {
-        let json = moment_to_json(Path::new("hike.mp4"), 83.4, &sample_moment(), MODELS[0]);
+        let json = vec![moment_to_json(
+            Path::new("hike.mp4"),
+            83.4,
+            &sample_moment(),
+            MODELS[0],
+        )];
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     }
 
