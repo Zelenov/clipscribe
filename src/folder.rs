@@ -538,8 +538,7 @@ mod run {
                     scope.spawn(|| {
                         let provider = make_provider();
                         loop {
-                            if self.cancel.load(Ordering::Relaxed) || halt.load(Ordering::Relaxed)
-                            {
+                            if self.cancel.load(Ordering::Relaxed) || halt.load(Ordering::Relaxed) {
                                 break;
                             }
                             let index = next.fetch_add(1, Ordering::Relaxed);
@@ -806,7 +805,16 @@ mod tests {
             most_at_once: Arc<AtomicUsize>,
         }
 
+        /// How long the test clients wait for an answer: far longer than any `wait` of
+        /// [`server`], so a held answer comes back as an answer (and a run that never overlaps
+        /// its requests fails on `most_at_once`, not on a timeout).
+        const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+
         fn server(wait: Duration) -> Server {
+            assert!(
+                wait * 2 <= ANSWER_TIMEOUT,
+                "a held answer must not time out"
+            );
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let url = format!("http://{}", listener.local_addr().expect("addr"));
             let requests = Arc::new(AtomicUsize::new(0));
@@ -833,11 +841,15 @@ mod tests {
                         let n = count.fetch_add(1, Ordering::SeqCst) + 1;
                         let now = in_work.fetch_add(1, Ordering::SeqCst) + 1;
                         most.fetch_max(now, Ordering::SeqCst);
-                        // Hold the answer until a second request is in work too (or `wait`
-                        // runs out), so a test of overlapping requests does not depend on how
-                        // long each clip takes to decode.
+                        // Hold the answer until two requests have been in work at the same time
+                        // (or `wait` runs out), so a test of overlapping requests does not depend
+                        // on how long each clip takes to decode. The condition is the high-water
+                        // mark, not the current count: a request that arrives second is released
+                        // at once, so polling the current count could miss the moment the two
+                        // overlapped, and a request that arrives after the overlap was already
+                        // seen (the last clip of a run) has nothing left to wait for.
                         let started = std::time::Instant::now();
-                        while in_work.load(Ordering::SeqCst) < 2 && started.elapsed() < wait {
+                        while most.load(Ordering::SeqCst) < 2 && started.elapsed() < wait {
                             std::thread::sleep(Duration::from_millis(10));
                         }
                         in_work.fetch_sub(1, Ordering::SeqCst);
@@ -875,7 +887,9 @@ mod tests {
             }
         }
 
-        /// A folder of copies of the named test clips.
+        /// A folder of copies of the named test clips, and their paths in the order named (not
+        /// [`find_videos`]'s sorted order, which would put `file_example_MOV…` before
+        /// `rotated-90.mp4`: tests that depend on which clip goes first say so by the order).
         fn folder(name: &str, clips: &[&str]) -> (PathBuf, Vec<PathBuf>) {
             let dir =
                 std::env::temp_dir().join(format!("clipscribe-run-{name}-{}", std::process::id()));
@@ -885,7 +899,7 @@ mod tests {
             for clip in clips {
                 std::fs::copy(repo.join(clip), dir.join(clip)).expect("copy");
             }
-            let videos = find_videos(std::slice::from_ref(&dir)).expect("videos");
+            let videos = clips.iter().map(|clip| dir.join(clip)).collect();
             (dir, videos)
         }
 
@@ -907,7 +921,7 @@ mod tests {
                     rate_limit_wait: Duration::from_millis(1),
                     step: Duration::from_millis(1),
                     max_rate_limit_waits: 20,
-                    answer_timeout: Duration::from_secs(20),
+                    answer_timeout: ANSWER_TIMEOUT,
                 };
                 Ok(Box::new(
                     Anthropic::with_endpoint("k".to_string(), url.clone(), fast)
@@ -925,13 +939,18 @@ mod tests {
             .go(videos, &make_provider, on_event)
         }
 
+        /// What became of each clip, in a word; a failed clip's error is printed, so an assertion
+        /// on the words says why.
         fn kinds(run: &FolderRun) -> Vec<&'static str> {
             run.clips
                 .iter()
                 .map(|c| match c {
                     ClipOutcome::Described(_) => "described",
                     ClipOutcome::Cached(_) => "cached",
-                    ClipOutcome::Failed(_) => "failed",
+                    ClipOutcome::Failed(e) => {
+                        eprintln!("failed: {e:?}");
+                        "failed"
+                    }
                     ClipOutcome::OverBudget => "over budget",
                     ClipOutcome::NotStarted => "not started",
                 })
@@ -945,7 +964,11 @@ mod tests {
         fn a_stopped_run_resumes_without_redoing_finished_clips() {
             let (dir, videos) = folder(
                 "resume",
-                &["rotated-90.mp4", "file_example_MOV_480_700kB.mov", "file_example_MP4_480_1_5MG.mp4"],
+                &[
+                    "rotated-90.mp4",
+                    "file_example_MOV_480_700kB.mov",
+                    "file_example_MP4_480_1_5MG.mp4",
+                ],
             );
             let server = server(Duration::ZERO);
             let path = cache_path(&dir, None);
@@ -990,10 +1013,21 @@ mod tests {
             );
             assert_eq!(kinds(&second), ["cached", "described", "described"]);
             assert_eq!(second.stopped, None);
-            assert_eq!(server.requests.load(Ordering::SeqCst), 3, "only the two left");
-            assert_eq!(second.usage.input_tokens, 6000, "the cached clip cost nothing");
+            assert_eq!(
+                server.requests.load(Ordering::SeqCst),
+                3,
+                "only the two left"
+            );
+            assert_eq!(
+                second.usage.input_tokens, 6000,
+                "the cached clip cost nothing"
+            );
             let first_record = first.clips[0].record().expect("record");
-            assert_eq!(second.clips[0].record(), Some(first_record), "the same description");
+            assert_eq!(
+                second.clips[0].record(),
+                Some(first_record),
+                "the same description"
+            );
 
             let third = run_folder(
                 &server,
@@ -1025,7 +1059,11 @@ mod tests {
             let cache = Cache::open(&path).expect("reopen");
             assert_eq!(cache.len(), 3, "replaced, not added");
             let newest = forced.clips[0].record().expect("record");
-            assert_eq!(cache.get(&newest.key).as_ref(), Some(newest), "the fresh result");
+            assert_eq!(
+                cache.get(&newest.key).as_ref(),
+                Some(newest),
+                "the fresh result"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1059,8 +1097,9 @@ mod tests {
             assert!(cache.is_empty());
 
             // Room for one clip: the first (rotated-90.mp4, 3 frames) reserves a bound of about
-            // $0.022 and costs $0.0032 (the mock's 3,000 in / 40 out tokens); the second (the
-            // MOV, 15 frames) would reserve about $0.024 more, past $0.025.
+            // $0.0216 and costs $0.0032 (the mock's 3,000 in / 40 out tokens); the second (the
+            // MOV, 16 frames) would reserve about $0.0242 more, past $0.025. (The other way
+            // round both would fit — $0.0032 + $0.0216 < $0.025 — hence the clips' order.)
             let one_clip = Budget::new(Some(0.025));
             let run = run_folder(
                 &server,
@@ -1090,7 +1129,9 @@ mod tests {
                     "Short.Travel.Health.Views.file_example_WEBM_480_900KB.webm",
                 ],
             );
-            let server = server(Duration::from_secs(20));
+            // Generous: clips decode in parallel on a slow, shared CI machine before their
+            // requests can overlap.
+            let server = server(Duration::from_secs(60));
             let run = run_folder(
                 &server,
                 &videos,
@@ -1154,7 +1195,9 @@ mod tests {
                 .filter_map(|p| test_pattern(&dir, p))
                 .collect();
             if patterns.is_empty() {
-                eprintln!("gst-launch-1.0 could not make the test patterns: only the clips checked");
+                eprintln!(
+                    "gst-launch-1.0 could not make the test patterns: only the clips checked"
+                );
             }
             videos.extend(patterns.iter().cloned());
             let server = server(Duration::ZERO);
