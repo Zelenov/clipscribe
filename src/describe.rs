@@ -48,6 +48,11 @@ pub const MAX_DURATION_S: f64 = 30.0 * 60.0;
 const FRAME_INTERVAL_S: f64 = 2.0;
 /// Frames sent per clip at most; a longer clip is sampled evenly.
 pub const MAX_FRAMES: usize = 60;
+/// How much denser `candidate_times` samples than [`sample_times`], to give
+/// `select_key_frames` real choices inside each window it picks from. Key-frame selection only
+/// runs where there are decoded candidates to choose from (the `frames` feature).
+#[cfg(feature = "frames")]
+const CANDIDATE_OVERSAMPLE: usize = 4;
 /// The long side of a frame, in pixels.
 pub const FRAME_LONG_SIDE: u32 = 512;
 /// Instruction tokens per request, for the estimate.
@@ -83,6 +88,19 @@ impl Model {
             + usage.output_tokens as f64 * self.output_usd_per_mtok)
             / 1_000_000.0
     }
+}
+
+/// How a clip's frames are chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameSampling {
+    /// Candidates spaced closely, keeping the one in each window of the clip where the picture
+    /// changes the most (`select_key_frames`, `frames` feature only); the same frame budget as
+    /// `Interval`, spent on where the clip actually changes instead of a blind timestamp.
+    #[default]
+    KeyFrames,
+    /// One frame every 2 s, at most [`MAX_FRAMES`] spread evenly over a longer clip — today's
+    /// behaviour before key frames, kept for anyone who wants the old, predictable spacing.
+    Interval,
 }
 
 /// The language descriptions are written in.
@@ -195,28 +213,115 @@ pub struct Description {
 /// Where to take frames in a clip `duration_s` long: one every 2 s, at most 60 (a longer clip
 /// is sampled evenly), one in the middle of a clip shorter than 2 s.
 pub fn sample_times(duration_s: f64) -> Vec<f64> {
-    if duration_s < FRAME_INTERVAL_S {
+    sample_times_with(duration_s, FRAME_INTERVAL_S, MAX_FRAMES)
+}
+
+/// How many frames [`sample_times`] takes from a clip `duration_s` long, without listing them.
+pub fn frame_count(duration_s: f64) -> usize {
+    count_with(duration_s, FRAME_INTERVAL_S, MAX_FRAMES)
+}
+
+/// Candidates for `select_key_frames` to choose from: `CANDIDATE_OVERSAMPLE` times denser than
+/// [`sample_times`] and capped at that many times more of them, so every window
+/// `select_key_frames` picks one frame from has real choices in it. Below two frames' worth of
+/// budget ([`frame_count`] returns 0 or 1) there is no window to choose within, so callers use
+/// [`sample_times`] directly instead of this.
+#[cfg(feature = "frames")]
+pub(crate) fn candidate_times(duration_s: f64) -> Vec<f64> {
+    sample_times_with(
+        duration_s,
+        FRAME_INTERVAL_S / CANDIDATE_OVERSAMPLE as f64,
+        MAX_FRAMES * CANDIDATE_OVERSAMPLE,
+    )
+}
+
+/// Shared shape of [`sample_times`] and [`candidate_times`]: one sample every `interval_s`, at
+/// most `max_count` (a longer clip is sampled evenly), one in the middle of a clip shorter than
+/// `interval_s`.
+fn sample_times_with(duration_s: f64, interval_s: f64, max_count: usize) -> Vec<f64> {
+    if duration_s < interval_s {
         return (duration_s > 0.0)
             .then_some(duration_s / 2.0)
             .into_iter()
             .collect();
     }
-    let interval = FRAME_INTERVAL_S.max(duration_s / MAX_FRAMES as f64);
-    (0..frame_count(duration_s))
+    let interval = interval_s.max(duration_s / max_count as f64);
+    (0..count_with(duration_s, interval_s, max_count))
         .map(|i| i as f64 * interval)
         .collect()
 }
 
-/// How many frames [`sample_times`] takes from a clip `duration_s` long, without listing them.
-pub fn frame_count(duration_s: f64) -> usize {
+/// How many samples [`sample_times_with`] takes, without listing them.
+fn count_with(duration_s: f64, interval_s: f64, max_count: usize) -> usize {
     if duration_s <= 0.0 {
         return 0;
     }
-    if duration_s < FRAME_INTERVAL_S {
+    if duration_s < interval_s {
         return 1;
     }
-    let interval = FRAME_INTERVAL_S.max(duration_s / MAX_FRAMES as f64);
-    ((duration_s / interval).ceil() as usize).min(MAX_FRAMES)
+    let interval = interval_s.max(duration_s / max_count as f64);
+    ((duration_s / interval).ceil() as usize).min(max_count)
+}
+
+/// How a clip's frames are chosen: see [`FrameSampling`].
+///
+/// From `candidates` (each candidate's time and its fingerprint — same-length byte vectors, a
+/// downsampled grayscale grid of the frame; see `frames::fingerprint`), keep at most
+/// `max_frames`: split the candidates into `max_frames` equal-sized windows and, in each, the one
+/// whose fingerprint differs most from the *previous* candidate's — the moment inside that
+/// window where the picture changes the most. A window with no real change keeps its first
+/// candidate, the same timestamp fixed-interval sampling would have picked there.
+///
+/// Returns indices into `candidates`, strictly increasing (each window's pick is drawn from its
+/// own non-overlapping range), so the result needs no separate de-duplication pass.
+#[cfg(feature = "frames")]
+pub(crate) fn select_key_frames(candidates: &[(f64, Vec<u8>)], max_frames: usize) -> Vec<usize> {
+    let total = candidates.len();
+    if total == 0 || max_frames == 0 {
+        return Vec::new();
+    }
+    if total <= max_frames {
+        return (0..total).collect();
+    }
+    let scores = change_scores(candidates);
+    (0..max_frames)
+        .map(|window| {
+            let from = window * total / max_frames;
+            let to = (window + 1) * total / max_frames;
+            (from..to).fold(
+                from,
+                |best, i| if scores[i] > scores[best] { i } else { best },
+            )
+        })
+        .collect()
+}
+
+/// How much each candidate's fingerprint differs from the one before it: `0.0` for the first
+/// candidate (nothing to compare it with).
+#[cfg(feature = "frames")]
+fn change_scores(candidates: &[(f64, Vec<u8>)]) -> Vec<f64> {
+    std::iter::once(0.0)
+        .chain(
+            candidates
+                .windows(2)
+                .map(|pair| fingerprint_diff(&pair[0].1, &pair[1].1)),
+        )
+        .collect()
+}
+
+/// Mean absolute difference between two same-length byte fingerprints, normalised to 0.0–1.0.
+/// `0.0` when they differ in length or are empty (nothing to compare).
+#[cfg(feature = "frames")]
+fn fingerprint_diff(a: &[u8], b: &[u8]) -> f64 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let total: u64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| u64::from(x.abs_diff(*y)))
+        .sum();
+    total as f64 / (a.len() as f64 * 255.0)
 }
 
 /// At most this many segments, so the description stays short: one per 30 s, from 3 to 12.
@@ -420,6 +525,99 @@ mod tests {
         for d in [0.0, 1.0, 10.0, 38.0, 600.0, 1800.0] {
             assert_eq!(frame_count(d), sample_times(d).len(), "{d}");
         }
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn candidates_are_four_times_as_dense_and_capped_four_times_as_high() {
+        assert_eq!(candidate_times(10.0).len(), 4 * sample_times(10.0).len());
+        assert_eq!(candidate_times(0.1), vec![0.05]);
+        assert!(candidate_times(0.0).is_empty());
+        // A long clip's candidates are still capped, at four times today's frame cap.
+        assert_eq!(
+            candidate_times(10_000.0).len(),
+            MAX_FRAMES * CANDIDATE_OVERSAMPLE
+        );
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn key_frames_pick_the_biggest_change_in_each_window_and_stay_in_order() {
+        // 8 candidates, one point of real change (index 5) inside the second half; two windows
+        // of 4 candidates each is the whole budget.
+        let flat = vec![0u8; 4];
+        let changed = vec![255u8; 4];
+        let candidates: Vec<(f64, Vec<u8>)> = (0..8)
+            .map(|i| {
+                (
+                    i as f64,
+                    if i == 5 {
+                        changed.clone()
+                    } else {
+                        flat.clone()
+                    },
+                )
+            })
+            .collect();
+        let chosen = select_key_frames(&candidates, 2);
+        assert_eq!(
+            chosen,
+            vec![0, 5],
+            "first window's start, second window's change"
+        );
+        assert!(
+            chosen.windows(2).all(|w| w[0] < w[1]),
+            "strictly increasing"
+        );
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn key_frames_fall_back_to_the_window_start_with_no_change() {
+        let flat = vec![0u8; 4];
+        let candidates: Vec<(f64, Vec<u8>)> = (0..9).map(|i| (i as f64, flat.clone())).collect();
+        // 9 candidates into 3 windows of 3: with nothing to prefer, each window's first index.
+        assert_eq!(select_key_frames(&candidates, 3), vec![0, 3, 6]);
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn key_frames_never_exceed_the_budget_or_the_candidates() {
+        let one = vec![(0.0, vec![1u8, 2, 3])];
+        assert_eq!(select_key_frames(&one, 5), vec![0]);
+        assert!(select_key_frames(&[], 5).is_empty());
+        let ten: Vec<(f64, Vec<u8>)> = (0..10).map(|i| (i as f64, vec![i as u8])).collect();
+        assert!(select_key_frames(&ten, 0).is_empty());
+        assert_eq!(select_key_frames(&ten, 100), (0..10).collect::<Vec<_>>());
+        assert_eq!(select_key_frames(&ten, 4).len(), 4);
+    }
+
+    /// However the fingerprints score, no two chosen candidates are further apart in index than
+    /// two window widths (the worst case: the last candidate of one window and the first of the
+    /// next both picked), the coverage bound the design doc claims.
+    #[cfg(feature = "frames")]
+    #[test]
+    fn key_frames_stay_within_two_window_widths_of_each_other() {
+        // Every candidate distinct, so any of them could be a window's pick.
+        let candidates: Vec<(f64, Vec<u8>)> =
+            (0..97).map(|i| (i as f64, vec![(i % 251) as u8])).collect();
+        let max_frames = 11;
+        let chosen = select_key_frames(&candidates, max_frames);
+        let window = candidates.len().div_ceil(max_frames);
+        assert!(
+            chosen.windows(2).all(|w| w[1] - w[0] <= 2 * window),
+            "{chosen:?} (window {window})"
+        );
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn fingerprint_diff_is_normalised_and_handles_mismatched_input() {
+        assert_eq!(fingerprint_diff(&[0, 0], &[255, 255]), 1.0);
+        assert_eq!(fingerprint_diff(&[0, 0], &[0, 0]), 0.0);
+        assert_eq!(fingerprint_diff(&[100], &[0]), 100.0 / 255.0);
+        assert_eq!(fingerprint_diff(&[], &[]), 0.0, "nothing to compare");
+        assert_eq!(fingerprint_diff(&[1, 2], &[1]), 0.0, "different lengths");
     }
 
     #[test]

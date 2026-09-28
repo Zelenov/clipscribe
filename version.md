@@ -1,3 +1,18 @@
+# 0.2.0
+## Added
+- Key frames: by default, frames are chosen where the picture changes the most in each window of
+  the clip's frame budget, instead of a blind fixed interval — a static shot no longer spends the
+  same budget as a clip that keeps cutting to something new. `--frames keyframes|interval` picks
+  between the new default and the old fixed-interval spacing.
+
+## Changed
+- Library: `Options` has a new field `frame_sampling: FrameSampling` (`KeyFrames` or `Interval`);
+  set it to `FrameSampling::KeyFrames` for the new default or `FrameSampling::Interval` to keep
+  today's behaviour exactly.
+- Library: `frames::Clip::sample` (`frames` feature) takes a new `sampling: FrameSampling`
+  parameter, right after `duration_s`; pass `FrameSampling::Interval` to keep calling it the way
+  you do today.
+
 # 0.1.0
 ## Added
 - Describe what happens in a video clip, and when, with Claude: frames (one every 2 s, at most 60) and the clip's `.srt` go in; a one-sentence summary and time-ranged key moments come out, with the tokens billed.

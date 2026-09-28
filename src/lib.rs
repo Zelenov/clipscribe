@@ -1,18 +1,21 @@
 //! Describe what happens in a video clip, and when, with Claude.
 //!
-//! In: a video file, its subtitles if it has any, and [`Options`] (API key, model, language).
-//! Out: a [`Description`] (a one-sentence summary and time-ranged key moments) and what the
-//! request cost. Frames are sampled one every 2 s (at most 60, 512 px, JPEG, in memory only)
-//! and sent with the subtitles in one request; see [`build_request`] for the prompt.
+//! In: a video file, its subtitles if it has any, and [`Options`] (API key, model, language,
+//! frame sampling). Out: a [`Description`] (a one-sentence summary and time-ranged key moments)
+//! and what the request cost. Frames are key frames by default (at most 60, 512 px, JPEG, in
+//! memory only), one per equal-sized window of the clip where the picture changes the most (see
+//! [`FrameSampling`]), and sent with the subtitles in one request; see [`build_request`] for the
+//! prompt.
 //!
 //! ```no_run
 //! use std::sync::atomic::AtomicBool;
-//! use clipscribe::{describe, Options, SummaryLanguage, MODELS};
+//! use clipscribe::{describe, FrameSampling, Options, SummaryLanguage, MODELS};
 //!
 //! let options = Options {
 //!     api_key: std::env::var("ANTHROPIC_API_KEY").unwrap(),
 //!     model: MODELS[0],
 //!     language: SummaryLanguage::English,
+//!     frame_sampling: FrameSampling::KeyFrames,
 //! };
 //! let described = describe("clip.mp4".as_ref(), &[], &options, &AtomicBool::new(false), |_| {})
 //!     .expect("described");
@@ -53,6 +56,8 @@ pub struct Options {
     pub api_key: String,
     pub model: Model,
     pub language: SummaryLanguage,
+    /// How the clip's frames are chosen; see [`FrameSampling`].
+    pub frame_sampling: FrameSampling,
 }
 
 impl std::fmt::Debug for Options {
@@ -62,6 +67,7 @@ impl std::fmt::Debug for Options {
             .field("api_key", &"***")
             .field("model", &self.model.id)
             .field("language", &self.language)
+            .field("frame_sampling", &self.frame_sampling)
             .finish()
     }
 }
@@ -139,7 +145,7 @@ pub fn describe(
     if duration_s > MAX_DURATION_S {
         return Err(Error::TooLong(duration_s));
     }
-    let frames = match clip.sample(duration_s, cancel, |done, total| {
+    let frames = match clip.sample(duration_s, options.frame_sampling, cancel, |done, total| {
         on_stage(Stage::Frame { done, total })
     }) {
         Ok(Some(frames)) if !frames.is_empty() => frames,
@@ -189,6 +195,7 @@ mod tests {
             api_key: "k".to_string(),
             model: Model::default(),
             language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
         };
         let result = describe(&fake, &[], &options, &AtomicBool::new(false), |_| {});
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
@@ -201,8 +208,11 @@ mod tests {
             api_key: "sk-ant-secret".to_string(),
             model: Model::default(),
             language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
         };
-        assert!(!format!("{options:?}").contains("secret"));
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("KeyFrames"), "{debug}");
     }
 
     /// A real request, only when `CLIPSCRIBE_LIVE_API_KEY` is set (never in CI without the
@@ -224,6 +234,7 @@ mod tests {
             api_key: api_key.trim().to_string(),
             model: Model::default(),
             language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
         };
         let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
             Ok(described) => described,

@@ -8,15 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, ValueEnum};
 use clipscribe::{
-    describe, estimate_usage, format_time, frames, srt, AiUsage, Described, Error, Model, Options,
-    Stage, SummaryLanguage, MAX_DURATION_S, MODELS,
+    describe, estimate_usage, format_time, frames, srt, AiUsage, Described, Error, FrameSampling,
+    Model, Options, Stage, SummaryLanguage, MAX_DURATION_S, MODELS,
 };
 use serde_json::json;
 
 /// Describe what happens in video clips, and when, with Claude.
 ///
-/// Sends frames (one every 2 s, at most 60) and the `.srt` next to each video, if there is one,
-/// and prints a one-sentence summary and time-ranged key moments.
+/// Sends frames (key frames by default, at most 60) and the `.srt` next to each video, if there
+/// is one, and prints a one-sentence summary and time-ranged key moments.
 #[derive(Parser, Debug)]
 #[command(name = "clipscribe", version)]
 struct Cli {
@@ -36,6 +36,11 @@ struct Cli {
     /// none), en, ru, uk, de, es or fr.
     #[arg(long, default_value = "subtitles", value_parser = parse_language)]
     language: SummaryLanguage,
+
+    /// How frames are chosen: keyframes (where the picture changes the most, at most 60) or
+    /// interval (one every 2 s, at most 60, spread evenly over a longer clip).
+    #[arg(long, value_enum, default_value_t = FramesArg::Keyframes)]
+    frames: FramesArg,
 
     /// Do not send the `.srt` next to each video.
     #[arg(long)]
@@ -65,6 +70,21 @@ impl ModelArg {
             Self::Opus => "claude-opus-5",
         };
         MODELS.into_iter().find(|m| m.id == id).unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FramesArg {
+    Keyframes,
+    Interval,
+}
+
+impl FramesArg {
+    fn sampling(self) -> FrameSampling {
+        match self {
+            Self::Keyframes => FrameSampling::KeyFrames,
+            Self::Interval => FrameSampling::Interval,
+        }
     }
 }
 
@@ -111,6 +131,7 @@ fn main() -> ExitCode {
         api_key: api_key.trim().to_string(),
         model,
         language: cli.language,
+        frame_sampling: cli.frames.sampling(),
     };
 
     let mut results = Vec::new();
