@@ -465,26 +465,41 @@ mod tests {
                 },
             )
         });
-        // The first client got its 429 (and closed the gate) before the second one starts.
-        std::thread::sleep(Duration::from_millis(50));
-        let started = std::time::Instant::now();
-        let mut attempted_after = None;
+        // Start the second client only once the first one's 429 has closed the gate (polling
+        // the gate itself, not a fixed sleep that a slow machine could outlast), and note when it
+        // opens again.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let opens_at = loop {
+            // Read before the gate is asked, so `opens_at` is never later than its real time.
+            let now = std::time::Instant::now();
+            let left = gate.closed_for();
+            if !left.is_zero() {
+                break now + left;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first client never closed the gate"
+            );
+            std::thread::yield_now();
+        };
+        let mut attempted_at = None;
         let second = retry_loop(
             &fast_retries(),
             "Test",
             Some(&gate),
             &AtomicBool::new(false),
             || {
-                attempted_after = Some(started.elapsed());
+                attempted_at = Some(std::time::Instant::now());
                 ok()
             },
         );
         assert!(second.is_ok());
         assert!(first.join().expect("thread").is_ok());
-        let waited = attempted_after.expect("attempted");
+        let attempted_at = attempted_at.expect("attempted");
         assert!(
-            waited >= Duration::from_millis(150),
-            "the second client waited for the first one's 429: {waited:?}"
+            attempted_at >= opens_at,
+            "the second client waited for the first one's 429: {:?} early",
+            opens_at.saturating_duration_since(attempted_at)
         );
     }
 
