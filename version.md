@@ -1,4 +1,4 @@
-# NEXT
+# 0.4.0
 ## Added
 - Only important moments: by default, a description's moments (segments) cover only what stands
   out — none at all for a static or uniform clip, one per clearly different or standout part
