@@ -93,16 +93,27 @@ fit for a marker label; `usage` prices with `Model::cost_usd` like any other cal
 run and stop at a budget:
 
 ```rust
-use clipscribe::{cache_path, describe_folder, find_videos, group_clips, Budget, Cache, RunOptions};
+use clipscribe::{
+    cache_path, describe_folder, find_videos, group_clips, Budget, Cache, DescribedClip, RunOptions,
+};
 
 let videos = find_videos(&["footage".into()])?; // the videos in the folder, sorted
 let cache = Cache::open(&cache_path("footage".as_ref(), None))?;
 let budget = Budget::new(Some(5.0)); // US dollars
 let run = describe_folder(&videos, Some(&cache), &RunOptions::default(), &options, &budget,
     &AtomicBool::new(false), |event| eprintln!("{event:?}"));
-let clips: Vec<_> = run.clips.iter().filter_map(|c| c.record()).map(|r| &r.clip).collect();
-let grouping = group_clips(&clips);
+// Only the described (or cached) clips can be grouped: keep each one's index into `videos`.
+let described: Vec<(usize, &DescribedClip)> = run.clips.iter().enumerate()
+    .filter_map(|(i, c)| c.record().map(|r| (i, &r.clip)))
+    .collect();
+let grouping = group_clips(&described.iter().map(|(_, clip)| *clip).collect::<Vec<_>>());
+for ((i, _), groups) in described.iter().zip(&grouping.clips) {
+    println!("{}: group {}", videos[*i].display(), groups.group);
+}
 ```
+
+`grouping.clips[n]` belongs to the `n`th clip passed to `group_clips`, which is not `videos[n]`
+as soon as one video failed or was not started: keep the index, as above.
 
 - **Resume.** The `Cache` is a `.clipscribe-cache.jsonl` file next to the videos (or in a
   directory you pass to `cache_path`). A clip is found by its `FileIdentity` (size, modification
@@ -112,19 +123,30 @@ let grouping = group_clips(&clips);
   `RunOptions::force` describes everything again.
 - **Several at once.** `RunOptions::jobs` clips (default 4) are in flight; a rate limit on one
   pauses all of them.
-- **Budget.** Before each request, `Budget` sets aside the most it can cost; a request that could
-  pass the cap is not sent, the clip comes back `ClipOutcome::OverBudget`, and no new clip starts.
+- **Budget.** Before each request, `Budget` sets aside the most it can cost (the answer counted at
+  its longest). A request that does not fit only because of the others in flight waits for them
+  to settle (they usually cost a fraction of what they set aside); one that could pass the cap
+  even alone is not sent, the clip comes back `ClipOutcome::OverBudget`, and no new clip is
+  described — the clips left are still served from the cache when it has them. The cap holds as
+  long as each request is billed at most once and within its bound; OpenAI's image billing is
+  taken from its published formulas, and a request retried after a lost connection may, rarely,
+  have been billed twice.
 - **Outcomes.** `FolderRun::clips` has a `ClipOutcome` per video, in order (`Described`, `Cached`,
   `Failed`, `OverBudget`, `NotStarted`), with `usage` (what this run spent) and `stopped` (why it
   stopped early, if it did). `FolderEvent`s arrive from the worker threads, for a progress display.
+  A `Cached` clip's `usage` is what it cost when it was first described, not part of this run's.
 - **Grouping.** `group_clips` puts clips, and stretches within them, that show the same scene in
   one `Group`, with a label taken from the descriptions. It compares 8×8 brightness grids of the
   frames already sent (whatever the exposure, and turned sideways too), so it costs nothing,
-  runs offline and gives the same groups every time. It finds the same place or set-up filmed
-  again, not the same activity in a different place.
+  runs offline and gives the same groups every time. It finds the same *shot* — duplicates,
+  re-exports, a clip stored sideways, a camera that did not move — not the same place once the
+  camera moved or zoomed (a 1.25× zoom of the same footage is already a different group), and
+  not the same activity in a different place. Its thresholds are provisional: measured on
+  near-duplicates and synthetic patterns, not yet on real retakes.
 
 To build your own loop instead, the parts are public: `CacheKey`, `Cache::get`/`put`,
-`describe_clip` (one clip, within a `Budget`) and `request_cost_bound`.
+`cached_clip`, `describe_clip` (one clip, within a `Budget`), `Budget::reserve_or_wait` and
+`request_cost_bound`.
 
 ### Features
 

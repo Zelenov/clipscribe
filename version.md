@@ -6,10 +6,14 @@
   everything again and refreshes the cache. Library: `Cache`, `CacheKey`, `FileIdentity`.
 - Several videos in work at once: `--jobs N` (default 4); a rate limit on one pauses them all.
   Results still print in input order.
-- `--max-cost USD`: a budget cap. A request that could take the run past it is not sent, and no
-  new video starts. Library: `Budget`, `request_cost_bound`.
-- `--groups`: groups similar footage (videos, and stretches within them, showing the same scene),
-  each group with a label from the descriptions, at no extra cost. Text ends with a `Groups:`
+- `--max-cost USD`: a budget cap. Before each request the most it can cost is set aside; a video
+  that does not fit only because of others in flight waits for them, and one that could take the
+  run past the cap even alone is not sent, and no new video is described (videos already in the
+  cache are still shown). The message says the cap and what to do next. Library: `Budget`
+  (`reserve_or_wait`, `Reserved`), `request_cost_bound`, `cached_clip`.
+- `--groups`: groups similar footage (videos, and stretches within them, showing the same shot:
+  duplicates, re-exports, a camera that did not move — not the same place filmed from a moved or
+  zoomed camera), each group with a label from the descriptions, at no extra cost. Text ends with a `Groups:`
   section; JSON clip objects gain `group`, `group_label`, `stretches`, and each moment a `group`.
   Library: `group_clips`.
 - Library: `describe_folder` runs a whole folder with `FolderEvent`s for a progress display;
@@ -18,7 +22,9 @@
 ## Changed
 - Every run over whole clips goes through the folder run, several videos at once; `--jobs 1`
   works one video at a time as before. With `--json`, a clip from the cache carries
-  `"cached": true`. The status line shows how many videos are done and in work.
+  `"cached": true`, and its `usage` and `cost_usd` are what it cost when it was described, not
+  what this run spent (the usage line on stderr counts only this run). The status line shows how
+  many videos are done and in work.
 
 # 0.6.0
 ## Added

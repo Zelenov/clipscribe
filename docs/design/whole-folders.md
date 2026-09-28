@@ -78,6 +78,10 @@ the settings, the file name (informational only), model, duration, usage, summar
   a mutex shared by every worker. Nothing is written for a clip in work, a failed clip or a
   cancelled one, so Ctrl+C or a crash loses at most the clips in flight — never an already
   finished one, never a half-written entry that later parses as valid.
+- **A failed write** (a full disk part way through a line) is cut back to where the file ended
+  before it (`set_len`), so the next line does not start glued to a fragment; if even that fails,
+  the next line starts with a newline of its own. Either way a later, finished clip is never lost
+  with the fragment when the file is next opened.
 - **A torn last line** (the process died mid-write) is detected on the next open: a line that does
   not parse is skipped. A file that does not end in `\n` is never appended to as-is (the next line
   would glue onto the torn one): opening such a file compacts it first (below).
@@ -113,8 +117,10 @@ next `--resume` rather than left stale.
 ### Recommendation: perceptual fingerprints, labels from the descriptions
 
 Chosen. The issue asks for clips "that show the same scene or activity" in a folder of one
-shoot — the case where a perceptual fingerprint is strongest: the same place filmed several times,
-a camera left on a tripod, retakes, the same clip exported twice. It costs nothing, runs offline,
+shoot. A perceptual fingerprint finds the same *shot*: the same clip exported or re-muxed twice,
+stored sideways, brighter or darker, and — by construction, though not yet measured on real
+footage — a camera that did not move (a tripod left in place, retakes from the same position). It
+does not find the same place once the framing changes: see "Measured" below. It costs nothing, runs offline,
 is deterministic (so a resumed run groups exactly as a full one would), and it extends machinery
 the crate already has instead of adding the heaviest dependency it would ever carry: CLIP would
 bring a tensor runtime, a 90–340 MB model download and new build steps on three platforms into a
@@ -123,9 +129,11 @@ needs nothing new either, but it is the only option that costs money again on ea
 reproducible, stops fitting one request around 1,500 clips, and can only group what one sentence
 per stretch happened to mention.
 
-What it cannot do, stated plainly: group the same activity filmed in visibly different places
-(two different kitchens), or follow a small subject moving over an empty background (its 8×8 grid
-changes with the subject's position). That is where CLIP would win; if the owner wants it later, it
+What it cannot do, stated plainly: group the same place filmed from a moved or zoomed camera (on
+the test footage, a 1.25× zoom is already 0.36 away and a 20 % pan 0.60, both far past the 0.2
+threshold), group the same activity filmed in visibly different places (two different kitchens),
+or follow a small subject moving over an empty background (its 8×8 grid changes with the
+subject's position). That is where CLIP would win; if the owner wants it later, it
 fits as an optional cargo feature behind the same `group_clips` output shape.
 
 The 8×8 grid is a **block-mean-value hash**, one of the four perceptual image hashes benchmarked
@@ -170,25 +178,44 @@ Pairwise comparison is O(n²) over stretches with 256 multiply-adds per pair (fo
 10,000 stretches ≈ 50 M pairs ≈ 13 G multiply-adds, seconds in a release build. Beyond that a
 nearest-neighbour index would be the next step; not needed for "thousands of clips".
 
-### Measured on the test clips
+### Measured on the test clips (provisional)
+
+The thresholds are **provisional**: calibrated only on near-duplicates of one real video and on
+synthetic patterns. There is no real hard positive (the same place re-shot, a moved tripod, a
+retake) or hard negative (two different real scenes from one shoot) among the fixtures, so the
+0.2 threshold is not validated on either; retuning it is a later issue with real footage in hand.
 
 The four clips in `tests/clips/` are the same footage (a rotating Earth at night): the MP4, the
 MOV and the WebM are one video in three containers, `rotated-90.mp4` its first 6 s with a 90°
-rotation tag. Test patterns made with `gst-launch-1.0 videotestsrc` stand in for other scenes.
-Median over frames of the best-matching frame's distance `1 − r`, smallest rotation:
+rotation tag. The closest thing to a hard positive the fixtures allow is that footage *re-framed*:
+its first 6 s cropped and scaled back up, as a zoomed or panned camera would see it. Different
+scenes are `videotestsrc` patterns. All of these are made in-process with GStreamer by the test
+`grouping_distances_on_the_test_clips` (`src/folder.rs`), which prints this table:
 
-| | distance |
-|---|---|
-| MP4 vs MOV / WebM | 0.002–0.003 |
-| MP4 vs `rotated-90.mp4` | 0.06 (0.44 without rotation) |
-| Earth vs `ball` (a white ball on black) | 0.59 |
-| Earth vs `smpte` / `gradient` | 0.85–0.87 |
-| `smpte` vs `gradient` (the closest pair of different patterns) | 0.36 |
-| consecutive frames of the rotating Earth | 0.00–0.11 |
+```sh
+cargo test --lib grouping_distances -- --nocapture
+```
 
-0.2 sits well between "same footage" (≤ 0.11) and "different scene" (≥ 0.36). Raw mean absolute
-difference, as key frames use it, could not have told them apart: Earth vs `ball` is 0.067 there,
-Earth vs its own rotation 0.032.
+The distance is the one `group_clips` joins by: `1 − r` between stretch signatures, best of the
+four rotations, closest pair of stretches.
+
+| From the MP4 to | distance | grouped (< 0.2) |
+|---|---|---|
+| MOV / WebM (same video, other container) | 0.000–0.001 | yes |
+| `rotated-90.mp4` | 0.022 | yes |
+| itself zoomed 1.25× (centre crop) | 0.355 | **no** |
+| itself panned 20 % (left crop) | 0.598 | **no** |
+| itself panned 40 % | 0.702 | no |
+| `smpte`, `gradient`, `circular` | 0.84–0.89 | no |
+| `ball`, `pinwheel` | 0.95–0.98 | no |
+| **Between patterns** | | |
+| `smpte` vs `gradient` (the closest pair) | 0.359 | no |
+| every other pair | 0.59–1.01 | no |
+
+So on what could be measured, 0.2 sits between "the same shot" (≤ 0.02) and "anything else"
+(≥ 0.36), and re-framing the same scene already counts as "anything else". Raw mean absolute
+difference, as key frames use it, could not have told the shots apart: Earth vs `ball` is 0.067
+there, Earth vs its own rotation 0.032.
 
 ## 3. The folder run
 
@@ -213,25 +240,58 @@ exactly as before. Retries with backoff for 5xx and lost connections are unchang
 
 `Budget` (`--max-cost USD`) tracks what this run has spent plus what the requests in flight could
 still cost. Before a clip's request is sent — after its frames are read, so its size is known —
-the request's **upper bound** is reserved: input tokens from the actual frames (their JPEG sizes,
-the crate's own `frame_tokens`) and the prompt text (bytes / 3.5, an overestimate for English and
+the request's **upper bound** is reserved: input tokens from the actual frames (their JPEG sizes;
+Anthropic's 28 px tiles, or for OpenAI the larger of its two published schemes, 85 + 170 per 512 px
+tile and 1.62 per 32 px patch) and the prompt text (bytes / 3.5, an overestimate for English and
 for Cyrillic alike), plus 10 %, and output at the request's `max_tokens`, the most it can be
-billed for. If spent + reserved + bound would pass the cap, the request is not sent: the clip is
-`OverBudget`, nothing is written to the cache for it, no new clip is started, and the clips already
-in flight finish (their results are cached). When an answer comes back, the reservation is
-replaced by its real cost; a failed request releases it; a timeout — the one failure the provider
-may have billed without saying how much — keeps the whole bound as spent. So the total never
-passes the cap; the price of that guarantee is stopping up to one clip's worth of bound early.
+billed for. When an answer comes back, the reservation is replaced by its real cost; a failed
+request releases it; a timeout — the one failure the provider may have billed without saying how
+much — keeps the whole bound as spent.
+
+**Waiting for the others.** The bound is typically four or five times what a clip really costs
+(the answer is counted at 4,000 or 16,000 tokens and is usually a few hundred). So with several
+clips in flight, a clip's bound often does not fit next to the other clips' *reservations* even
+though it fits easily next to what they will really cost. Such a clip waits
+(`Budget::reserve_or_wait`: a condition variable signalled whenever a reservation settles or is
+released, checking the cancel flag every 50 ms) and tries again. Only when spent + its bound
+would pass the cap *with nothing else in flight* is it `OverBudget`: nothing is sent, nothing is
+cached for it, the run stops describing new clips, and the clips already in flight finish (their
+results are cached). No clip ever waits while holding a reservation of its own, so a waiting
+clip always has someone to wait for.
+
+What that guarantees: the reservations in flight never add up past the cap, so what the run is
+billed for stays under it as long as every request costs at most its bound and is billed once.
+The run stops early by at most one bound: the last clip is refused when what is spent plus its
+bound would pass the cap, whatever `--jobs` is. (In review of the first version, which refused instead of waiting, with `--jobs 4`
+the first clip's open reservation turned the other three away at once: `--max-cost 0.03` on
+`tests/clips/`, estimated at $0.025 in all, described one video of four.)
+
+What it does not guarantee:
+
+- **OpenAI's image billing is taken from its published formulas, not measured** (OpenAI is not
+  reachable from where this crate is developed; see `docs/design/openai-provider.md`). The
+  answer's slack covers a small error there, but it is not a proven bound.
+- **A retried attempt may have been billed.** A lost connection *after* the request was sent, or
+  an answer that could not be read, is retried (as it always was for a single `describe`); if the
+  provider billed that first attempt, the run never learns of it, and only the last attempt's
+  usage is counted. A timeout, the common case, is not retried and is counted at its bound.
 
 The cap counts only what the run itself spends: cached clips are free. A resumed run with the same
 `--max-cost` gets the full amount again.
 
 ### Stopping
 
-Ctrl+C (the `cancel` flag) stops at the next frame or wait, as before; an answer that arrives
-anyway is still cached, since it was billed. `OverBudget`, and an error that would fail every
-clip the same way (`AiError::stops_job`: rejected key, no credit, a spend limit), stop starting new
-clips. `FolderRun::stopped` says which.
+Ctrl+C (the `cancel` flag) stops at the next frame, the next wait (for a rate limit, a retry or
+the budget), or just before a request is sent — the last moment the money can still be saved. A
+request already sent is not interrupted: its answer is waited for, cached and counted, since it
+was billed. Nothing new is taken up after a cancel.
+
+`OverBudget`, and an error that would fail every clip the same way (`AiError::stops_job`: rejected
+key, no credit, a spend limit), stop describing new clips. The clips left are still looked up in
+the cache (`cached_clip`) and served from it when it has them — they cost nothing and are already
+on disk, so a `--resume --max-cost` run that hits the cap still prints and groups every clip
+described before; only the clips that would need a request are `NotStarted`. `FolderRun::stopped`
+says why the run stopped.
 
 ## 4. API
 
@@ -244,8 +304,10 @@ Always built (no GStreamer):
 - `FileIdentity::of(path)`, `CacheKey::new(video, &options, vocabulary, subtitles)`,
   `cache_path(folder, cache_dir)`, `CACHE_FILE_NAME`, `Cache::open(path)` → `get(&key)`,
   `put(&record)`; `ClipRecord { file, key, model, clip: DescribedClip }`.
-- `Budget::new(max_usd)` → `reserve(usd)` → `Reservation::settle(actual_usd)`; `spent_usd()`;
-  `request_cost_bound(model, &request)`.
+- `Budget::new(max_usd)` → `reserve(usd)` (never waits) or `reserve_or_wait(usd, cancel)` →
+  `Reserved::{Yes(Reservation), OverBudget, Cancelled}`; `Reservation::settle(actual_usd)`;
+  `spent_usd()`, `max_usd()`; `request_cost_bound(model, &request)`.
+- `cached_clip(video, &cache, &run, &options)`: what the cache has for a video, nothing sent.
 - `group_clips(&[&DescribedClip])` → `Grouping { groups: Vec<Group { id, label, stretches }>,
   clips: Vec<ClipGroups { group, stretches: Vec<Stretch { start_s, end_s, group }>, segments }> }`.
 
@@ -254,13 +316,19 @@ With `frames`:
 - `describe_clip(video, subtitles, vocabulary, &options, &budget, cancel, on_stage)` →
   `Ok(Some(DescribedClip))`, `Ok(None)` when the budget would be exceeded (nothing sent), or the
   same `Error`s as `describe`. `DescribedClip { description, tags, usage, duration_s, frames }`.
+  `describe` and `describe_with_tags` are `describe_clip` with a budget without a cap: there is
+  one place that builds a clip's request, sends it and reads the answer.
 - `describe_folder(videos, cache, &run, &options, &budget, cancel, on_event)` → `FolderRun { clips:
   Vec<ClipOutcome>, usage, stopped }`, with `ClipOutcome::{Described, Cached, Failed, OverBudget,
   NotStarted}` in input order and `FolderEvent::{Started, Stage, Finished, Warning}` for a progress
-  display (called from worker threads, hence `Fn + Sync`).
+  display (called from worker threads, hence `Fn + Sync`). After a budget or job stop, `Finished`
+  comes for every clip left too (`Cached` or `NotStarted`), in order.
 
 frename can call `describe_folder` and show `FolderEvent`s, or build its own loop from
 `CacheKey`/`Cache`/`describe_clip`/`Budget` and call `group_clips` on whatever it has.
+
+The crate root re-exports these by name (not `pub use module::*`), so a new public item in these
+modules does not become part of the API unnoticed.
 
 **No breaking change.** Everything is new; `Options`, `Error`, `describe`, `describe_with_tags` and
 `RetryPolicy` keep their shape. `retry_loop` (crate-private) gains the optional gate; `Anthropic`
@@ -282,18 +350,23 @@ and `OpenAi` gain a private field.
 Every whole-clip run now goes through `describe_folder`: results are printed in input order as
 soon as every earlier clip is done, so output reads exactly as before; `--jobs 1` is the old
 one-at-a-time run. The status line shows how many clips are done and in work. Cached clips print
-like described ones (JSON: `"cached": true`, with the usage they cost when described); the usage
-line at the end counts only what this run spent, and says how many clips came from the cache.
-
-Added while wiring the CLI (after the session that wrote the above was interrupted):
+like described ones (JSON: `"cached": true`); their `usage` and `cost_usd` are what they cost when
+they were described, not what this run spent — a script summing `cost_usd` over a resumed run's
+JSON overstates the run. The usage line on stderr counts only what this run spent, and says how
+many clips came from the cache.
 
 - With `--resume`/`--force` and no `--cache-dir`, inputs from several folders run as one
   `describe_folder` per folder (each stretch of consecutive videos in one folder, with that
-  folder's cache), one after the other in input order, sharing one `Budget`; a stop in one
-  (budget, cancel, rejected key) leaves the rest `NotStarted`. Without a cache, or with
-  `--cache-dir`, it is a single `describe_folder`. Every cache is opened before anything is sent.
+  folder's cache), one after the other in input order, sharing one `Budget`. A budget or job stop
+  in one leaves the rest to their caches: cached clips are served, the others `NotStarted`; a
+  cancel leaves them all `NotStarted`. Without a cache, or with `--cache-dir`, it is a single
+  `describe_folder`. Every cache is opened before anything is sent.
 - `--resume` and `--force` exclude each other; `--cache-dir` needs one of them. `--at` and
   `--estimate` take none of the folder-run options.
+- A budget stop says the cap and what to do: `Stopped at --max-cost $5.00: 120 of 400 videos not
+  described. Raise --max-cost and run again with --resume to continue.` Without `--resume` or
+  `--force` nothing was saved, and the message says so: the videos described in this run were
+  not saved, so running again pays for them again too.
 - The exit code is 1 whenever a video was not described (failed, over budget, not started,
   cancelled), as a failure was before.
 
@@ -302,16 +375,26 @@ Added while wiring the CLI (after the session that wrote the above was interrupt
 - Cache: identity changes with size, mtime or the sampled content, and not with a rename; the
   sample of a small file is the whole file; round trip of a record through a line; settings
   mismatch is a miss; a torn last line and a corrupt line are skipped and compacted away, and the
-  next append lands on its own line; newer-version lines survive compaction.
-- Budget: reserve/settle/release arithmetic, refusal at the cap, timeouts kept as spent; the bound
-  covers a real request's parts.
-- Rate gate: a 429 on one thread holds back another thread's next attempt.
+  next append lands on its own line; an entry written after a failed write is not glued to its
+  fragment; newer-version lines survive compaction.
+- Budget: reserve/settle/release arithmetic, refusal at the cap, timeouts kept as spent; a
+  reservation waits for another in flight and goes ahead when it settles, is over budget when it
+  could not fit even alone, and stops waiting on a cancel; the bound covers a real request's
+  parts, and OpenAI's image tokens.
+- Rate gate: a 429 on one thread holds back another thread's next attempt (synchronised on the
+  gate's state, not a sleep).
 - Grouping: synthetic grids (a scene, its rotation, another scene, a blank clip, a clip with a
-  cut) and, on Linux, the real test clips (one group) plus `videotestsrc` clips (their own groups).
+  cut) and, on Linux, the real test clips (one group) plus `videotestsrc` clips made in-process
+  (their own groups — this half always runs, no `gst-launch-1.0` needed), and the distance table
+  above.
 - Folder run, on Linux with a mock HTTP server (the `TcpListener` pattern of the other tests):
   an interrupted run (cancelled after its first clip) resumes and sends only the rest; a third run
   sends nothing; `--force` sends everything again; a budget below one clip's bound sends nothing and
-  caches nothing; two clips are really in flight at once with `jobs = 2`.
+  caches nothing, and one with room for exactly one clip (derived from the real bounds, not
+  hand-computed) describes one; with `jobs = 3` and room for only one bound at a time, every clip
+  waits its turn and all are described within the cap; a run stopped by the budget still serves
+  what the cache has; an answer in flight when Ctrl+C comes is kept; two clips are really in
+  flight at once with `jobs = 2`.
 
 ## Decisions made without the owner
 
@@ -327,9 +410,12 @@ Added while wiring the CLI (after the session that wrote the above was interrupt
 - **Settings are part of a hit**: a different model, language, frame sampling, moments mode,
   vocabulary or `.srt` redoes the clip; the newest result replaces the entry.
 - **Failures are not cached**, not even a billed bad answer: the next run retries them.
-- **The budget reserves an upper bound**, so the cap is never passed, at the price of stopping up
-  to one clip early; it stops at the first clip that does not fit rather than hunting for smaller
-  clips that might, so what is left is a clean tail for a resumed run.
+- **The budget reserves an upper bound**, so the cap is not passed (within the limits under "The
+  budget cap"), at the price of stopping up to one clip's bound early. A clip that does not fit
+  only because of other reservations in flight **waits** for them rather than stopping the run.
+  It stops at the first clip that does not fit even alone rather than hunting for smaller clips
+  that might, so what is left is a clean tail for a resumed run.
+- **After a stop, cached clips are still served** (not after a cancel: Ctrl+C means stop now).
 - **`--jobs` defaults to 4**, and applies to every whole-clip run, not only cached ones; `--jobs 1`
   is the old behaviour.
 - **One shared pause on a 429** across workers, not per-worker only; no pre-emptive pacing from the
@@ -344,8 +430,9 @@ Added while wiring the CLI (after the session that wrote the above was interrupt
   shots merging — is bounded by the strict 0.2 threshold.
 - **JSON stays an array** of per-clip objects; group data is added to each clip, not a new top-level
   object.
-- **Thresholds are fixed constants** (0.2 same scene, 0.5 + 0.05 cut, 4 blank), not options:
-  measured above; retuning is a later issue with real footage in hand.
+- **Thresholds are fixed constants** (0.2 same scene, 0.5 + 0.05 cut, 4 blank), not options, and
+  provisional: measured above on near-duplicates, re-framings and synthetic patterns only;
+  retuning is a later issue with real footage in hand.
 
 [defaulthasher]: https://doc.rust-lang.org/std/collections/hash_map/struct.DefaultHasher.html
 [fnv]: http://www.isthe.com/chongo/tech/comp/fnv/
