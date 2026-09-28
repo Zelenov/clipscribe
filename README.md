@@ -144,8 +144,10 @@ as soon as one video failed or was not started: keep the index, as above.
   camera that did not move. The descriptions' words (shared words over all words, common words
   dropped) find the same subject or activity filmed again from elsewhere or zoomed, as long as
   the descriptions say it in similar words — and they also join the same place with something
-  else happening, or different things described with the same generic words ("black and white",
-  "the centre"). Both cost nothing, run offline and give the same groups every time. Both
+  else happening, or different things described with the same everyday words ("a woman in a
+  bright kitchen", "a woman in a bright office"). On a large folder from one shoot described in
+  similar words, those links can chain several groups into a few large ones: check groups before
+  relying on them. Both cost nothing, run offline and give the same groups every time. Both
   thresholds are provisional: measured on near-duplicates, synthetic patterns and descriptions
   written for the tests, not yet on real retakes and real descriptions.
 

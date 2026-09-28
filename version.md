@@ -15,8 +15,10 @@
 - `--groups`: groups similar footage — videos, and stretches within them, that look like the same
   shot (duplicates, re-exports, a camera that did not move) or whose descriptions share enough
   words (the same subject or activity even after the camera moved or zoomed; sometimes also the
-  same place with something else happening) — each group with a label from the descriptions, at
-  no extra cost. Text ends with a `Groups:` section; JSON clip objects gain `group`,
+  same place with something else happening, and unrelated videos described in similar everyday
+  words, like "a woman in a bright room") — each group with a label from the descriptions, at no
+  extra cost. On a large folder from one shoot these links can chain several groups into one:
+  check groups before relying on them. Text ends with a `Groups:` section; JSON clip objects gain `group`,
   `group_label`, `stretches`, and each moment a `group`. Library: `group_clips`.
 - Library: `describe_folder` runs a whole folder with `FolderEvent`s for a progress display;
   `describe_clip` describes one clip within a `Budget`; `find_videos` lists a folder's videos.

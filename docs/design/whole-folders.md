@@ -144,16 +144,30 @@ What it cannot do, stated plainly:
   descriptions share enough words, which also happens for **the same place or person with
   something else happening** (a hiker walking a ridge and a man biking the same ridge at sunset
   share most of their words) and for **different things described with the same generic words**
-  (on the test patterns, a black-and-white pinwheel and black-and-white rings "around the
-  centre": a real false positive, below). It misses the same activity described in different
-  words ("chops onions" and "slicing an onion" barely make it). Whether a group is the same
-  "scene or activity" is only as good as the descriptions' wording.
-- Its stemming is crude (the first four letters of each word) and its stop words are English
-  only; in the other description languages only the length rule drops function words.
+  (on the test patterns, a black-and-white pinwheel, black-and-white rings "around the centre"
+  and a white ball on black: real false positives, below). One-sentence summaries, the default
+  `Important` mode's usual output, are the most exposed: "A woman chops vegetables in a bright
+  kitchen" and "A woman types on a laptop in a bright office" share "woman" and "bright" out of
+  eight words, exactly the threshold, and are joined. It misses the same activity described in
+  different words ("chops onions" and "slicing an onion" barely make it). Whether a group is the
+  same "scene or activity" is only as good as the descriptions' wording.
+- Its stemming is crude (the first four letters of each word: "winding" and "wind" come out the
+  same). Its stop words are English only and a best-effort list, not a complete one: the
+  model has more ways to talk about the framing than any list holds. In the other description
+  languages only the length rule drops function words.
+- **Words of three letters or fewer never count**, in any language: the length rule that drops
+  "the", "and", "on" also drops "dog", "cat", "car", "man", "sun", "sea", "sky" and "red". "A dog
+  runs on the beach" has two words left ("runs", "beach"), under the three needed, so it is never
+  joined by words at all; where enough words are left, the subject named in three letters is
+  invisible. Keeping three-letter words would need three-letter stop words in all six
+  description languages, measured again; left for the retuning issue.
 - Groups are connected sets (single linkage): with the word signal, a chain of clips each close in
   words to the next can join clips that have little in common end to end. On a large folder of
   one shoot described in similar words (every clip a "hiker on a trail"), expect some large
-  groups.
+  groups: several groups can chain into a few big ones.
+- Which stretch of a clip a link by words joins depends on input order: two stretches of one clip
+  described alike cannot both join another clip's group (below), and the first one in input
+  order does.
 - Neither signal groups the same activity filmed in visibly different places *and* described in
   different words, or follows a small subject moving over an empty background. That is where
   CLIP would win; if the owner wants it later, it fits as an optional cargo feature behind the
@@ -174,13 +188,16 @@ the test clips (below):
 
 The words are compared as sets (the **Jaccard index**: shared words over all words), after
 lower-casing, splitting at anything that is not a letter or digit, dropping words under four
-letters (articles and prepositions in all six description languages) and a short English list
-of longer function words and words about the footage itself ("camera", "shot", "scene", …), and
-cutting each word to its first four letters — truncation stemming, language-blind: "goat" and
-"goats", "hiker" and "hikes", "красной" and "красная" come out the same. The segment-merging
-check of `MomentsMode::Important` (`merge_same_description`) compares whole descriptions for
-equality after trimming and lower-casing; that is a different question (is this the same
-sentence?), so it is left as it is rather than shared.
+letters (articles and prepositions in all six description languages, and short content words
+with them, see above) and a best-effort English list of longer function words and of words about
+the footage rather than what it shows ("camera", "shot", "close", "view", "wide", "background",
+"seen", "time-lapse", …; each also with a final "s": "clips", "views"), and cutting each word
+to its first four letters — truncation stemming, language-blind: "goat" and "goats", "hiker" and
+"hikes", "красной" and "красная" come out the same. The stop list is checked against the whole
+word (and without its final "s"), not its four-letter stem, so dropping "footage" does not drop
+"football". The segment-merging check of `MomentsMode::Important` (`merge_same_description`)
+compares whole descriptions for equality after trimming and lower-casing; that is a different
+question (is this the same sentence?), so it is left as it is rather than shared.
 
 ### The algorithm
 
@@ -200,13 +217,21 @@ sentence?), so it is left as it is rather than shared.
 5. **Stretch words.** The words of the description segments that overlap this stretch more than
    any other, plus the clip's summary when the stretch is the whole clip or no segment falls in
    it. Fewer than 3 distinct words: nothing to compare.
-6. **Groups.** Two stretches are joined when their signatures are closer than 0.2 (the same
-   shot), or when they are in different clips and their words' Jaccard index is at least 0.25.
-   Two stretches of one clip are never joined by words (they often carry the same summary). A
-   stretch without a signature (blank) is a group of its own, whatever its words. Groups are the
-   connected sets (union-find, i.e. single linkage). Group ids count from 1 in order of first
-   appearance (videos in input order, stretches in time order), so the same inputs always get the
-   same ids.
+6. **Groups.** Union-find (single linkage), in two passes. First the pictures: two stretches are
+   joined when their signatures are closer than 0.2 (the same shot), any two, of one clip or not.
+   Then the words: two stretches of different clips whose words' Jaccard index is at least 0.25
+   are joined, pairs in input order, **unless their two groups already hold a stretch of the same
+   clip**. So words never put two stretches of one clip in one group, directly or through other
+   clips. That matters because stretches of one clip often carry the same text: in the default
+   `Important` mode, every stretch no segment covers carries the whole-clip summary, and any other
+   clip described like that summary would otherwise link to all of them and, through itself, glue
+   them into one group (an earlier version did, found in review). Why it holds: when two stretches
+   of one clip end up in one group, their groups were never merged by words (that merge is
+   refused), so they were already one group after the pictures' pass — pictures alone joined them,
+   e.g. a cut away and back to the same shot. A stretch without a signature (blank) is a group of
+   its own, whatever its words. Group ids count from 1 in order of first appearance (videos in
+   input order, stretches in time order), so the same inputs in the same order always get the
+   same groups and ids.
 7. **Labels.** The group's medoid (the stretch with the smallest total distance to the other
    members, each pair's distance being the closer of its two signals, each over its threshold;
    the first on a tie) names it: the clip's description segment covering at least half of that
@@ -215,9 +240,13 @@ sentence?), so it is left as it is rather than shared.
    description segment gets the group of the stretch overlapping it most.
 
 Pairwise comparison is O(n²) over stretches: 256 multiply-adds for the pictures (four rotations ×
-64) and a merge of two sorted lists of a dozen or two word ids for the words. 10,000 stretches ≈
-50 M pairs, seconds in a release build. Beyond that a nearest-neighbour index would be the next
-step; not needed for "thousands of clips".
+64, each stretch's rotations made once, nothing allocated per pair) and a merge of two sorted
+lists of a dozen or two word ids for the words; picking each group's label is O(m²) over its m
+members. Measured in a release build on the machine this was developed on, with 5,000 synthetic
+stretches (12.5 M pairs): about 1.6 s for the pictures, 1.1 s for the words and 3 s for the labels
+when most stretches end up in one big group — about 6 s in all. Four times that at 10,000
+stretches (≈ 50 M pairs): 20–25 s, once, after every clip is described. Beyond that a
+nearest-neighbour index would be the next step; not needed for "thousands of clips".
 
 ### Measured on the test clips (provisional)
 
@@ -246,17 +275,25 @@ best of the four rotations, closest pair of stretches. The words' is the Jaccard
 
 | From the MP4 to | pictures | words | grouped by |
 |---|---|---|---|
-| MOV / WebM (same video, other container) | 0.000–0.001 | 0.31–0.38 | both |
-| `rotated-90.mp4` | 0.022 | 0.64 | both |
-| itself zoomed 1.25× (centre crop) | 0.355 | 0.58 | **words** |
-| itself panned 20 % (left crop) | 0.598 | 0.73 | **words** |
+| MOV / WebM (same video, other container) | 0.000–0.001 | 0.33–0.42 | both |
+| `rotated-90.mp4` | 0.022 | 0.70 | both |
+| itself zoomed 1.25× (centre crop) | 0.355 | 0.70 | **words** |
+| itself panned 20 % (left crop) | 0.598 | 0.80 | **words** |
 | itself panned 40 % | 0.702 | 0.50 | **words** |
 | `smpte`, `gradient`, `circular` | 0.84–0.89 | 0.00–0.07 | no |
 | `ball`, `pinwheel` | 0.95–0.98 | 0.00 | no |
 | **Between patterns** | | | |
 | `smpte` vs `gradient` (the closest pictures) | 0.359 | 0.00 | no |
 | `pinwheel` vs `circular` ("black and white … the centre") | 0.991 | 0.33 | **words: a false positive** |
-| every other pair | 0.59–1.01 | 0.00–0.22 | no |
+| `ball` ("a white ball … on a black background") vs `pinwheel`, `circular` | 0.94–1.01 | 0.25 | **words: false positives** |
+| every other pair | 0.59–0.98 | 0.00 | no |
+
+The ball's two false positives are new with the longer stop list: "background" no longer counts,
+which leaves "white" and "black" as two of its four words. Jaccard over a short text rises when
+any word the other text lacks is dropped, so a stop word helps only where framing words are
+*shared* (the hike descriptions below) and can hurt where one text alone used one. On these
+generic test-pattern descriptions every pattern is "black and white"; the list was kept, since
+the model's framing words ("close view", "wide view") are far more often shared than not.
 
 So the pictures' 0.2 sits between "the same shot" (≤ 0.02) and "anything else" (≥ 0.36), and
 re-framing the same scene counts as "anything else" there; the words bring the re-framed footage
@@ -264,18 +301,24 @@ back. Raw mean absolute difference, as key frames use it, could not have told th
 Earth vs `ball` is 0.067 there, Earth vs its own rotation 0.032.
 
 The words' threshold comes from `text_similarity_of_descriptions` (`src/groups.rs`, `cargo test
---lib text_similarity -- --nocapture`): 19 descriptions of a day's shoot — five subjects each
-described twice as a re-shoot would be (another position or zoom), one pair in Russian, and seven
-other clips of the same shoot, some at the same place as a subject.
+--lib text_similarity -- --nocapture`): 22 descriptions of a day's shoot — five subjects each
+described twice as a re-shoot would be (another position or zoom), one pair in Russian, seven
+other clips of the same shoot, some at the same place as a subject, and three a review wrote to
+show the framing words joining different subjects ("Close view of hiking boots on a winding dirt
+trail", "Wide view of the mountain valley…", "A close view of wildflowers…": boots and flowers
+were 0.30, joined on "close" and "view", before those became stop words).
 
 | Pairs | Jaccard | at 0.25 |
 |---|---|---|
-| The same subject filmed again (6 pairs) | 0.27–0.50 (onion 0.27, tent 0.29, waves 0.30, hiker 0.31, goats 0.43, Russian hiker 0.50) | all joined |
-| The same place or person, something else happening (5 pairs) | 0.21–0.50 (hiker walking vs biking the same ridge 0.50) | 3 of 5 joined |
-| Different subjects (160 pairs) | 0.00–0.18 (the closest: the same hiker drinking from a stream) | none joined |
+| The same subject filmed again (6 pairs) | 0.29–0.50 (tent 0.29, onion 0.30, waves 0.33, hiker 0.36, goats 0.43, Russian hiker 0.50) | all joined |
+| The same place or person, something else happening (5 pairs) | 0.21–0.50 (hiker walking vs biking the same ridge 0.50) | 4 of 5 joined |
+| Different subjects (220 pairs) | 0.00–0.20 (the closest: the same hiker drinking from a stream) | none joined |
+| Different things in the same everyday words (printed, not asserted) | 0.25 ("A woman chops vegetables in a bright kitchen" / "A woman types on a laptop in a bright office"; a family walking a beach / a forest trail) | both joined |
 
-0.25 sits in the gap between 0.18 and 0.27, nearer the re-shoots, to keep joins of different
-subjects rare; the margin is thin on both sides, which is why it is provisional.
+0.25 sits in the gap between 0.20 and 0.29, nearer the re-shoots, to keep joins of different
+subjects rare; the margin is thin on both sides, which is why it is provisional. "None joined"
+holds for this hand-written corpus only, not in general: the last row is two short summaries
+of unrelated things that reach the threshold on "woman" and "bright" alone.
 ## 3. The folder run
 
 ### Concurrency and rate limits
@@ -354,7 +397,10 @@ on disk, so a `--resume --max-cost` run that hits the cap still prints and group
 described before; only the clips that would need a request are `NotStarted`. `FolderRun::stopped`
 says why the run stopped. That policy lives in one function, `serve_after_stop`, which
 `describe_folder` calls for the clips it did not take up and the CLI calls for the folders after
-the one that stopped.
+the one that stopped. It checks `cancel` before every clip: a Ctrl+C while a folder of thousands
+is served from its cache (each lookup reads the file's identity, slow on a network drive) stops
+the lookups at once, and the rest are `NotStarted`. A cancel overrides whatever stopped the run
+first: `FolderRun::stopped` is then `Cancelled`, even after `OverBudget`.
 
 ## 4. API
 
@@ -371,8 +417,9 @@ Always built (no GStreamer):
   `Reserved::{Yes(Reservation), OverBudget, Cancelled}`; `Reservation::settle(actual_usd)`;
   `spent_usd()`, `max_usd()`; `request_cost_bound(model, &request)`.
 - `cached_clip(video, &cache, &run, &options)`: what the cache has for a video, nothing sent.
-- `serve_after_stop(videos, cache, &run, &options, &stop, on_event)`: the clips a stopped run did
-  not take up, served from the cache (or `NotStarted`; nothing at all after a cancel).
+- `serve_after_stop(videos, cache, &run, &options, &stop, cancel, on_event)`: the clips a stopped
+  run did not take up, served from the cache (or `NotStarted`; nothing at all after a cancel, and
+  nothing more from the moment `cancel` is set while serving).
 - `Budget::refused_usd()`: the bound of the last request found over budget, for a message.
 - `group_clips(&[&DescribedClip])` → `Grouping { groups: Vec<Group { id, label, stretches }>,
   clips: Vec<ClipGroups { group, stretches: Vec<Stretch { start_s, end_s, group }>, segments }> }`.
@@ -432,11 +479,14 @@ many clips came from the cache.
 - A budget stop says the cap, what was spent, why it stopped short of the cap, and what to do:
   `Stopped at --max-cost $0.03: 2 of 4 videos not described. $0.0143 spent; the next video could
   cost up to $0.0231 (its answer counted at full length, though it usually costs a fraction of
-  that), which would pass the cap. Each video needs that much room before it is sent, so a cap
-  close to --estimate's total can stop a video or two early. Raise --max-cost and run again with
-  --resume to continue.` Without `--resume` or `--force` nothing was saved, and the message says
-  so: the videos described in this run were not saved, so running again pays for them again
-  too. `--max-cost`'s help says the same about a cap close to `--estimate`'s total.
+  that), which would pass the cap. Each video needs several times its usual cost set aside before
+  it is sent, so a cap close to --estimate's total can stop several videos early. Raise --max-cost
+  and run again with --resume to continue.` (On the test clips a request's bound, $0.0231, is almost
+  four times its `--estimate`d cost, so "several", not "one or two".) When the next video's bound is
+  more than the whole cap, the message says that instead of talking about `--estimate`. Without
+  `--resume` or `--force` nothing was saved, and the message says so: the videos described in
+  this run were not saved, so running again pays for them again too. `--max-cost`'s help says
+  the same about a cap close to `--estimate`'s total.
 - The exit code is 1 whenever a video was not described (failed, over budget, not started,
   cancelled), as a failure was before.
 
@@ -455,11 +505,13 @@ many clips came from the cache.
   gate's state, not a sleep).
 - Grouping: synthetic grids (a scene, its rotation, another scene, a blank clip, a clip with a
   cut); clips whose pictures differ joined by their descriptions, never two stretches of one clip
-  or a blank one; the word table above; and, on Linux, the real test clips (one group) plus
+  or a blank one — including two stretches of one clip that share its summary, or carry segments,
+  described like a third clip (it joins one, never glues them), while a cut back to the same shot
+  still joins by pictures; framing words and their plurals dropped; the word table above; and, on Linux, the real test clips (one group) plus
   `videotestsrc` clips made in-process (their own groups — this half always runs, no
   `gst-launch-1.0` needed), and the distance table above.
 - An unreadable answer counts its bound as spent; after a stop, the clips left are finished in
-  order (none after a cancel).
+  order (none after a cancel, none after a Ctrl+C that comes while they are served).
 - Folder run, on Linux with a mock HTTP server (the `TcpListener` pattern of the other tests):
   an interrupted run (cancelled after its first clip) resumes and sends only the rest; a third run
   sends nothing; `--force` sends everything again; a budget below one clip's bound sends nothing and
@@ -509,9 +561,11 @@ many clips came from the cache.
   0.5 + 0.05 cut, 4 blank), not options, and provisional: measured above on near-duplicates,
   re-framings, synthetic patterns and descriptions written for the tests only; retuning is a
   later issue with real footage and real descriptions in hand.
-- **Words never join two stretches of one clip, nor a blank stretch**: stretches of one clip
-  often carry the same summary, and a blank stretch's words ("a black screen") would gather every
-  black leader of a folder into one group.
+- **Words never join two stretches of one clip, nor a blank stretch** — not directly, and not
+  through other clips either (a link by words between two groups that already share a clip is
+  skipped): stretches of one clip often carry the same summary, and a blank stretch's words ("a
+  black screen") would gather every black leader of a folder into one group. Pictures still can:
+  a cut back to the same shot is the same shot.
 
 [defaulthasher]: https://doc.rust-lang.org/std/collections/hash_map/struct.DefaultHasher.html
 [fnv]: http://www.isthe.com/chongo/tech/comp/fnv/
