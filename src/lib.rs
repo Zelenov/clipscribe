@@ -35,11 +35,13 @@ mod describe;
 pub mod frames;
 pub mod provider;
 pub mod srt;
+mod tags;
 
 use std::time::Duration;
 
 pub use describe::*;
 pub use provider::{AiError, AiUsage};
+pub use tags::*;
 
 /// One subtitle cue, sent with the frames so the description knows what is said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +181,111 @@ pub fn describe(
     })
 }
 
+/// A clip described together with tag suggestions from a vocabulary, from one request: see
+/// [`describe_with_tags`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribedWithTags {
+    pub description: Description,
+    pub tags: TagSuggestions,
+    pub usage: AiUsage,
+    pub duration_s: f64,
+    pub frames: usize,
+}
+
+/// Describe the clip at `video` and suggest tags from `vocabulary` in one request: cheaper than
+/// [`describe`] followed by [`suggest_tags`], since the frames and the API call are shared. See
+/// [`suggest_tags`] to tag an already-described clip without reading it again.
+#[cfg(feature = "frames")]
+pub fn describe_with_tags(
+    video: &std::path::Path,
+    subtitles: &[Cue],
+    vocabulary: &[Tag],
+    options: &Options,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_stage: impl FnMut(Stage),
+) -> Result<DescribedWithTags, Error> {
+    use provider::AiProvider;
+
+    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
+    let duration_s = clip
+        .duration_s()
+        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
+    if duration_s > MAX_DURATION_S {
+        return Err(Error::TooLong(duration_s));
+    }
+    let frames = match clip.sample(duration_s, options.frame_sampling, cancel, |done, total| {
+        on_stage(Stage::Frame { done, total })
+    }) {
+        Ok(Some(frames)) if !frames.is_empty() => frames,
+        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
+        Ok(None) => return Err(Error::Cancelled),
+        Err(e) => return Err(Error::Unreadable(e)),
+    };
+    drop(clip);
+    let request = build_combined_request(
+        options.model,
+        &frames,
+        subtitles,
+        vocabulary,
+        duration_s,
+        options.language,
+    );
+    on_stage(Stage::Asking);
+    let provider = anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?;
+    let response = provider.complete(&request, cancel).map_err(|e| match e {
+        AiError::Cancelled => Error::Cancelled,
+        e => Error::Ai(e),
+    })?;
+    let (description, tags) =
+        parse_combined_answer(&response, duration_s, vocabulary).map_err(|reason| {
+            Error::BadAnswer {
+                reason,
+                usage: response.usage,
+            }
+        })?;
+    Ok(DescribedWithTags {
+        description,
+        tags,
+        usage: response.usage,
+        duration_s,
+        frames: frames.len(),
+    })
+}
+
+/// Suggest tags from `vocabulary` for a clip already described (by [`describe`] or
+/// [`describe_with_tags`]): no video is read, so this works without the `frames` feature, from
+/// `description` and `duration_s` alone. Cheaper than [`describe_with_tags`], but blind to
+/// anything `description`'s summary and segments left out. `cancel` is checked while waiting for
+/// the answer. Like `describe`, a bad answer is still billed: [`Error::BadAnswer`] carries the
+/// usage so the caller can still account for it.
+pub fn suggest_tags(
+    description: &Description,
+    duration_s: f64,
+    subtitles: &[Cue],
+    vocabulary: &[Tag],
+    options: &Options,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<TagSuggestions, Error> {
+    use provider::AiProvider;
+
+    let request = build_tags_only_request(
+        options.model,
+        description,
+        subtitles,
+        vocabulary,
+        duration_s,
+    );
+    let provider = anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?;
+    let response = provider.complete(&request, cancel).map_err(|e| match e {
+        AiError::Cancelled => Error::Cancelled,
+        e => Error::Ai(e),
+    })?;
+    parse_tags_only_answer(&response, vocabulary, duration_s).map_err(|reason| Error::BadAnswer {
+        reason,
+        usage: response.usage,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +305,35 @@ mod tests {
             frame_sampling: FrameSampling::KeyFrames,
         };
         let result = describe(&fake, &[], &options, &AtomicBool::new(false), |_| {});
+        assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn a_video_file_with_tags_that_is_not_a_video_is_unreadable() {
+        let dir = std::env::temp_dir().join(format!("clipscribe-lib-tags-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let fake = dir.join("fake.mp4");
+        std::fs::write(&fake, b"not a movie").expect("write");
+        let options = Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+        };
+        let vocabulary = vec![Tag {
+            name: "Goat".to_string(),
+            hint: None,
+        }];
+        let result = describe_with_tags(
+            &fake,
+            &[],
+            &vocabulary,
+            &options,
+            &AtomicBool::new(false),
+            |_| {},
+        );
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }

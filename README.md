@@ -52,6 +52,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 clipscribe clip.mp4 other.mov          # describe
 clipscribe footage/ --json > out.json  # every video in a folder, as JSON
 clipscribe footage/ --estimate         # what it would cost; nothing is sent
+clipscribe clip.mp4 --tags tags.txt    # also suggest tags from a vocabulary (see below)
 ```
 
 | Option | |
@@ -59,14 +60,34 @@ clipscribe footage/ --estimate         # what it would cost; nothing is sent
 | `--model haiku\|sonnet\|opus` | Claude Haiku 4.5 (default; about $10 per 1000 one-minute clips), Sonnet 5 or Opus 5 (notice more, cost more). |
 | `--language` | `subtitles` (default: the subtitles' language, English if none), `en`, `ru`, `uk`, `de`, `es`, `fr`. |
 | `--frames keyframes\|interval` | `keyframes` (default: one per window of the clip where the picture changes the most) or `interval` (one every 2 s, spread evenly on a longer clip). |
+| `--tags <file>` | Suggest tags from this vocabulary in the same request as the description (see below); not set by default. |
 | `--no-subtitles` | Do not send the `.srt`. |
-| `--json` | One JSON array: `file`, `duration_s`, `frames`, `summary`, `moments[{start_s, end_s, description}]`, `model`, `usage`, `cost_usd`. |
+| `--json` | One JSON array: `file`, `duration_s`, `frames`, `summary`, `moments[{start_s, end_s, description}]`, `model`, `usage`, `cost_usd` — with `--tags`, also `tags[{name, confidence, ranges[{start_s, end_s}]}]` and `new_tag_ideas`. |
 | `--estimate` | Price the videos from their lengths only. |
 | `--api-key` | Instead of `ANTHROPIC_API_KEY`. |
 
 Progress goes to stderr, results to stdout, and the tokens and cost of the run to stderr at the
 end. Ctrl+C stops the video in work. A rejected key or an empty balance stops the batch. The exit
 code is 1 when a video failed.
+
+### Tag suggestions
+
+`--tags tags.txt` matches each clip against a closed vocabulary — one tag per line in the file,
+`name — hint` (the hint is optional) — instead of the model inventing tags freely. Each suggestion
+gets a confidence and, when it does not apply to the whole clip, the time ranges where it does; a
+tag is never suggested outside the vocabulary, but the model may add short, unscored `new_tag_ideas`
+for anything worth tagging that the vocabulary does not cover.
+
+```
+$ clipscribe hike.mp4 --tags tags.txt
+hike.mp4  0:30 · 16 frames · $0.0050
+  Two hikers reach a viewpoint over a valley with goats grazing below.
+  0:12–0:20  A herd of goats crosses the path in front of the hikers.
+  Tags:
+    Goat 95% (0:12–0:20)
+    Outdoor 80%
+  New tag ideas: Hiking trail
+```
 
 ## As a library
 
@@ -101,6 +122,13 @@ Everything blocks: call it from a worker thread. `describe` fails with `Error::C
 `Unreadable`, `TooLong`, `Ai(AiError)` (rejected key, no credit, limits, network, timeout) or
 `BadAnswer` (billed, but not usable). `estimate_usage` and `Model::cost_usd` price a clip
 before sending it; `frames::clip_duration_s` reads its length.
+
+`describe_with_tags(video, subtitles, vocabulary, &options, ...)` describes a clip and suggests
+tags from a `&[Tag]` vocabulary (`parse_vocabulary` reads the file format above) in one request,
+returning a `DescribedWithTags`. `suggest_tags(description, duration_s, subtitles, vocabulary,
+&options, cancel)` tags a clip already described earlier instead, from its `Description` alone —
+cheaper, no video read, works without the `frames` feature — at the cost of not seeing anything
+the description itself left out. `estimate_tags_usage` prices either.
 
 ### Features
 

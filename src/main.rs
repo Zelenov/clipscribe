@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, ValueEnum};
 use clipscribe::{
-    describe, estimate_usage, format_time, frames, srt, AiUsage, Described, Error, FrameSampling,
-    Model, Options, Stage, SummaryLanguage, MAX_DURATION_S, MODELS,
+    describe, describe_with_tags, estimate_tags_usage, estimate_usage, format_time, frames,
+    parse_vocabulary, srt, AiUsage, Described, DescribedWithTags, Error, FrameSampling, Model,
+    Options, Stage, SummaryLanguage, Tag, MAX_DURATION_S, MODELS,
 };
 use serde_json::json;
 
@@ -41,6 +42,11 @@ struct Cli {
     /// interval (one every 2 s, at most 60, spread evenly over a longer clip).
     #[arg(long, value_enum, default_value_t = FramesArg::Keyframes)]
     frames: FramesArg,
+
+    /// Suggest tags for each video from this vocabulary file (one per line, `name — hint`), in
+    /// the same request as the description.
+    #[arg(long)]
+    tags: Option<PathBuf>,
 
     /// Do not send the `.srt` next to each video.
     #[arg(long)]
@@ -119,8 +125,18 @@ fn main() -> ExitCode {
         }
     };
     let model = cli.model.model();
+    let vocabulary = match &cli.tags {
+        Some(path) => match load_vocabulary(path) {
+            Ok(vocabulary) => Some(vocabulary),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
     if cli.estimate {
-        return estimate(&videos, model, cli.no_subtitles);
+        return estimate(&videos, model, cli.no_subtitles, vocabulary.as_deref());
     }
     let Some(api_key) = cli.api_key.clone().filter(|k| !k.trim().is_empty()) else {
         eprintln!("error: no API key: set ANTHROPIC_API_KEY or pass --api-key");
@@ -150,24 +166,49 @@ fn main() -> ExitCode {
             })
         };
         let progress = Progress::new(video);
-        let result = describe(video, &subtitles, &options, &CANCEL, |stage| {
-            progress.show(stage)
-        });
-        progress.clear();
-        match result {
-            Ok(described) => {
-                total += described.usage;
-                if cli.json {
-                    results.push(to_json(video, &described, model));
-                } else {
-                    print_text(video, &described, model);
+        let error = if let Some(vocabulary) = &vocabulary {
+            let result =
+                describe_with_tags(video, &subtitles, vocabulary, &options, &CANCEL, |stage| {
+                    progress.show(stage)
+                });
+            progress.clear();
+            match result {
+                Ok(described) => {
+                    total += described.usage;
+                    if cli.json {
+                        results.push(to_json_with_tags(video, &described, model));
+                    } else {
+                        print_text_with_tags(video, &described, model);
+                    }
+                    None
                 }
+                Err(e) => Some(e),
             }
-            Err(Error::Cancelled) => {
+        } else {
+            let result = describe(video, &subtitles, &options, &CANCEL, |stage| {
+                progress.show(stage)
+            });
+            progress.clear();
+            match result {
+                Ok(described) => {
+                    total += described.usage;
+                    if cli.json {
+                        results.push(to_json(video, &described, model));
+                    } else {
+                        print_text(video, &described, model);
+                    }
+                    None
+                }
+                Err(e) => Some(e),
+            }
+        };
+        match error {
+            None => {}
+            Some(Error::Cancelled) => {
                 eprintln!("cancelled: {}", video.display());
                 break;
             }
-            Err(e) => {
+            Some(e) => {
                 failed = true;
                 if let Error::BadAnswer { usage, .. } = &e {
                     total += *usage;
@@ -234,8 +275,24 @@ fn is_video(path: &Path) -> bool {
         .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
+/// Read a `--tags` vocabulary file: one tag per line, `name — hint`.
+fn load_vocabulary(path: &Path) -> Result<Vec<Tag>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let vocabulary = parse_vocabulary(&text);
+    if vocabulary.is_empty() {
+        return Err(format!("{}: no tags found", path.display()));
+    }
+    Ok(vocabulary)
+}
+
 /// Print what describing `videos` with `model` would cost, reading only their lengths.
-fn estimate(videos: &[PathBuf], model: Model, no_subtitles: bool) -> ExitCode {
+/// `vocabulary`, when given, adds the cost of suggesting tags from it.
+fn estimate(
+    videos: &[PathBuf],
+    model: Model,
+    no_subtitles: bool,
+    vocabulary: Option<&[Tag]>,
+) -> ExitCode {
     let mut total = AiUsage::default();
     let mut unreadable = 0;
     for video in videos {
@@ -258,7 +315,12 @@ fn estimate(videos: &[PathBuf], model: Model, no_subtitles: bool) -> ExitCode {
         } else {
             std::fs::metadata(srt::subtitle_path(video)).map_or(0, |m| m.len() as usize)
         };
-        let usage = estimate_usage(model, duration_s, subtitle_bytes);
+        let usage = match vocabulary {
+            Some(vocabulary) => {
+                estimate_tags_usage(model, duration_s, subtitle_bytes, vocabulary, None)
+            }
+            None => estimate_usage(model, duration_s, subtitle_bytes),
+        };
         total += usage;
         println!(
             "{}: {}, about ${:.4}",
@@ -321,6 +383,81 @@ fn to_json(video: &Path, described: &Described, model: Model) -> serde_json::Val
     })
 }
 
+fn print_text_with_tags(video: &Path, described: &DescribedWithTags, model: Model) {
+    println!(
+        "{}  {} · {} frames · ${:.4}",
+        video.display(),
+        format_time(described.duration_s),
+        described.frames,
+        model.cost_usd(described.usage)
+    );
+    println!("  {}", described.description.summary);
+    for moment in &described.description.segments {
+        println!(
+            "  {}–{}  {}",
+            format_time(moment.start_s),
+            format_time(moment.end_s),
+            moment.description
+        );
+    }
+    if !described.tags.tags.is_empty() {
+        println!("  Tags:");
+        for tag in &described.tags.tags {
+            let ranges: Vec<String> = tag
+                .ranges
+                .iter()
+                .map(|r| format!("{}\u{2013}{}", format_time(r.start_s), format_time(r.end_s)))
+                .collect();
+            let where_ = if ranges.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", ranges.join(", "))
+            };
+            println!("    {} {:.0}%{where_}", tag.name, tag.confidence * 100.0);
+        }
+    }
+    if !described.tags.new_tag_ideas.is_empty() {
+        println!(
+            "  New tag ideas: {}",
+            described.tags.new_tag_ideas.join(", ")
+        );
+    }
+    println!();
+}
+
+fn to_json_with_tags(
+    video: &Path,
+    described: &DescribedWithTags,
+    model: Model,
+) -> serde_json::Value {
+    json!({
+        "file": video.display().to_string(),
+        "duration_s": described.duration_s,
+        "frames": described.frames,
+        "summary": described.description.summary,
+        "moments": described.description.segments.iter().map(|m| json!({
+            "start_s": m.start_s,
+            "end_s": m.end_s,
+            "description": m.description,
+        })).collect::<Vec<_>>(),
+        "tags": described.tags.tags.iter().map(|t| json!({
+            "name": t.name,
+            "confidence": t.confidence,
+            "ranges": t.ranges.iter().map(|r| json!({
+                "start_s": r.start_s,
+                "end_s": r.end_s,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "new_tag_ideas": described.tags.new_tag_ideas,
+        "model": model.id,
+        "usage": {
+            "input_tokens": described.usage.input_tokens,
+            "output_tokens": described.usage.output_tokens,
+        },
+        "cost_usd": model.cost_usd(described.usage),
+    })
+}
+
 /// One status line on stderr for the video in work, when stderr is a terminal.
 struct Progress {
     name: String,
@@ -353,5 +490,71 @@ impl Progress {
         if self.shown {
             eprint!("\r\x1b[K");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clipscribe::{Description, Segment, TagRange, TagSuggestion, TagSuggestions};
+
+    fn sample() -> DescribedWithTags {
+        DescribedWithTags {
+            description: Description {
+                summary: "Two hikers reach a viewpoint over a valley with goats grazing below."
+                    .to_string(),
+                segments: vec![Segment {
+                    start_s: 12.0,
+                    end_s: 20.0,
+                    description: "A herd of goats crosses the path in front of the hikers."
+                        .to_string(),
+                }],
+            },
+            tags: TagSuggestions {
+                tags: vec![
+                    TagSuggestion {
+                        name: "Goat".to_string(),
+                        confidence: 0.95,
+                        ranges: vec![TagRange {
+                            start_s: 12.0,
+                            end_s: 20.0,
+                        }],
+                    },
+                    TagSuggestion {
+                        name: "Outdoor".to_string(),
+                        confidence: 0.8,
+                        ranges: vec![],
+                    },
+                ],
+                new_tag_ideas: vec!["Hiking trail".to_string()],
+            },
+            usage: AiUsage {
+                input_tokens: 3965,
+                output_tokens: 210,
+            },
+            duration_s: 30.0,
+            frames: 16,
+        }
+    }
+
+    /// Printed with `cargo test print_text_with_tags -- --nocapture`, for the PR's sample output:
+    /// no live API key is needed since this exercises the CLI's own formatting, not a real answer.
+    #[test]
+    fn print_text_with_tags_shows_the_summary_segments_tags_and_ideas() {
+        print_text_with_tags(Path::new("hike.mp4"), &sample(), MODELS[0]);
+    }
+
+    #[test]
+    fn to_json_with_tags_carries_the_tags_and_new_tag_ideas_fields() {
+        let json = to_json_with_tags(Path::new("hike.mp4"), &sample(), MODELS[0]);
+        assert_eq!(json["tags"][0]["name"], "Goat");
+        assert_eq!(json["tags"][0]["ranges"][0]["start_s"], 12.0);
+        assert_eq!(json["tags"][1]["name"], "Outdoor");
+        assert!(json["tags"][1]["ranges"].as_array().unwrap().is_empty());
+        assert_eq!(json["new_tag_ideas"], json!(["Hiking trail"]));
+        // Unchanged from plain `to_json`, so existing `--json` consumers without `--tags` see no
+        // difference: only videos run with `--tags` get these extra fields at all.
+        assert!(json.get("summary").is_some());
+        assert!(json.get("moments").is_some());
     }
 }
