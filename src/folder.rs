@@ -1835,12 +1835,54 @@ mod tests {
             )
         }
 
+        /// What the model might write for each clip of the grouping tests: written for the tests
+        /// (the mock server answers every clip with the same sentence, and no live request is
+        /// made), in its usual style — the same footage described in different words each time,
+        /// the way two requests describe it.
+        fn description_of(name: &str) -> &'static str {
+            match name {
+                "MP4" => "The Earth turns slowly in space at night, city lights glowing across the continents.",
+                "MOV" => "A night view of the Earth from space, its cities glowing as the planet rotates.",
+                "WebM" => "The planet rotates in the dark, city lights glowing across the Earth seen from space.",
+                "rotated-90" => "The Earth, seen from space at night, rotates slowly with its city lights glowing.",
+                "zoom 1.25x" => "Close view of the night side of the Earth from space, city lights glowing as it turns.",
+                "pan 20%" => "Part of the Earth at night seen from space, with glowing city lights, turning slowly.",
+                "pan 40%" => "The edge of the Earth from space at night, lights of cities glowing as it slowly rotates.",
+                "smpte" => "Vertical colour bars of a television test pattern fill the screen.",
+                "ball" => "A white ball bounces around on a black background.",
+                "gradient" => "A smooth grey gradient runs from dark to light across the picture.",
+                "pinwheel" => "Black and white pinwheel blades spin around the centre.",
+                "circular" => "Concentric black and white rings spread out from the centre.",
+                _ => panic!("no description for {name}"),
+            }
+        }
+
+        /// `clip` with `summary` as its description instead of the mock server's.
+        fn described_as(clip: &DescribedClip, summary: &str) -> DescribedClip {
+            DescribedClip {
+                description: crate::Description {
+                    summary: summary.to_string(),
+                    segments: Vec::new(),
+                },
+                ..clip.clone()
+            }
+        }
+
         /// Grouping on the real test clips: all four are the same footage (the MP4, the MOV and
         /// the WebM one video in three containers, `rotated-90.mp4` its first 6 s stored sideways),
         /// so one group; generated test patterns are other scenes and get groups of their own.
         /// Both halves always run (the patterns are made in-process).
         #[test]
         fn the_test_clips_are_one_group_and_other_scenes_are_not() {
+            let names = [
+                "MP4",
+                "MOV",
+                "WebM",
+                "rotated-90",
+                "smpte",
+                "ball",
+                "gradient",
+            ];
             let (dir, mut videos) = folder(
                 "groups",
                 &[
@@ -1850,10 +1892,7 @@ mod tests {
                     "rotated-90.mp4",
                 ],
             );
-            let patterns: Vec<PathBuf> = ["smpte", "ball", "gradient"]
-                .iter()
-                .map(|p| pattern(&dir, p))
-                .collect();
+            let patterns: Vec<PathBuf> = names[4..].iter().map(|p| pattern(&dir, p)).collect();
             videos.extend(patterns.iter().cloned());
             let server = server(Duration::ZERO);
             let run = run_folder(
@@ -1865,12 +1904,15 @@ mod tests {
                 &AtomicBool::new(false),
                 &|_| {},
             );
-            let clips: Vec<&DescribedClip> = run
+            let clips: Vec<DescribedClip> = run
                 .clips
                 .iter()
-                .map(|c| &c.record().expect("described").clip)
+                .zip(names)
+                .map(|(c, name)| {
+                    described_as(&c.record().expect("described").clip, description_of(name))
+                })
                 .collect();
-            let grouping = group_clips(&clips);
+            let grouping = group_clips(&clips.iter().collect::<Vec<_>>());
             for (video, groups) in videos.iter().zip(&grouping.clips) {
                 eprintln!(
                     "{}: group {} {:?}",
@@ -1898,12 +1940,14 @@ mod tests {
         }
 
         /// The measurement behind the grouping thresholds (`docs/design/whole-folders.md`,
-        /// "Measured"): the distance `group_clips` joins clips by, between the test clips, the
-        /// test clip re-framed (cropped and scaled, as a camera moved or zoomed would), and
-        /// generated patterns. Prints the table (`cargo test --lib grouping_distances --
-        /// --nocapture`) and checks only what the design relies on.
+        /// "Measured"): both distances `group_clips` joins clips by — the pictures' (`1 − r`)
+        /// and the descriptions' words (Jaccard) — between the test clips, the test clip
+        /// re-framed (cropped and scaled, as a camera moved or zoomed would), and generated
+        /// patterns, each described as [`description_of`] says. Prints the table (`cargo test
+        /// --lib grouping_distances -- --nocapture`) and checks what the design relies on.
         #[test]
         fn grouping_distances_on_the_test_clips() {
+            use crate::groups::{text_similarity, SAME_SHOT, SAME_TEXT};
             let dir = std::env::temp_dir()
                 .join(format!("clipscribe-run-distances-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
@@ -1939,7 +1983,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                     DescribedClip {
                         description: crate::Description {
-                            summary: String::new(),
+                            summary: description_of(name).to_string(),
                             segments: Vec::new(),
                         },
                         tags: None,
@@ -1949,31 +1993,74 @@ mod tests {
                     }
                 })
                 .collect();
-            let distance = |a: usize, b: usize| {
+            let picture = |a: usize, b: usize| {
                 crate::groups::clip_distance(&clips[a], &clips[b]).unwrap_or(f64::NAN)
             };
-            eprintln!("distance (1 - r, best rotation, closest stretches) from the MP4:");
+            let text = |a: usize, b: usize| {
+                text_similarity(&clips[a].description.summary, &clips[b].description.summary)
+            };
+            let by = |a: usize, b: usize| match (picture(a, b) < SAME_SHOT, text(a, b) >= SAME_TEXT)
+            {
+                (true, true) => "both",
+                (true, false) => "picture",
+                (false, true) => "words",
+                (false, false) => "no",
+            };
+            eprintln!(
+                "from the MP4: picture (1 - r, best rotation, closest stretches), words \
+                 (Jaccard), grouped by (picture < {SAME_SHOT}, words >= {SAME_TEXT}):"
+            );
             for (i, (name, _)) in named.iter().enumerate().skip(1) {
-                eprintln!("  {name:<12} {:.3}", distance(0, i));
+                eprintln!(
+                    "  {name:<12} {:.3}  {:.2}  {}",
+                    picture(0, i),
+                    text(0, i),
+                    by(0, i)
+                );
             }
             let patterns = 7..named.len();
             eprintln!("between patterns:");
-            let mut closest_patterns = f64::INFINITY;
+            let mut closest_picture = f64::INFINITY;
             for i in patterns.clone() {
                 for j in patterns.clone().filter(|&j| j > i) {
-                    let d = distance(i, j);
-                    closest_patterns = closest_patterns.min(d);
-                    eprintln!("  {:<9} {:<9} {d:.3}", named[i].0, named[j].0);
+                    closest_picture = closest_picture.min(picture(i, j));
+                    eprintln!(
+                        "  {:<9} {:<9} {:.3}  {:.2}  {}",
+                        named[i].0,
+                        named[j].0,
+                        picture(i, j),
+                        text(i, j),
+                        by(i, j)
+                    );
                 }
             }
-            let same = crate::groups::SAME_SCENE;
+            let mock = |n: usize| format!("The Earth turns in space, answer {n}.");
+            eprintln!(
+                "the mock server's own answers, one clip to another: words {:.2}",
+                text_similarity(&mock(1), &mock(2))
+            );
             for (i, (name, _)) in named.iter().enumerate().take(4).skip(1) {
-                assert!(distance(0, i) < same, "{name}: {}", distance(0, i));
+                assert!(picture(0, i) < SAME_SHOT, "{name}: {}", picture(0, i));
             }
-            for i in patterns {
-                assert!(distance(0, i) > same, "{}: {}", named[i].0, distance(0, i));
+            for i in patterns.clone() {
+                assert!(
+                    picture(0, i) > SAME_SHOT,
+                    "{}: {}",
+                    named[i].0,
+                    picture(0, i)
+                );
+                assert!(text(0, i) < SAME_TEXT, "{}: {}", named[i].0, text(0, i));
             }
-            assert!(closest_patterns > same, "{closest_patterns}");
+            assert!(closest_picture > SAME_SHOT, "{closest_picture}");
+            // The hybrid end to end: the re-framed footage joins the originals by its words, and
+            // no pattern joins them. (Between patterns the words can join two different ones —
+            // the pinwheel and the rings are both "black and white" around "the centre": the
+            // word signal's false positive, printed above and in the design notes.)
+            let grouping = group_clips(&clips.iter().collect::<Vec<_>>());
+            let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
+            eprintln!("groups: {ids:?}");
+            assert!(ids[..7].iter().all(|&id| id == 1), "{ids:?}");
+            assert!(ids[7..].iter().all(|&id| id != 1), "{ids:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

@@ -1,10 +1,14 @@
-//! Grouping similar footage across clips, and stretches within clips, from the fingerprints of the
-//! frames each clip was described from: see [`group_clips`] and the design notes in
+//! Grouping similar footage across clips, and stretches within clips, from two signals each
+//! described clip already carries: the fingerprints of the frames it was described from, and the
+//! words of its description. See [`group_clips`] and the design notes in
 //! `docs/design/whole-folders.md`.
 //!
 //! No GStreamer or image dependency: a [`DescribedClip`] carries its frames' fingerprints (8×8
-//! grids of average luma, the block-mean-value hash key frames already use), so grouping runs
-//! without the `frames` feature, on clips described earlier and read back from the cache.
+//! grids of average luma, the block-mean-value hash key frames already use) and its description,
+//! so grouping runs without the `frames` feature, on clips described earlier and read back from
+//! the cache.
+
+use std::collections::{BTreeSet, HashMap};
 
 use crate::describe::fingerprint_diff;
 use crate::folder::{DescribedClip, FrameFingerprint};
@@ -16,10 +20,31 @@ const BLANK_SPREAD: f64 = 4.0;
 const CUT_STRUCTURE: f64 = 0.5;
 /// ...and their level of light by more than this (mean absolute difference, 0.0–1.0).
 const CUT_LEVEL: f64 = 0.05;
-/// Two stretches closer than this (`1 − r`, over the four rotations) show the same scene.
-pub(crate) const SAME_SCENE: f64 = 0.2;
+/// Two stretches whose pictures are closer than this (`1 − r`, over the four rotations) are the
+/// same shot: a duplicate, a re-export, the clip stored sideways, a camera that did not move.
+pub(crate) const SAME_SHOT: f64 = 0.2;
+/// Two stretches of different clips whose descriptions share at least this fraction of their
+/// words (Jaccard index of [`words`]) are described as the same thing: the same subject or
+/// activity, even filmed from a moved or zoomed camera.
+pub(crate) const SAME_TEXT: f64 = 0.25;
+/// A stretch described in fewer [`words`] than this has too little text to compare.
+const MIN_WORDS: usize = 3;
+/// How many letters of a word [`words`] keeps: a crude, language-blind stemmer ("goat" and
+/// "goats", "hiker" and "hikes", "красной" and "красная" come out the same).
+const STEM_LETTERS: usize = 4;
 /// A description segment names a stretch when it covers at least this fraction of it.
 const LABEL_COVERAGE: f64 = 0.5;
+
+/// Words that say nothing about what a clip shows: English function words of four letters or more
+/// (shorter words are dropped in every language), and words about the footage itself.
+const STOP_WORDS: [&str; 52] = [
+    "about", "above", "across", "after", "against", "along", "also", "among", "around", "before",
+    "behind", "being", "below", "beneath", "beside", "between", "both", "during", "each", "from",
+    "have", "into", "just", "near", "onto", "other", "over", "some", "that", "their", "them",
+    "then", "there", "these", "they", "this", "through", "toward", "towards", "under", "very",
+    "where", "which", "while", "with", "camera", "clip", "footage", "frame", "scene", "shot",
+    "video",
+];
 
 /// Similar footage: groups, and which group each clip, stretch and segment belongs to.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +64,9 @@ impl Grouping {
     }
 }
 
-/// Footage that shows the same scene.
+/// Footage that looks like the same shot (a duplicate, a re-export, the clip stored sideways, a
+/// camera that did not move), or whose descriptions say much the same thing (the same subject or
+/// activity, the camera moved or not); see [`group_clips`] for what that does and does not catch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Group {
     /// From 1, in order of first appearance (clips in the order given, stretches in time order).
@@ -75,46 +102,96 @@ pub struct Stretch {
     pub group: usize,
 }
 
-/// Group `clips` by what their frames look like: each clip is cut into stretches where the
-/// picture changes to something else, and stretches (in any clips, or the same one) whose average
-/// picture has the same layout of light and dark — whatever the exposure, and in any of the four
-/// 90° rotations — share a group. A group is labelled with the description of its most typical
-/// stretch; no request is made. Deterministic: the same clips always give the same groups and ids.
+/// Group `clips`, and stretches within them: each clip is cut into stretches where the picture
+/// changes to something else, and two stretches share a group when either
+///
+/// - their pictures are the same shot: the same average layout of light and dark, whatever the
+///   exposure and in any of the four 90° rotations — a duplicate, a re-export, a clip stored
+///   sideways, a camera that did not move (any two stretches, in the same clip or not); or
+/// - they are in different clips and their descriptions share at least a quarter of their words
+///   (the segments falling in the stretch, and the clip's summary when the stretch is the whole
+///   clip or no segment falls in it; common words dropped, each word cut to its first four
+///   letters) — the same subject or activity, even after the camera moved or zoomed.
+///
+/// Groups are what those links connect. A stretch whose frames are all blank (black, a flat wall)
+/// is a group of its own. The word signal only sees what the descriptions say: two clips of the
+/// same place doing different things can share enough words to be joined, and two of the same
+/// thing described in different words are not. A group is labelled with the description of its
+/// most typical stretch; no request is made. Deterministic: the same clips always give the same
+/// groups and ids.
 pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
     struct Piece {
         clip: usize,
         start_s: f64,
         end_s: f64,
         signature: Option<Vec<f64>>,
+        /// The stretch's words, as ids into `vocabulary`, sorted; empty when too few to compare.
+        words: Vec<usize>,
     }
-    let pieces: Vec<Piece> = clips
-        .iter()
-        .enumerate()
-        .flat_map(|(clip, described)| {
-            stretches_of(described)
+    let mut vocabulary: HashMap<String, usize> = HashMap::new();
+    let mut pieces: Vec<Piece> = Vec::new();
+    for (clip, described) in clips.iter().enumerate() {
+        let stretches = stretches_of(described);
+        let texts = stretch_texts(described, &stretches);
+        for ((start_s, end_s, signature), text) in stretches.into_iter().zip(texts) {
+            let words: BTreeSet<usize> = text
                 .into_iter()
-                .map(move |(start_s, end_s, signature)| Piece {
-                    clip,
-                    start_s,
-                    end_s,
-                    signature,
+                .map(|word| {
+                    let next = vocabulary.len();
+                    *vocabulary.entry(word).or_insert(next)
                 })
-        })
-        .collect();
+                .collect();
+            let words = if words.len() >= MIN_WORDS {
+                words.into_iter().collect()
+            } else {
+                Vec::new()
+            };
+            pieces.push(Piece {
+                clip,
+                start_s,
+                end_s,
+                signature,
+                words,
+            });
+        }
+    }
+    // How far apart two stretches are, 0.0 up, below 1.0 when they belong together: each signal's
+    // distance over its threshold, the closer of the two. `None` when one of them is blank.
+    let link = |a: &Piece, b: &Piece| -> Option<f64> {
+        let (Some(a_sig), Some(b_sig)) = (&a.signature, &b.signature) else {
+            return None;
+        };
+        let picture = scene_distance(a_sig, b_sig) / SAME_SHOT;
+        let text = if a.clip == b.clip || a.words.is_empty() || b.words.is_empty() {
+            f64::INFINITY
+        } else {
+            // At the threshold exactly this is 1.0, which still joins: see `joined`.
+            (1.0 - jaccard(&a.words, &b.words)) / (1.0 - SAME_TEXT)
+        };
+        Some(picture.min(text))
+    };
+    let joined = |a: &Piece, b: &Piece| -> bool {
+        let Some((a_sig, b_sig)) = a.signature.as_ref().zip(b.signature.as_ref()) else {
+            return false;
+        };
+        scene_distance(a_sig, b_sig) < SAME_SHOT
+            || (a.clip != b.clip
+                && !a.words.is_empty()
+                && !b.words.is_empty()
+                && jaccard(&a.words, &b.words) >= SAME_TEXT)
+    };
 
     let mut sets = DisjointSets::new(pieces.len());
     for (i, a) in pieces.iter().enumerate() {
-        let Some(a_sig) = &a.signature else { continue };
         for (j, b) in pieces.iter().enumerate().skip(i + 1) {
-            let Some(b_sig) = &b.signature else { continue };
-            if scene_distance(a_sig, b_sig) < SAME_SCENE {
+            if joined(a, b) {
                 sets.union(i, j);
             }
         }
     }
 
     // Ids in order of first appearance; members of each group in piece order.
-    let mut id_of_root = std::collections::HashMap::new();
+    let mut id_of_root = HashMap::new();
     let mut members: Vec<Vec<usize>> = Vec::new();
     let group_of: Vec<usize> = (0..pieces.len())
         .map(|i| {
@@ -140,10 +217,7 @@ pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
                     let total: f64 = members
                         .iter()
                         .filter(|&&j| j != i)
-                        .map(|&j| match (&pieces[i].signature, &pieces[j].signature) {
-                            (Some(a), Some(b)) => scene_distance(a, b),
-                            _ => 0.0,
-                        })
+                        .map(|&j| link(&pieces[i], &pieces[j]).unwrap_or(0.0))
                         .sum();
                     (i, total)
                 })
@@ -181,20 +255,12 @@ pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
                 .segments
                 .iter()
                 .map(|segment| {
-                    stretches
-                        .iter()
-                        .map(|s| {
-                            (
-                                s.group,
-                                overlap(s.start_s, s.end_s, segment.start_s, segment.end_s),
-                            )
-                        })
-                        .filter(|(_, overlap)| *overlap > 0.0)
-                        .fold(None, |best: Option<(usize, f64)>, (g, o)| match best {
-                            Some((_, best_o)) if best_o >= o => best,
-                            _ => Some((g, o)),
-                        })
-                        .map_or(group, |(g, _)| g)
+                    most_overlapping(
+                        stretches.iter().map(|s| (s.start_s, s.end_s)),
+                        segment.start_s,
+                        segment.end_s,
+                    )
+                    .map_or(group, |i| stretches[i].group)
                 })
                 .collect();
             ClipGroups {
@@ -206,6 +272,104 @@ pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
         .collect();
 
     Grouping { groups, clips }
+}
+
+/// The index of the span of `spans` overlapping `start_s..end_s` most (the first on a tie), if any
+/// overlaps it at all.
+fn most_overlapping(
+    spans: impl Iterator<Item = (f64, f64)>,
+    start_s: f64,
+    end_s: f64,
+) -> Option<usize> {
+    spans
+        .enumerate()
+        .map(|(i, (a, b))| (i, overlap(a, b, start_s, end_s)))
+        .filter(|(_, o)| *o > 0.0)
+        .fold(None, |best: Option<(usize, f64)>, (i, o)| match best {
+            Some((_, best_o)) if best_o >= o => best,
+            _ => Some((i, o)),
+        })
+        .map(|(i, _)| i)
+}
+
+/// The words each of `stretches` of `clip` is described in (see [`words`]): the description
+/// segments overlapping it more than any other stretch, and the clip's summary when the stretch is
+/// the whole clip or no segment falls in it.
+fn stretch_texts(
+    clip: &DescribedClip,
+    stretches: &[(f64, f64, Option<Vec<f64>>)],
+) -> Vec<Vec<String>> {
+    let mut texts: Vec<Vec<String>> = vec![Vec::new(); stretches.len()];
+    let mut has_segment = vec![false; stretches.len()];
+    for segment in &clip.description.segments {
+        let spans = stretches.iter().map(|(a, b, _)| (*a, *b));
+        if let Some(i) = most_overlapping(spans, segment.start_s, segment.end_s) {
+            texts[i].extend(words(&segment.description));
+            has_segment[i] = true;
+        }
+    }
+    for (i, text) in texts.iter_mut().enumerate() {
+        if stretches.len() == 1 || !has_segment[i] {
+            text.extend(words(&clip.description.summary));
+        }
+    }
+    texts
+}
+
+/// The words of `text` that say what it shows, for comparing descriptions: lower-cased, split at
+/// anything that is not a letter or a digit, words shorter than four letters and [`STOP_WORDS`]
+/// dropped, each cut to its first [`STEM_LETTERS`] letters. Works the same in every language the
+/// descriptions come in, except that only English has stop words beyond the length rule.
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 4 && !STOP_WORDS.contains(word))
+        .map(|word| word.chars().take(STEM_LETTERS).collect())
+        .collect()
+}
+
+/// The Jaccard index of two sorted sets of word ids: shared over all, 0.0–1.0.
+fn jaccard(a: &[usize], b: &[usize]) -> f64 {
+    let (mut i, mut j, mut shared) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    let all = a.len() + b.len() - shared;
+    if all == 0 {
+        0.0
+    } else {
+        shared as f64 / all as f64
+    }
+}
+
+/// The Jaccard index of the [`words`] of two texts (0.0 when either has fewer than
+/// [`MIN_WORDS`]): what [`group_clips`] compares descriptions by. For measuring the threshold.
+#[cfg(test)]
+pub(crate) fn text_similarity(a: &str, b: &str) -> f64 {
+    let mut vocabulary: HashMap<String, usize> = HashMap::new();
+    let mut ids = |text: &str| -> Vec<usize> {
+        let set: BTreeSet<usize> = words(text)
+            .into_iter()
+            .map(|word| {
+                let next = vocabulary.len();
+                *vocabulary.entry(word).or_insert(next)
+            })
+            .collect();
+        set.into_iter().collect()
+    };
+    let (a, b) = (ids(a), ids(b));
+    if a.len() < MIN_WORDS || b.len() < MIN_WORDS {
+        return 0.0;
+    }
+    jaccard(&a, &b)
 }
 
 /// The distance [`group_clips`] would join `a` and `b` by: the smallest [`scene_distance`] between
@@ -473,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn the_same_scene_groups_across_clips_whatever_the_exposure_and_rotation() {
+    fn the_same_shot_groups_across_clips_whatever_the_exposure_and_rotation() {
         let a = clip(
             "A lamp on a desk.",
             4.0,
@@ -593,6 +757,143 @@ mod tests {
         assert_eq!(grouping.groups[0].label, "Nothing.");
     }
 
+    /// Descriptions in the style the model writes them (a one-sentence summary, a moment or
+    /// two), for measuring the word signal: written for this test, not model output (no live
+    /// requests are made in the tests). Letters name a subject; `a`/`b` are the same subject or
+    /// activity filmed from another position or zoom, as a re-shoot would be.
+    const DESCRIPTIONS: [(&str, &str); 19] = [
+        ("hike a", "A hiker in a red jacket walks along a rocky ridge at sunset, with mountains in the distance."),
+        ("hike b", "Close view of a hiker in a red jacket crossing a rocky ridge as the sun goes down."),
+        ("tent a", "Two people pitch a green tent in a grassy clearing beside a lake. They spread the tent out on the grass. The poles go in and the tent stands up."),
+        ("tent b", "From the lake shore, two campers finish setting up a green tent in the clearing."),
+        ("goats a", "A herd of goats grazes on a steep hillside above the trail."),
+        ("goats b", "The camera pans across goats grazing on the hillside."),
+        ("onion a", "A woman chops onions on a wooden cutting board in a small kitchen."),
+        ("onion b", "Close-up of a knife slicing an onion on a cutting board."),
+        ("waves a", "Waves break on a sandy beach under a cloudy sky."),
+        ("waves b", "Seen from the dunes, grey waves roll onto the beach beneath heavy clouds."),
+        ("хребет a", "Турист в красной куртке идёт по скалистому хребту на закате."),
+        ("хребет b", "Турист в красной куртке пересекает скалистый хребет, солнце садится."),
+        // The same shoot, something else: the same hiker, the same place, the same beach.
+        ("drink", "A hiker in a red jacket drinks water from a stream."),
+        ("bike", "A man in a red jacket rides a mountain bike along a rocky ridge at sunset."),
+        ("stove", "Two people cook dinner on a camp stove beside the green tent."),
+        ("lake", "The sun sets over the lake; the water is calm."),
+        ("dog", "A dog runs along the sandy beach chasing a ball."),
+        ("street", "A car drives down a city street at night, its headlights on."),
+        ("football", "Children play football in a school yard."),
+    ];
+
+    /// Pairs of [`DESCRIPTIONS`] that show the same place with something else happening: what
+    /// the issue's "the same scene or activity" may or may not mean. Printed, not asserted.
+    const SAME_PLACE: [(&str, &str); 5] = [
+        ("hike a", "bike"),
+        ("hike b", "bike"),
+        ("tent a", "stove"),
+        ("tent b", "stove"),
+        ("waves a", "dog"),
+    ];
+
+    /// The measurement behind [`SAME_TEXT`] (`docs/design/whole-folders.md`, "Measured"): the
+    /// word similarity of every pair of [`DESCRIPTIONS`]. Prints the table (`cargo test --lib
+    /// text_similarity -- --nocapture`); every re-shoot pair must reach the threshold and every
+    /// pair of different subjects stay under it.
+    #[test]
+    fn text_similarity_of_descriptions() {
+        let subject = |name: &str| name.split(' ').next().unwrap_or(name).to_string();
+        let mut same = Vec::new();
+        let mut place = Vec::new();
+        let mut different = Vec::new();
+        for (i, (a, a_text)) in DESCRIPTIONS.iter().enumerate() {
+            for (b, b_text) in DESCRIPTIONS.iter().skip(i + 1) {
+                let similarity = text_similarity(a_text, b_text);
+                if subject(a) == subject(b) {
+                    same.push((similarity, *a, *b));
+                } else if SAME_PLACE.contains(&(*a, *b)) {
+                    place.push((similarity, *a, *b));
+                } else {
+                    different.push((similarity, *a, *b));
+                }
+            }
+        }
+        different.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let joined = |s: f64| if s >= SAME_TEXT { "joined" } else { "" };
+        eprintln!("word similarity (Jaccard), joined at >= {SAME_TEXT}:");
+        eprintln!("the same subject, filmed again:");
+        for (s, a, b) in &same {
+            eprintln!("  {a:<9} {b:<9} {s:.2} {}", joined(*s));
+        }
+        eprintln!("the same place, something else happening:");
+        for (s, a, b) in &place {
+            eprintln!("  {a:<9} {b:<9} {s:.2} {}", joined(*s));
+        }
+        eprintln!(
+            "different subjects ({} pairs), the closest:",
+            different.len()
+        );
+        for (s, a, b) in different.iter().take(6) {
+            eprintln!("  {a:<9} {b:<9} {s:.2} {}", joined(*s));
+        }
+        for (s, a, b) in &same {
+            assert!(*s >= SAME_TEXT, "{a} / {b}: {s}");
+        }
+        for (s, a, b) in &different {
+            assert!(*s < SAME_TEXT, "{a} / {b}: {s}");
+        }
+    }
+
+    #[test]
+    fn words_drop_what_says_nothing_and_keep_four_letters() {
+        assert_eq!(
+            words("The camera follows two hikers, then a goat."),
+            ["foll", "hike", "goat"]
+        );
+        assert_eq!(words("Козы пасутся на склоне"), ["козы", "пасу", "скло"]);
+        assert_eq!(text_similarity("A goat.", "A goat."), 0.0, "too few words");
+    }
+
+    /// Two clips whose pictures have nothing in common (the camera moved) but whose descriptions
+    /// say the same thing are grouped; the same summary never joins two stretches of one clip, and
+    /// a blank stretch stays on its own whatever its description says.
+    #[test]
+    fn descriptions_saying_the_same_thing_group_clips_the_pictures_do_not() {
+        let text = "A hiker in a red jacket walks along a rocky ridge at sunset.";
+        let near = clip(text, 4.0, vec![(0.0, scene(1, 1, 20))]);
+        let far = clip(
+            "Close view of a hiker in a red jacket crossing a rocky ridge at sunset.",
+            4.0,
+            vec![(0.0, ramp())],
+        );
+        let checkers: Vec<u8> = (0..64)
+            .map(|i| if (i / 8 + i % 8) % 2 == 0 { 200 } else { 20 })
+            .collect();
+        let other = clip(
+            "Children play football in a school yard.",
+            4.0,
+            vec![(0.0, checkers)],
+        );
+        let blank = clip(text, 4.0, vec![(0.0, vec![9; 64])]);
+        let grouping = group_clips(&[&near, &far, &other, &blank]);
+        let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
+        assert_eq!(ids, [1, 1, 2, 3]);
+
+        // One clip, a cut from the block to the ramp, no segments: both stretches carry the
+        // summary, and still are two groups.
+        let cut = clip(
+            text,
+            8.0,
+            vec![
+                (0.0, scene(1, 1, 20)),
+                (2.0, scene(1, 1, 20)),
+                (6.0, ramp()),
+            ],
+        );
+        let grouping = group_clips(&[&cut]);
+        let stretches = &grouping.clips[0].stretches;
+        assert_eq!(stretches.len(), 2, "{stretches:?}");
+        assert_ne!(stretches[0].group, stretches[1].group);
+    }
+
     #[test]
     fn rotation_is_exact_on_the_grid_and_distances_are_bounded() {
         let values: Vec<f64> = (0..64).map(f64::from).collect();
@@ -607,7 +908,7 @@ mod tests {
         );
         let other = normalise(&ramp()).expect("structure");
         let d = scene_distance(&a, &other);
-        assert!((SAME_SCENE..=2.0).contains(&d), "{d}");
+        assert!((SAME_SHOT..=2.0).contains(&d), "{d}");
         assert!(normalise(&[7; 64]).is_none(), "flat is blank");
     }
 }

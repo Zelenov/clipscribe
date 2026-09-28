@@ -95,8 +95,12 @@ struct Cli {
     #[arg(long, requires = "cache")]
     cache_dir: Option<PathBuf>,
 
-    /// Group similar footage: videos, and stretches within them, that show the same scene, each
-    /// group with a short label. Computed from the frames already read; nothing extra is sent.
+    /// Group similar footage: videos, and stretches within them, that look like the same shot
+    /// (duplicates, re-exports, a clip stored sideways, a camera that did not move) or whose
+    /// descriptions share enough words (the same subject or activity, even after the camera moved
+    /// or zoomed; also, sometimes, the same place with something else happening). Each group gets
+    /// a short label. Computed from the frames and descriptions already there; nothing extra is
+    /// sent.
     #[arg(long)]
     groups: bool,
 
@@ -1224,13 +1228,15 @@ mod tests {
     }
 
     /// Printed with `cargo test print_groups -- --nocapture`, for the PR's `--groups` sample
-    /// output: two clips of one scene (the second a brighter take) and a third of another.
+    /// output: two takes of one shot (the second brighter), a third of the same trail filmed from
+    /// elsewhere (other pictures, a description in much the same words), and a black clip.
     #[test]
     fn print_groups_lists_each_group_with_its_footage() {
         let mut hike = sample_without_tags();
         hike.clip.description.summary = "A black screen.".to_string();
         let mut retake = sample_without_tags();
         retake.clip.description.summary = "A trail winds up a hillside in the evening.".to_string();
+        retake.clip.description.segments.clear();
         for frame in &mut retake.clip.frames {
             frame.fingerprint = (0..64).map(|i| 40 + (i % 8) * 20).collect();
         }
@@ -1239,15 +1245,24 @@ mod tests {
             frame.fingerprint.iter_mut().for_each(|v| *v += 30);
         }
         again.clip.description.summary = "The same trail again, in brighter light.".to_string();
-        let grouping = group_clips(&[&retake.clip, &hike.clip, &again.clip]);
+        let mut elsewhere = retake.clone();
+        elsewhere.clip.description.summary =
+            "Walking up the trail on the hillside in the evening light.".to_string();
+        for frame in &mut elsewhere.clip.frames {
+            frame.fingerprint = (0..64)
+                .map(|i| if (i / 8 + i % 8) % 2 == 0 { 200 } else { 20 })
+                .collect();
+        }
+        let grouping = group_clips(&[&retake.clip, &hike.clip, &again.clip, &elsewhere.clip]);
         let videos = [
             Path::new("trail-1.mp4"),
             Path::new("black.mp4"),
             Path::new("trail-2.mp4"),
+            Path::new("trail-3.mp4"),
         ];
         print_groups(&videos, &grouping);
         let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
-        assert_eq!(ids, [1, 2, 1]);
+        assert_eq!(ids, [1, 2, 1, 1]);
     }
 
     #[test]
