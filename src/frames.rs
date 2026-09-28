@@ -233,12 +233,16 @@ impl Clip {
             _ => duration_s,
         };
         // The frame budget `on_frame`'s `total` reports: same meaning as before key frames
-        // existed, even though `times` (the candidates to decode) can be denser than that.
+        // existed, even though `times` (the candidates to decode) can be denser than that. `done`
+        // is `i` scaled down proportionally from the candidate loop's range into the budget's,
+        // so it still counts up smoothly to `total` over the (denser) loop instead of jumping.
         let frame_budget = frame_count(duration_s).max(1);
         let candidate_total = times.len().max(1);
         let mut candidates: Vec<(f64, image::RgbImage)> = Vec::new();
         for (i, time_s) in times.into_iter().enumerate() {
-            on_frame(i * frame_budget / candidate_total, frame_budget);
+            let done = i * frame_budget / candidate_total;
+            debug_assert!(done < frame_budget, "{done} of {frame_budget}");
+            on_frame(done, frame_budget);
             if cancel.load(Ordering::Relaxed) {
                 return Ok(None);
             }
@@ -268,7 +272,7 @@ impl Clip {
                 .iter()
                 .map(|(t, image)| (*t, fingerprint(image)))
                 .collect();
-            select_key_frames(&fingerprints, frame_count(duration_s))
+            select_key_frames(&fingerprints, frame_budget)
         } else {
             (0..candidates.len()).collect()
         };
@@ -657,7 +661,8 @@ mod tests {
     /// Below two frames' worth of budget (`frame_count(duration_s) <= 1`), `KeyFrames` takes
     /// `sample_times`'s single midpoint frame directly, the same as `Interval` — there is no
     /// window to choose a frame within — on a real decoded clip, not just the pure-math check in
-    /// `describe::tests`.
+    /// `describe::tests`. Like `a_picture_shorter_than_the_sound_gives_its_frames` above, this
+    /// needs `gst-launch-1.0` to build its fixture and skips (still passing) without it.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_very_short_clip_gets_sample_times_midpoint_frame_with_key_frames_too() {

@@ -9,6 +9,9 @@
 - Library: `Options` has a new field `frame_sampling: FrameSampling` (`KeyFrames` or `Interval`);
   set it to `FrameSampling::KeyFrames` for the new default or `FrameSampling::Interval` to keep
   today's behaviour exactly.
+- Library: `frames::Clip::sample` (`frames` feature) takes a new `sampling: FrameSampling`
+  parameter, right after `duration_s`; pass `FrameSampling::Interval` to keep calling it the way
+  you do today.
 
 # 0.1.0
 ## Added

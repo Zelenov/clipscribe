@@ -67,6 +67,7 @@ impl std::fmt::Debug for Options {
             .field("api_key", &"***")
             .field("model", &self.model.id)
             .field("language", &self.language)
+            .field("frame_sampling", &self.frame_sampling)
             .finish()
     }
 }
@@ -209,7 +210,9 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
         };
-        assert!(!format!("{options:?}").contains("secret"));
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("KeyFrames"), "{debug}");
     }
 
     /// A real request, only when `CLIPSCRIBE_LIVE_API_KEY` is set (never in CI without the
