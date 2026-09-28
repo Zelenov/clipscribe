@@ -39,6 +39,7 @@ pub fn cache_path(folder: &Path, cache_dir: Option<&Path>) -> PathBuf {
 /// modification time, and a hash of a sample of its content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
+    /// The file's length, in bytes.
     pub size: u64,
     /// Nanoseconds since the Unix epoch; 0 when the file system cannot tell (or before 1970).
     pub modified_ns: u64,
@@ -95,6 +96,7 @@ fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
 /// the subtitles). An entry is used only when both match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheKey {
+    /// Which file it is: see [`FileIdentity`].
     pub identity: FileIdentity,
     /// e.g. `model=claude-haiku-4-5 language=en frames=keyframes moments=important tags=none
     /// subtitles=none`.
@@ -159,6 +161,7 @@ pub struct ClipRecord {
     /// The video's path when it was described; only for reading the cache by eye (entries are
     /// found by identity, so a renamed file still finds its own).
     pub file: PathBuf,
+    /// How the cache finds it: the file's identity and the settings it was described with.
     pub key: CacheKey,
     /// The model id it was described with, to price [`DescribedClip::usage`].
     pub model: String,
@@ -182,6 +185,9 @@ pub struct Cache {
 struct State {
     entries: HashMap<FileIdentity, ClipRecord>,
     file: File,
+    /// A write failed part way and the fragment could not be cut off again: the next line starts
+    /// with a newline of its own, so it is not glued to the fragment.
+    torn: bool,
 }
 
 impl Cache {
@@ -249,10 +255,12 @@ impl Cache {
                     .map(|(identity, (_, record))| (identity, record))
                     .collect(),
                 file,
+                torn: false,
             }),
         })
     }
 
+    /// Where the cache file is.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -268,13 +276,26 @@ impl Cache {
     }
 
     /// Add `record`, replacing any earlier entry for the same file: appended as one line and synced
-    /// to disk before this returns.
+    /// to disk before this returns. A write that fails part way (a full disk) is cut off again, so
+    /// the next line is not glued to the fragment and lost with it on the next open.
     pub fn put(&self, record: &ClipRecord) -> std::io::Result<()> {
         let mut line = record_to_json(record).to_string();
         line.push('\n');
         let mut state = self.lock();
-        state.file.write_all(line.as_bytes())?;
-        state.file.sync_data()?;
+        if state.torn {
+            line.insert(0, '\n');
+        }
+        let before = state.file.metadata().map(|m| m.len());
+        let written = state
+            .file
+            .write_all(line.as_bytes())
+            .and_then(|()| state.file.sync_data());
+        if let Err(e) = written {
+            let cut = before.and_then(|len| state.file.set_len(len));
+            state.torn = state.torn || cut.is_err();
+            return Err(e);
+        }
+        state.torn = false;
         state.entries.insert(record.key.identity, record.clone());
         Ok(())
     }
@@ -284,6 +305,7 @@ impl Cache {
         self.lock().entries.len()
     }
 
+    /// Whether the cache has no clips at all.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -685,6 +707,54 @@ mod tests {
         assert_eq!(reopened.get(&third.key), Some(third));
         assert!(!dir.join(format!("{CACHE_FILE_NAME}.tmp")).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write that failed part way and could not be cut off leaves a fragment without a newline:
+    /// the next entry starts on a line of its own, so reopening loses only the fragment, never
+    /// the finished clip written after it.
+    #[test]
+    fn an_entry_after_a_failed_write_is_not_glued_to_its_fragment() {
+        let dir = temp_dir("fragment");
+        let path = dir.join(CACHE_FILE_NAME);
+        let cache = Cache::open(&path).expect("open");
+        let first = record(identity(1), "First.");
+        cache.put(&first).expect("put");
+        // What a write cut short by a full disk leaves, with the cut-off failing too.
+        let fragment = record_to_json(&record(identity(2), "Second.")).to_string();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(&fragment.as_bytes()[..fragment.len() / 2]))
+            .expect("fragment");
+        cache.lock().torn = true;
+        let third = record(identity(3), "Third.");
+        cache.put(&third).expect("put");
+        drop(cache);
+        let reopened = Cache::open(&path).expect("reopen");
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(reopened.get(&first.key), Some(first));
+        assert_eq!(reopened.get(&third.key), Some(third));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write that fails is cut back to where the file ended before it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_write_leaves_the_file_as_it_was() {
+        // /dev/full takes the open and fails every write with ENOSPC, like a full disk.
+        let Ok(file) = std::fs::OpenOptions::new().append(true).open("/dev/full") else {
+            return;
+        };
+        let cache = Cache {
+            path: PathBuf::from("/dev/full"),
+            state: Mutex::new(State {
+                entries: HashMap::new(),
+                file,
+                torn: false,
+            }),
+        };
+        assert!(cache.put(&record(identity(1), "Lost.")).is_err());
+        assert!(cache.is_empty(), "not counted as cached");
     }
 
     #[test]
