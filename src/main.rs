@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, ValueEnum};
 use clipscribe::{
-    describe, describe_with_tags, estimate_tags_usage, estimate_usage, format_time, frames,
-    parse_vocabulary, srt, AiUsage, Described, DescribedWithTags, Error, FrameSampling, Model,
-    MomentsMode, Options, Provider, Stage, SummaryLanguage, Tag, MAX_DURATION_S, MODELS,
+    describe, describe_moment, describe_with_tags, estimate_tags_usage, estimate_usage,
+    format_time, frames, parse_vocabulary, srt, AiUsage, Described, DescribedMoment,
+    DescribedWithTags, Error, FrameSampling, Model, MomentsMode, Options, Provider, Stage,
+    SummaryLanguage, Tag, MAX_DURATION_S, MODELS,
 };
 use serde_json::json;
 
@@ -70,6 +71,32 @@ struct Cli {
     /// Only print what describing the videos would cost; nothing is sent.
     #[arg(long)]
     estimate: bool,
+
+    /// Name and describe the moment at this time (m:ss.f, h:mm:ss.f or plain seconds) in one
+    /// video, instead of describing the whole clip. Fast and cheap: one small request.
+    #[arg(long, value_parser = parse_at, conflicts_with_all = ["tags", "estimate", "frames", "moments"])]
+    at: Option<f64>,
+}
+
+/// A timestamp: `h:mm:ss.f`, `m:ss.f`, or plain seconds, all with the fraction optional.
+fn parse_at(text: &str) -> Result<f64, String> {
+    let parts: Vec<&str> = text.split(':').collect();
+    if parts.len() > 3 || parts.iter().any(|p| p.is_empty()) {
+        return Err(format!(
+            "unusable time {text:?}: use m:ss.f, h:mm:ss.f or seconds"
+        ));
+    }
+    let mut seconds = 0.0;
+    for part in &parts {
+        let value: f64 = part
+            .parse()
+            .map_err(|_| format!("unusable time {text:?}: {part:?} is not a number"))?;
+        if value < 0.0 {
+            return Err(format!("unusable time {text:?}: negative"));
+        }
+        seconds = seconds * 60.0 + value;
+    }
+    Ok(seconds)
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -282,6 +309,10 @@ fn main() -> ExitCode {
         moments: cli.moments.mode(),
     };
 
+    if let Some(at_s) = cli.at {
+        return describe_one_moment(&videos, at_s, &options, cli.no_subtitles, cli.json, model);
+    }
+
     let mut results = Vec::new();
     let mut total = AiUsage::default();
     let mut failed = false;
@@ -376,6 +407,90 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `--at`: name and describe the moment at `at_s` in the one video `--at` requires, instead of
+/// describing a whole clip.
+fn describe_one_moment(
+    videos: &[PathBuf],
+    at_s: f64,
+    options: &Options,
+    no_subtitles: bool,
+    json: bool,
+    model: Model,
+) -> ExitCode {
+    let [video] = videos else {
+        eprintln!("error: --at takes exactly one video, not {}", videos.len());
+        return ExitCode::from(2);
+    };
+    let subtitles = if no_subtitles {
+        Vec::new()
+    } else {
+        srt::load_for(video).unwrap_or_else(|e| {
+            eprintln!("warning: {}: subtitles not read: {e}", video.display());
+            Vec::new()
+        })
+    };
+    match describe_moment(video, at_s, &subtitles, options, &CANCEL) {
+        Ok(described) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&moment_to_json(video, at_s, &described, model))
+                        .unwrap_or_default()
+                );
+            } else {
+                print_moment(video, at_s, &described, model);
+            }
+            eprintln!(
+                "{} in / {} out tokens, about ${:.4} with {}",
+                described.usage.input_tokens,
+                described.usage.output_tokens,
+                model.cost_usd(described.usage),
+                model.label
+            );
+            ExitCode::SUCCESS
+        }
+        Err(Error::Cancelled) => {
+            eprintln!("cancelled: {}", video.display());
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: {}: {e}", video.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_moment(video: &Path, at_s: f64, described: &DescribedMoment, model: Model) {
+    println!(
+        "{}  {} · ${:.4}",
+        video.display(),
+        format_time(at_s),
+        model.cost_usd(described.usage)
+    );
+    println!("  {}", described.moment.name);
+    println!("  {}", described.moment.description);
+}
+
+fn moment_to_json(
+    video: &Path,
+    at_s: f64,
+    described: &DescribedMoment,
+    model: Model,
+) -> serde_json::Value {
+    json!({
+        "file": video.display().to_string(),
+        "at_s": at_s,
+        "name": described.moment.name,
+        "description": described.moment.description,
+        "model": model.id,
+        "usage": {
+            "input_tokens": described.usage.input_tokens,
+            "output_tokens": described.usage.output_tokens,
+        },
+        "cost_usd": model.cost_usd(described.usage),
+    })
 }
 
 /// The videos of `inputs`: files as given, folders as the videos in them, sorted.
@@ -676,6 +791,34 @@ mod tests {
         print_text_with_tags(Path::new("hike.mp4"), &sample(), MODELS[0]);
     }
 
+    fn sample_moment() -> DescribedMoment {
+        DescribedMoment {
+            moment: clipscribe::Moment {
+                name: "Goat crosses path".to_string(),
+                description: "A goat walks in front of the hikers on the trail.".to_string(),
+            },
+            usage: AiUsage {
+                input_tokens: 620,
+                output_tokens: 24,
+            },
+        }
+    }
+
+    /// Printed with `cargo test print_moment -- --nocapture`, for the PR's sample output: no live
+    /// API key is needed since this exercises the CLI's own formatting, not a real answer.
+    #[test]
+    fn print_moment_shows_the_name_and_description() {
+        print_moment(Path::new("hike.mp4"), 83.4, &sample_moment(), MODELS[0]);
+    }
+
+    #[test]
+    fn moment_to_json_carries_the_name_description_and_usage() {
+        let json = moment_to_json(Path::new("hike.mp4"), 83.4, &sample_moment(), MODELS[0]);
+        assert_eq!(json["at_s"], 83.4);
+        assert_eq!(json["name"], "Goat crosses path");
+        assert_eq!(json["usage"]["input_tokens"], 620);
+    }
+
     #[test]
     fn to_json_with_tags_carries_the_tags_and_new_tag_ideas_fields() {
         let json = to_json_with_tags(Path::new("hike.mp4"), &sample(), MODELS[0]);
@@ -711,5 +854,23 @@ mod tests {
         assert!(error.contains("--model haiku"), "{error}");
         assert!(error.contains("Anthropic"), "{error}");
         assert!(error.contains("--provider openai"), "{error}");
+    }
+
+    #[test]
+    fn parse_at_reads_seconds_mmss_and_hhmmss() {
+        assert_eq!(parse_at("5"), Ok(5.0));
+        assert_eq!(parse_at("5.5"), Ok(5.5));
+        assert_eq!(parse_at("1:23.4"), Ok(83.4));
+        assert_eq!(parse_at("1:02:03"), Ok(3723.0));
+    }
+
+    #[test]
+    fn parse_at_rejects_nonsense() {
+        assert!(parse_at("").is_err());
+        assert!(parse_at("abc").is_err());
+        assert!(parse_at("1:2:3:4").is_err());
+        assert!(parse_at("1::3").is_err());
+        assert!(parse_at("-5").is_err());
+        assert!(parse_at("1:-5").is_err());
     }
 }

@@ -78,6 +78,15 @@ already described earlier instead, from its `Description` alone — cheaper, no 
 without the `frames` feature — at the cost of not seeing anything the description itself left
 out. `estimate_tags_usage` prices either.
 
+### One moment
+
+`describe_moment(video, at_s, subtitles, &options, cancel)` names and describes the frame at
+`at_s`, for a marker there, instead of the whole clip: a fast, cheap, single request reading only
+the frame plus a few around it (`MOMENT_WINDOW_S`, 1 s each way) and any subtitle lines that
+overlap that window. Returns a `DescribedMoment { moment: Moment { name, description }, usage }` —
+`moment.name` is a few words, fit for a marker label; `usage` prices with `Model::cost_usd` like
+any other call.
+
 ### Features
 
 | Feature | |

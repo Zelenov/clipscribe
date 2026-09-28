@@ -200,7 +200,7 @@ impl SummaryLanguage {
     }
 
     /// The sentence of the instructions that names the language.
-    fn instruction(self, has_subtitles: bool) -> &'static str {
+    pub(crate) fn instruction(self, has_subtitles: bool) -> &'static str {
         match self {
             Self::SameAsSubtitles if has_subtitles => "Write in the language of the subtitles.",
             Self::SameAsSubtitles | Self::English => "Write in English.",
