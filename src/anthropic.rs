@@ -7,9 +7,9 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::provider::{
-    self, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, Provider, CONNECT_TIMEOUT,
+    self, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, Attempt, Provider,
+    CONNECT_TIMEOUT,
 };
-use provider::Attempt;
 
 /// Kept for anyone already naming `anthropic::RetryPolicy`: the type now lives in
 /// [`crate::provider`], shared with the OpenAI client, since none of it was ever
@@ -204,7 +204,6 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     /// A local HTTP server answering each request with the next canned response, recording
@@ -312,21 +311,6 @@ mod tests {
     }
 
     #[test]
-    fn a_429_waits_without_using_up_a_retry() {
-        let limited = || http("429 Too Many Requests", "retry-after: 0\r\n", "{}");
-        let (result, n) = complete(vec![
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            ok(),
-        ]);
-        assert!(result.is_ok());
-        assert_eq!(n, 6);
-    }
-
-    #[test]
     fn overloaded_is_retried_three_times_then_fails() {
         let overloaded = || {
             http(
@@ -390,14 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn endless_rate_limits_fail_the_file_instead_of_waiting_forever() {
-        let limited = || http("429 Too Many Requests", "retry-after: 0\r\n", "{}");
-        let (result, n) = complete(vec![limited(); 21]);
-        assert!(matches!(result, Err(AiError::Rejected(_))));
-        assert_eq!(n, 21);
-    }
-
-    #[test]
     fn a_429_waits_as_long_as_retry_after_says() {
         let wait = |retry_after| match classify(429, retry_after, "{}", Duration::from_secs(30)) {
             Attempt::RateLimited(wait) => wait,
@@ -443,28 +419,6 @@ mod tests {
         );
         assert!(AiError::Rejected(String::new()).stops_job().is_none());
         assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn a_cancel_during_a_wait_ends_the_request() {
-        let (url, _) = server(vec![http(
-            "429 Too Many Requests",
-            "retry-after: 30\r\n",
-            "{}",
-        )]);
-        let provider = Anthropic::with_endpoint("k".into(), url, fast_retries()).expect("client");
-        let cancel = Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            flag.store(true, Ordering::Relaxed);
-        });
-        let started = std::time::Instant::now();
-        assert_eq!(
-            provider.complete(&request(), &cancel),
-            Err(AiError::Cancelled)
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

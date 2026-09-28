@@ -87,12 +87,18 @@ limiting (no such code, or a `Retry-After` header) to the same `RateLimited` wai
 `RetryPolicy`, `timeout_for` and `CONNECT_TIMEOUT` moved from `anthropic.rs` to `provider.rs`: they
 never had any Anthropic-specific content (delay lengths, an upload-speed allowance, a connect
 timeout), and `openai.rs` needs the exact same shape. `anthropic::RetryPolicy` stays a valid path
-(`pub use crate::provider::RetryPolicy;`) so nothing that already names it breaks. The retry *loop*
-itself (`Attempt`, `wait`, the `complete` loop) is duplicated once, not shared, in each provider
-module: it is small, and the two providers' HTTP status classification differs enough (different
-error-code shapes, different quota signal) that a generic executor would need its classification
-step passed in anyway, buying no real deduplication of behaviour, only of a loop structure that
-sits directly in the reviewable, testable path.
+(`pub use crate::provider::RetryPolicy;`) so nothing that already names it breaks.
+
+The retry *loop* itself started out duplicated once per provider module (`Attempt`, `wait`, the
+`complete` loop) — an early draft's reasoning was that the two providers' HTTP status
+classification differs enough (different error-code shapes, different quota signal) that a
+generic executor would need its classification step passed in anyway, buying no real
+deduplication. Review found that reasoning didn't hold: the loop only ever consumes an already-
+classified `Attempt`, so `provider::retry_loop(&RetryPolicy, provider_label, cancel, impl FnMut()
+-> Attempt)` factors out cleanly, leaving each provider's own `body`, `classify` and
+`parse_message` — the genuinely provider-specific parts — untouched. Both `anthropic::complete`
+and `openai::complete` now call it; only `attempt()` (the actual HTTP round-trip and its status
+classification) stays per provider.
 
 ## CLI
 
@@ -107,10 +113,17 @@ since the variable to read is no longer known at compile time).
 
 ## Testing
 
-`src/openai.rs` mirrors `src/anthropic.rs`'s test shape exactly: the same local-TCP-listener mock
-server, the same body/usage/retry/timeout/cancel cases translated to OpenAI's request and response
-shapes. No network test can run against the real API from this environment (`api.openai.com` is
-blocked here); a live test gated on `OPENAI_API_KEY`, skipped when unset, mirrors
+`src/openai.rs` uses the same local-TCP-listener mock server as `src/anthropic.rs` for what stays
+genuinely per-provider: request body shape, `classify`'s status-code mapping, `parse_message`'s
+answer shape (including OpenAI's own `message.refusal` field, which Anthropic's shape has no
+equivalent of). The generic retry/rate-limit/cancellation mechanics `retry_loop` and `wait`
+implement are tested once, directly, in `provider.rs`, with a fake `Attempt`-returning closure and
+no HTTP at all — review found the first version of this PR testing that mechanism twice, once per
+provider, against a real mock server each time, which is exactly the production-code duplication
+the same round asked to remove, just moved into `#[cfg(test)]`.
+
+No network test can run against the real API from this environment (`api.openai.com` is blocked
+here); a live test gated on `OPENAI_API_KEY`, skipped when unset, mirrors
 `live_description_of_a_test_clip`'s existing pattern for Anthropic — it will only ever run once the
 owner adds `OPENAI_API_KEY` as a CI secret, same as the issue's own text says.
 
@@ -124,7 +137,9 @@ owner adds `OPENAI_API_KEY` as a CI secret, same as the issue's own text says.
   change (nothing else in the crate names a model id directly).
 - The provider lives on `Model`, not as a separate `Options` field — see "Where the provider choice
   lives" above.
-- `RetryPolicy` is shared, the retry loop is not — see "Shared retry/timeout code" above.
+- `RetryPolicy` and the retry loop itself (`provider::retry_loop`) both ended up shared — see
+  "Shared retry/timeout code" above for why the loop wasn't from the start, and why that turned
+  out to be wrong.
 - No OpenAI equivalent of `AiError::LimitReached`'s account-usage-limit text matching: OpenAI's 429
   shape (an error `code`, not a free-text phrase to match) does not carry the same signal, and
   guessing at wording risks a wrong classification more than it helps; unclassified 429s without a

@@ -9,10 +9,9 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::provider::{
-    self, timeout_for, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, Provider,
-    RetryPolicy, CONNECT_TIMEOUT,
+    self, timeout_for, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, Attempt,
+    Provider, RetryPolicy, CONNECT_TIMEOUT,
 };
-use provider::Attempt;
 
 const API_URL: &str = "https://api.openai.com";
 
@@ -210,7 +209,6 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     /// A local HTTP server answering each request with the next canned response, recording
@@ -348,21 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn a_429_waits_without_using_up_a_retry() {
-        let limited = || http("429 Too Many Requests", "retry-after: 0\r\n", "{}");
-        let (result, n) = complete(vec![
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            ok(),
-        ]);
-        assert!(result.is_ok());
-        assert_eq!(n, 6);
-    }
-
-    #[test]
     fn insufficient_quota_stops_the_job_as_out_of_credit() {
         let body = r#"{"error":{"message":"You exceeded your current quota.","code":"insufficient_quota"}}"#;
         let (result, _) = complete(vec![http("429 Too Many Requests", "", body)]);
@@ -413,36 +396,6 @@ mod tests {
         assert_eq!(result, Err(AiError::Timeout));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(*count.lock().expect("lock"), 1, "sent once");
-    }
-
-    #[test]
-    fn endless_rate_limits_fail_the_file_instead_of_waiting_forever() {
-        let limited = || http("429 Too Many Requests", "retry-after: 0\r\n", "{}");
-        let (result, n) = complete(vec![limited(); 21]);
-        assert!(matches!(result, Err(AiError::Rejected(_))));
-        assert_eq!(n, 21);
-    }
-
-    #[test]
-    fn a_cancel_during_a_wait_ends_the_request() {
-        let (url, _) = server(vec![http(
-            "429 Too Many Requests",
-            "retry-after: 30\r\n",
-            "{}",
-        )]);
-        let provider = OpenAi::with_endpoint("k".into(), url, fast_retries()).expect("client");
-        let cancel = Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            flag.store(true, Ordering::Relaxed);
-        });
-        let started = std::time::Instant::now();
-        assert_eq!(
-            provider.complete(&request(), &cancel),
-            Err(AiError::Cancelled)
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

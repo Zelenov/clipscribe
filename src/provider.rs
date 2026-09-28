@@ -134,7 +134,9 @@ pub enum AiError {
     Network(String),
     /// No answer within the request timeout. Not retried: the provider may have billed it.
     Timeout,
-    /// The provider refused the request; its own message.
+    /// The request could not be sent as asked: the provider refused it (its own message), or it
+    /// could not even be built for something only the caller can fix (e.g. a request needing a
+    /// parameter this client has no way to send yet).
     Rejected(String),
     /// The answer could not be read.
     BadAnswer(String),
@@ -241,5 +243,122 @@ pub(crate) fn retry_loop(
                 wait(retry, *delay, cancel)?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    /// `anthropic.rs` and `openai.rs` each classify their own HTTP responses into an [`Attempt`]
+    /// and test that mapping against a real mock server; these tests cover `retry_loop`/`wait`
+    /// themselves, generically, with a fake `attempt` that needs no HTTP at all — the mechanism
+    /// both providers share, tested once instead of twice.
+    fn fast_retries() -> RetryPolicy {
+        RetryPolicy {
+            delays: vec![Duration::from_millis(1); 3],
+            rate_limit_wait: Duration::from_millis(1),
+            step: Duration::from_millis(1),
+            max_rate_limit_waits: 20,
+            answer_timeout: Duration::from_millis(500),
+        }
+    }
+
+    fn ok() -> Attempt {
+        Attempt::Done(Ok(AiResponse {
+            json: serde_json::json!({"ok": true}),
+            stop_reason: "end_turn".to_string(),
+            usage: AiUsage::default(),
+        }))
+    }
+
+    #[test]
+    fn a_done_attempt_is_returned_without_retrying() {
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        let result = retry_loop(&fast_retries(), "Test", &AtomicBool::new(false), || {
+            *seen.lock().expect("lock") += 1;
+            Attempt::Done(Err(AiError::Timeout))
+        });
+        assert_eq!(result, Err(AiError::Timeout));
+        assert_eq!(*calls.lock().expect("lock"), 1, "not retried");
+    }
+
+    #[test]
+    fn rate_limits_wait_without_spending_a_retry() {
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        // More rate-limited attempts than `delays` has entries: if a rate limit consumed a
+        // retry, this would fail with `Network` before ever reaching `ok()`.
+        let result = retry_loop(
+            &fast_retries(),
+            "Test",
+            &AtomicBool::new(false),
+            move || {
+                let mut n = seen.lock().expect("lock");
+                *n += 1;
+                if *n <= 5 {
+                    Attempt::RateLimited(Duration::from_millis(1))
+                } else {
+                    ok()
+                }
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*calls.lock().expect("lock"), 6);
+    }
+
+    #[test]
+    fn retries_are_exhausted_then_fails_with_the_last_reason() {
+        let result = retry_loop(&fast_retries(), "Test", &AtomicBool::new(false), || {
+            Attempt::Retry("still failing".to_string())
+        });
+        assert_eq!(result, Err(AiError::Network("still failing".to_string())));
+    }
+
+    #[test]
+    fn endless_rate_limits_fail_instead_of_waiting_forever() {
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        let result = retry_loop(
+            &fast_retries(),
+            "Test",
+            &AtomicBool::new(false),
+            move || {
+                *seen.lock().expect("lock") += 1;
+                Attempt::RateLimited(Duration::from_millis(1))
+            },
+        );
+        assert!(
+            matches!(&result, Err(AiError::Rejected(m)) if m.contains("Test")),
+            "{result:?}"
+        );
+        assert_eq!(
+            *calls.lock().expect("lock"),
+            21,
+            "20 waits, then it gives up"
+        );
+    }
+
+    #[test]
+    fn a_cancel_during_a_wait_ends_the_request() {
+        let policy = RetryPolicy {
+            rate_limit_wait: Duration::from_secs(30),
+            ..fast_retries()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let result = retry_loop(&policy, "Test", &cancel, || {
+            Attempt::RateLimited(Duration::from_secs(30))
+        });
+        assert_eq!(result, Err(AiError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
