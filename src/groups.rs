@@ -36,14 +36,94 @@ const STEM_LETTERS: usize = 4;
 const LABEL_COVERAGE: f64 = 0.5;
 
 /// Words that say nothing about what a clip shows: English function words of four letters or more
-/// (shorter words are dropped in every language), and words about the footage itself.
-const STOP_WORDS: [&str; 52] = [
-    "about", "above", "across", "after", "against", "along", "also", "among", "around", "before",
-    "behind", "being", "below", "beneath", "beside", "between", "both", "during", "each", "from",
-    "have", "into", "just", "near", "onto", "other", "over", "some", "that", "their", "them",
-    "then", "there", "these", "they", "this", "through", "toward", "towards", "under", "very",
-    "where", "which", "while", "with", "camera", "clip", "footage", "frame", "scene", "shot",
+/// (shorter words are dropped in every language), and English words about the footage itself —
+/// how it was framed or filmed rather than what it shows. Best effort, not complete: the model
+/// has more ways to say "close view" than any list. Matched against the whole word, and against
+/// the word without a final "s" ("clips", "views"), never against its four-letter stem (which
+/// would drop "football" with "footage").
+const STOP_WORDS: &[&str] = &[
+    // Function words.
+    "about",
+    "above",
+    "across",
+    "after",
+    "against",
+    "along",
+    "also",
+    "among",
+    "around",
+    "before",
+    "behind",
+    "being",
+    "below",
+    "beneath",
+    "beside",
+    "between",
+    "both",
+    "during",
+    "each",
+    "from",
+    "have",
+    "into",
+    "just",
+    "near",
+    "onto",
+    "other",
+    "over",
+    "some",
+    "that",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "through",
+    "toward",
+    "towards",
+    "under",
+    "very",
+    "where",
+    "which",
+    "while",
+    "with",
+    // The footage itself: what filmed it, how it is framed, how it is seen.
+    "aerial",
+    "angle",
+    "background",
+    "camera",
+    "captured",
+    "clip",
+    "close",
+    "closer",
+    "closeup",
+    "filmed",
+    "footage",
+    "foreground",
+    "frame",
+    "framed",
+    "framing",
+    "lapse",
+    "overhead",
+    "panning",
+    "scene",
+    "seen",
+    "shot",
+    "show",
+    "shown",
+    "showing",
+    "time",
+    "timelapse",
     "video",
+    "view",
+    "viewed",
+    "visible",
+    "wide",
+    "wider",
+    "zoom",
+    "zoomed",
+    "zooming",
 ];
 
 /// Similar footage: groups, and which group each clip, stretch and segment belongs to.
@@ -110,83 +190,75 @@ pub struct Stretch {
 ///   sideways, a camera that did not move (any two stretches, in the same clip or not); or
 /// - they are in different clips and their descriptions share at least a quarter of their words
 ///   (the segments falling in the stretch, and the clip's summary when the stretch is the whole
-///   clip or no segment falls in it; common words dropped, each word cut to its first four
-///   letters) — the same subject or activity, even after the camera moved or zoomed.
+///   clip or no segment falls in it; common words and words about the framing dropped, each word
+///   cut to its first four letters) — the same subject or activity, even after the camera moved
+///   or zoomed.
 ///
-/// Groups are what those links connect. A stretch whose frames are all blank (black, a flat wall)
-/// is a group of its own. The word signal only sees what the descriptions say: two clips of the
-/// same place doing different things can share enough words to be joined, and two of the same
-/// thing described in different words are not. A group is labelled with the description of its
-/// most typical stretch; no request is made. Deterministic: the same clips always give the same
-/// groups and ids.
+/// Groups are what those links connect, with one rule: words never put two stretches of one clip
+/// in the same group, not even through other clips (stretches of one clip often carry the same
+/// summary, so every clip described like it would otherwise glue them together). Only their
+/// pictures can: a cut back to the same shot. A link by words that would bring two stretches of
+/// one clip together is skipped; the links by words are taken in input order, so which stretch
+/// of a clip joins a group like that is the first one. A stretch whose frames are all blank
+/// (black, a flat wall) is a group of its own.
+///
+/// The word signal only sees what the descriptions say, and it has false positives: clips of the
+/// same place or person doing different things, and sometimes unrelated clips described in
+/// similar everyday words ("a woman in a bright kitchen", "a woman in a bright office"), share
+/// enough words to be joined; two of the same thing described in different words are not. Groups
+/// are connected sets, so on a large folder from one shoot these links can chain several groups
+/// into one: check groups before relying on them. A group is labelled with the description of its
+/// most typical stretch; no request is made. Deterministic: the same clips in the same order
+/// always give the same groups and ids.
 pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
-    struct Piece {
-        clip: usize,
-        start_s: f64,
-        end_s: f64,
-        signature: Option<Vec<f64>>,
-        /// The stretch's words, as ids into `vocabulary`, sorted; empty when too few to compare.
-        words: Vec<usize>,
-    }
     let mut vocabulary: HashMap<String, usize> = HashMap::new();
     let mut pieces: Vec<Piece> = Vec::new();
     for (clip, described) in clips.iter().enumerate() {
         let stretches = stretches_of(described);
         let texts = stretch_texts(described, &stretches);
         for ((start_s, end_s, signature), text) in stretches.into_iter().zip(texts) {
-            let words: BTreeSet<usize> = text
-                .into_iter()
-                .map(|word| {
-                    let next = vocabulary.len();
-                    *vocabulary.entry(word).or_insert(next)
-                })
-                .collect();
-            let words = if words.len() >= MIN_WORDS {
-                words.into_iter().collect()
-            } else {
-                Vec::new()
-            };
             pieces.push(Piece {
                 clip,
                 start_s,
                 end_s,
-                signature,
-                words,
+                turns: signature.map(Turns::new),
+                words: word_ids(text, &mut vocabulary),
             });
         }
     }
-    // How far apart two stretches are, 0.0 up, below 1.0 when they belong together: each signal's
-    // distance over its threshold, the closer of the two. `None` when one of them is blank.
-    let link = |a: &Piece, b: &Piece| -> Option<f64> {
-        let (Some(a_sig), Some(b_sig)) = (&a.signature, &b.signature) else {
-            return None;
-        };
-        let picture = scene_distance(a_sig, b_sig) / SAME_SHOT;
-        let text = if a.clip == b.clip || a.words.is_empty() || b.words.is_empty() {
-            f64::INFINITY
-        } else {
-            // At the threshold exactly this is 1.0, which still joins: see `joined`.
-            (1.0 - jaccard(&a.words, &b.words)) / (1.0 - SAME_TEXT)
-        };
-        Some(picture.min(text))
-    };
-    let joined = |a: &Piece, b: &Piece| -> bool {
-        let Some((a_sig, b_sig)) = a.signature.as_ref().zip(b.signature.as_ref()) else {
-            return false;
-        };
-        scene_distance(a_sig, b_sig) < SAME_SHOT
-            || (a.clip != b.clip
-                && !a.words.is_empty()
-                && !b.words.is_empty()
-                && jaccard(&a.words, &b.words) >= SAME_TEXT)
-    };
 
+    // Pictures first: they may join any two stretches, of one clip or not.
     let mut sets = DisjointSets::new(pieces.len());
     for (i, a) in pieces.iter().enumerate() {
         for (j, b) in pieces.iter().enumerate().skip(i + 1) {
-            if joined(a, b) {
+            if same_shot(a, b) {
                 sets.union(i, j);
             }
+        }
+    }
+    // Then words, only between groups with no clip in common: so no stretch of a clip can reach
+    // another stretch of it through a link by words, directly or through other clips. (When two
+    // stretches of one clip end up in one group, the group held both before any link by words was
+    // made, so pictures alone joined them.)
+    let mut clips_in: Vec<BTreeSet<usize>> =
+        pieces.iter().map(|p| BTreeSet::from([p.clip])).collect();
+    for i in 0..pieces.len() {
+        let root = sets.find(i);
+        if root != i {
+            merge_into(&mut clips_in, root, i);
+        }
+    }
+    for (i, a) in pieces.iter().enumerate() {
+        for (j, b) in pieces.iter().enumerate().skip(i + 1) {
+            if !same_words(a, b) {
+                continue;
+            }
+            let (ra, rb) = (sets.find(i), sets.find(j));
+            if ra == rb || !clips_in[ra].is_disjoint(&clips_in[rb]) {
+                continue;
+            }
+            let (root, other) = sets.union(ra, rb);
+            merge_into(&mut clips_in, root, other);
         }
     }
 
@@ -217,7 +289,7 @@ pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
                     let total: f64 = members
                         .iter()
                         .filter(|&&j| j != i)
-                        .map(|&j| link(&pieces[i], &pieces[j]).unwrap_or(0.0))
+                        .map(|&j| link_distance(&pieces[i], &pieces[j]).unwrap_or(0.0))
                         .sum();
                     (i, total)
                 })
@@ -274,6 +346,82 @@ pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
     Grouping { groups, clips }
 }
 
+/// One stretch of one clip, as [`group_clips`] compares it.
+struct Piece {
+    /// Its clip's index in the slice given to [`group_clips`].
+    clip: usize,
+    start_s: f64,
+    end_s: f64,
+    /// Its picture; `None` when every frame of it is blank.
+    turns: Option<Turns>,
+    /// Its words, as sorted ids (see [`word_ids`]); empty when too few to compare.
+    words: Vec<usize>,
+}
+
+/// The picture signal between two stretches ([`shot_distance`]); `None` when either is blank.
+/// With [`word_signal`], the only place that says which stretches a signal may compare:
+/// [`same_shot`], [`same_words`] and [`link_distance`] only weigh the results.
+fn picture_signal(a: &Piece, b: &Piece) -> Option<f64> {
+    Some(shot_distance(a.turns.as_ref()?, b.turns.as_ref()?))
+}
+
+/// The word signal between two stretches (the [`jaccard`] index of their words); `None` when
+/// either is blank (its words would gather every black leader into one group), both are of one
+/// clip (see [`group_clips`] for through other clips), or either has too few words.
+fn word_signal(a: &Piece, b: &Piece) -> Option<f64> {
+    let comparable = a.turns.is_some()
+        && b.turns.is_some()
+        && a.clip != b.clip
+        && !a.words.is_empty()
+        && !b.words.is_empty();
+    comparable.then(|| jaccard(&a.words, &b.words))
+}
+
+/// Whether two stretches are the same shot (see [`SAME_SHOT`]).
+fn same_shot(a: &Piece, b: &Piece) -> bool {
+    picture_signal(a, b).is_some_and(|d| d < SAME_SHOT)
+}
+
+/// Whether two stretches are described in the same words (see [`SAME_TEXT`]).
+fn same_words(a: &Piece, b: &Piece) -> bool {
+    word_signal(a, b).is_some_and(|w| w >= SAME_TEXT)
+}
+
+/// How far apart two stretches are, for picking a group's most typical one: each signal's
+/// distance over its threshold (1.0 at the threshold), the closer of the two; `None` when one of
+/// them is blank.
+fn link_distance(a: &Piece, b: &Piece) -> Option<f64> {
+    let picture = picture_signal(a, b)? / SAME_SHOT;
+    let words = word_signal(a, b).map_or(f64::INFINITY, |w| (1.0 - w) / (1.0 - SAME_TEXT));
+    Some(picture.min(words))
+}
+
+/// Moves the clips of group `from` into group `into`'s (the larger set taking the smaller).
+fn merge_into(clips_in: &mut [BTreeSet<usize>], into: usize, from: usize) {
+    let mut moved = std::mem::take(&mut clips_in[from]);
+    if moved.len() > clips_in[into].len() {
+        std::mem::swap(&mut moved, &mut clips_in[into]);
+    }
+    clips_in[into].extend(moved);
+}
+
+/// `words` as a sorted set of ids into `vocabulary` (new words added to it); empty when there are
+/// fewer than [`MIN_WORDS`] distinct ones, too few to compare.
+fn word_ids(words: Vec<String>, vocabulary: &mut HashMap<String, usize>) -> Vec<usize> {
+    let set: BTreeSet<usize> = words
+        .into_iter()
+        .map(|word| {
+            let next = vocabulary.len();
+            *vocabulary.entry(word).or_insert(next)
+        })
+        .collect();
+    if set.len() >= MIN_WORDS {
+        set.into_iter().collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// The index of the span of `spans` overlapping `start_s..end_s` most (the first on a tie), if any
 /// overlaps it at all.
 fn most_overlapping(
@@ -318,12 +466,20 @@ fn stretch_texts(
 
 /// The words of `text` that say what it shows, for comparing descriptions: lower-cased, split at
 /// anything that is not a letter or a digit, words shorter than four letters and [`STOP_WORDS`]
-/// dropped, each cut to its first [`STEM_LETTERS`] letters. Works the same in every language the
-/// descriptions come in, except that only English has stop words beyond the length rule.
+/// (with or without a final "s") dropped, each cut to its first [`STEM_LETTERS`] letters. Works
+/// the same in every language the descriptions come in, except that only English has stop words
+/// beyond the length rule. The length rule drops short content words too ("dog", "car", "sea",
+/// "red"): they never count.
 fn words(text: &str) -> Vec<String> {
+    let stop = |word: &str| {
+        STOP_WORDS.contains(&word)
+            || word
+                .strip_suffix('s')
+                .is_some_and(|w| STOP_WORDS.contains(&w))
+    };
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| word.chars().count() >= 4 && !STOP_WORDS.contains(word))
+        .filter(|word| word.chars().count() >= 4 && !stop(word))
         .map(|word| word.chars().take(STEM_LETTERS).collect())
         .collect()
 }
@@ -355,37 +511,28 @@ fn jaccard(a: &[usize], b: &[usize]) -> f64 {
 #[cfg(test)]
 pub(crate) fn text_similarity(a: &str, b: &str) -> f64 {
     let mut vocabulary: HashMap<String, usize> = HashMap::new();
-    let mut ids = |text: &str| -> Vec<usize> {
-        let set: BTreeSet<usize> = words(text)
-            .into_iter()
-            .map(|word| {
-                let next = vocabulary.len();
-                *vocabulary.entry(word).or_insert(next)
-            })
-            .collect();
-        set.into_iter().collect()
-    };
-    let (a, b) = (ids(a), ids(b));
-    if a.len() < MIN_WORDS || b.len() < MIN_WORDS {
+    let a = word_ids(words(a), &mut vocabulary);
+    let b = word_ids(words(b), &mut vocabulary);
+    if a.is_empty() || b.is_empty() {
         return 0.0;
     }
     jaccard(&a, &b)
 }
 
-/// The distance [`group_clips`] would join `a` and `b` by: the smallest [`scene_distance`] between
-/// a stretch of one and a stretch of the other (`None` when either has no stretch with a
-/// signature). For measuring the thresholds on real clips.
+/// The picture signal between `a` and `b` (the words are not looked at): the smallest
+/// [`shot_distance`] between a stretch of one and a stretch of the other (`None` when either has
+/// no stretch with a signature). For measuring [`SAME_SHOT`] on real clips.
 #[cfg(test)]
 pub(crate) fn clip_distance(a: &DescribedClip, b: &DescribedClip) -> Option<f64> {
-    let signatures = |clip: &DescribedClip| -> Vec<Vec<f64>> {
+    let signatures = |clip: &DescribedClip| -> Vec<Turns> {
         stretches_of(clip)
             .into_iter()
-            .filter_map(|(_, _, signature)| signature)
+            .filter_map(|(_, _, signature)| signature.map(Turns::new))
             .collect()
     };
     let (a, b) = (signatures(a), signatures(b));
     a.iter()
-        .flat_map(|x| b.iter().map(move |y| scene_distance(x, y)))
+        .flat_map(|x| b.iter().map(move |y| shot_distance(x, y)))
         .min_by(f64::total_cmp)
 }
 
@@ -521,21 +668,43 @@ fn correlation(a: &[f64], b: &[f64]) -> f64 {
     if a.is_empty() || a.len() != b.len() {
         return 0.0;
     }
-    a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>() / a.len() as f64
+    // Four running sums rather than one, so the compiler can overlap the additions: this runs
+    // four times for every pair of stretches.
+    let mut sums = [0.0; 4];
+    let ((a_quads, a_rest), (b_quads, b_rest)) = (a.as_chunks::<4>(), b.as_chunks::<4>());
+    let tail: f64 = a_rest.iter().zip(b_rest).map(|(x, y)| x * y).sum();
+    for (x, y) in a_quads.iter().zip(b_quads) {
+        for k in 0..4 {
+            sums[k] += x[k] * y[k];
+        }
+    }
+    (sums.iter().sum::<f64>() + tail) / a.len() as f64
+}
+
+/// A stretch signature and its three 90° turns (just the signature when the grid is not square),
+/// made once per stretch so that comparing two stretches allocates nothing.
+struct Turns(Vec<Vec<f64>>);
+
+impl Turns {
+    fn new(signature: Vec<f64>) -> Self {
+        let mut turns = vec![signature];
+        if let Some(side) = square_side(turns[0].len()) {
+            for _ in 0..3 {
+                let next = rotate(&turns[turns.len() - 1], side);
+                turns.push(next);
+            }
+        }
+        Self(turns)
+    }
 }
 
 /// `1 − r` between two standardised grids, the smallest over the four 90° rotations of `b` (when
 /// the grid is square): 0.0 for the same layout of light and dark, up to 2.0 for its negative.
-fn scene_distance(a: &[f64], b: &[f64]) -> f64 {
-    let mut best = 1.0 - correlation(a, b);
-    if let Some(side) = square_side(b.len()) {
-        let mut turned = b.to_vec();
-        for _ in 0..3 {
-            turned = rotate(&turned, side);
-            best = best.min(1.0 - correlation(a, &turned));
-        }
-    }
-    best
+/// Compared with [`SAME_SHOT`].
+fn shot_distance(a: &Turns, b: &Turns) -> f64 {
+    b.0.iter()
+        .map(|turned| 1.0 - correlation(&a.0[0], turned))
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// The side of a square grid of `len` cells, if it is one.
@@ -581,10 +750,12 @@ impl DisjointSets {
     }
 
     /// Joins the sets of `a` and `b`, the smaller root becoming the root, so roots stay stable.
-    fn union(&mut self, a: usize, b: usize) {
+    /// Returns the root kept and the root joined to it.
+    fn union(&mut self, a: usize, b: usize) -> (usize, usize) {
         let (a, b) = (self.find(a), self.find(b));
         let (low, high) = (a.min(b), a.max(b));
         self.parent[high] = low;
+        (low, high)
     }
 }
 
@@ -761,7 +932,7 @@ mod tests {
     /// two), for measuring the word signal: written for this test, not model output (no live
     /// requests are made in the tests). Letters name a subject; `a`/`b` are the same subject or
     /// activity filmed from another position or zoom, as a re-shoot would be.
-    const DESCRIPTIONS: [(&str, &str); 19] = [
+    const DESCRIPTIONS: &[(&str, &str)] = &[
         ("hike a", "A hiker in a red jacket walks along a rocky ridge at sunset, with mountains in the distance."),
         ("hike b", "Close view of a hiker in a red jacket crossing a rocky ridge as the sun goes down."),
         ("tent a", "Two people pitch a green tent in a grassy clearing beside a lake. They spread the tent out on the grass. The poles go in and the tent stands up."),
@@ -782,6 +953,25 @@ mod tests {
         ("dog", "A dog runs along the sandy beach chasing a ball."),
         ("street", "A car drives down a city street at night, its headlights on."),
         ("football", "Children play football in a school yard."),
+        // A review's counterexample: three subjects of one hike that used to be joined on their
+        // framing ("close view", "wide view") rather than on what they show.
+        ("boots", "Close view of hiking boots on a winding dirt trail."),
+        ("valley", "Wide view of the mountain valley with a river winding through it."),
+        ("flowers", "A close view of wildflowers swaying in the wind beside the path."),
+    ];
+
+    /// Different things described in the same everyday words, as one-sentence summaries often
+    /// are: what the word signal cannot tell apart. Printed, not asserted either way — they are
+    /// here so the table shows the risk next to the favourable cases.
+    const SAME_WORDS_OTHER_THINGS: &[(&str, &str)] = &[
+        (
+            "A woman chops vegetables in a bright kitchen.",
+            "A woman types on a laptop in a bright office.",
+        ),
+        (
+            "A family walks along a sandy beach at sunset.",
+            "A family walks along a forest trail in the afternoon.",
+        ),
     ];
 
     /// Pairs of [`DESCRIPTIONS`] that show the same place with something else happening: what
@@ -834,6 +1024,11 @@ mod tests {
         for (s, a, b) in different.iter().take(6) {
             eprintln!("  {a:<9} {b:<9} {s:.2} {}", joined(*s));
         }
+        eprintln!("different things in the same everyday words (not asserted):");
+        for (a, b) in SAME_WORDS_OTHER_THINGS {
+            let s = text_similarity(a, b);
+            eprintln!("  {s:.2} {:<6} {a} / {b}", joined(s));
+        }
         for (s, a, b) in &same {
             assert!(*s >= SAME_TEXT, "{a} / {b}: {s}");
         }
@@ -849,6 +1044,16 @@ mod tests {
             ["foll", "hike", "goat"]
         );
         assert_eq!(words("Козы пасутся на склоне"), ["козы", "пасу", "скло"]);
+        assert_eq!(
+            words("Close views of goats, seen in two clips, wide shots, time-lapse background."),
+            ["goat"],
+            "framing words and their plurals"
+        );
+        assert_eq!(
+            words("Footage of football."),
+            ["foot"],
+            "not dropped by stem"
+        );
         assert_eq!(text_similarity("A goat.", "A goat."), 0.0, "too few words");
     }
 
@@ -894,20 +1099,114 @@ mod tests {
         assert_ne!(stretches[0].group, stretches[1].group);
     }
 
+    /// A clip cut into stretches that all carry its summary (no segment covers them), and another
+    /// clip described in the same words: the other clip may join one of them, never glue them
+    /// together. The same for two segments of one clip each described like a third clip. Pictures
+    /// still join stretches of one clip: a cut back to the same shot.
+    #[test]
+    fn words_never_join_two_stretches_of_one_clip_even_through_another_clip() {
+        let text = "A hiker in a red jacket walks along a rocky ridge at sunset.";
+        let checkers: Vec<u8> = (0..64)
+            .map(|i| if (i / 8 + i % 8) % 2 == 0 { 200 } else { 20 })
+            .collect();
+        let cut = clip(
+            text,
+            8.0,
+            vec![
+                (0.0, scene(1, 1, 20)),
+                (2.0, scene(1, 1, 20)),
+                (6.0, ramp()),
+            ],
+        );
+        let alone = group_clips(&[&cut]);
+        assert_eq!(
+            alone.clips[0]
+                .stretches
+                .iter()
+                .map(|s| s.group)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        // Another picture, described like the first clip's summary.
+        let other = clip(text, 4.0, vec![(0.0, checkers.clone())]);
+        let grouping = group_clips(&[&cut, &other]);
+        let stretches: Vec<usize> = grouping.clips[0]
+            .stretches
+            .iter()
+            .map(|s| s.group)
+            .collect();
+        assert_eq!(stretches.len(), 2);
+        assert_ne!(stretches[0], stretches[1], "{grouping:?}");
+        assert_eq!(
+            grouping.clips[1].group, stretches[0],
+            "the other clip joins the first stretch"
+        );
+
+        // Two segments, one per stretch, each described like a third clip.
+        let segmented = DescribedClip {
+            description: Description {
+                summary: "A walk in the hills.".to_string(),
+                segments: vec![
+                    Segment {
+                        start_s: 0.0,
+                        end_s: 3.0,
+                        description: text.to_string(),
+                    },
+                    Segment {
+                        start_s: 5.0,
+                        end_s: 8.0,
+                        description: "The hiker in the red jacket walks on along the rocky ridge."
+                            .to_string(),
+                    },
+                ],
+            },
+            ..cut.clone()
+        };
+        let grouping = group_clips(&[&other, &segmented]);
+        let stretches: Vec<usize> = grouping.clips[1]
+            .stretches
+            .iter()
+            .map(|s| s.group)
+            .collect();
+        assert_eq!(stretches.len(), 2);
+        assert_ne!(stretches[0], stretches[1], "{grouping:?}");
+
+        // A cut away and back to the same shot: its pictures join the first and last stretch.
+        let back = clip(
+            text,
+            12.0,
+            vec![
+                (0.0, scene(1, 1, 20)),
+                (5.0, ramp()),
+                (10.0, scene(1, 1, 22)),
+            ],
+        );
+        let grouping = group_clips(&[&back, &other]);
+        let stretches: Vec<usize> = grouping.clips[0]
+            .stretches
+            .iter()
+            .map(|s| s.group)
+            .collect();
+        assert_eq!(stretches.len(), 3, "{grouping:?}");
+        assert_eq!(stretches[0], stretches[2]);
+        assert_ne!(stretches[0], stretches[1]);
+    }
+
     #[test]
     fn rotation_is_exact_on_the_grid_and_distances_are_bounded() {
         let values: Vec<f64> = (0..64).map(f64::from).collect();
         let four = (0..4).fold(values.clone(), |g, _| rotate(&g, 8));
         assert_eq!(four, values, "four quarter turns are the identity");
         let a = normalise(&scene(1, 1, 20)).expect("structure");
-        assert!(scene_distance(&a, &a).abs() < 1e-9);
+        let a_turns = Turns::new(a.clone());
+        assert!(shot_distance(&a_turns, &a_turns).abs() < 1e-9);
         let negative: Vec<f64> = a.iter().map(|v| -v).collect();
         assert!(
             (1.0 - correlation(&a, &negative) - 2.0).abs() < 1e-9,
             "the negative: 2.0"
         );
-        let other = normalise(&ramp()).expect("structure");
-        let d = scene_distance(&a, &other);
+        let other = Turns::new(normalise(&ramp()).expect("structure"));
+        let d = shot_distance(&a_turns, &other);
         assert!((SAME_SHOT..=2.0).contains(&d), "{d}");
         assert!(normalise(&[7; 64]).is_none(), "flat is blank");
     }
