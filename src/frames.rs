@@ -288,6 +288,51 @@ impl Clip {
             .collect::<Result<Vec<Frame>, String>>()
             .map(Some)
     }
+
+    /// The frame at `at_s`, plus one on each side `window_s` away — for [`describe_moment`],
+    /// never more than three frames, so always exact seeks: nothing like `sample`'s care to keep
+    /// a whole clip's worth of seeks cheap is needed here. `at_s` and the window are clamped to
+    /// the clip's own duration, so a caller need not know it. `Ok(None)` when `cancel` is set
+    /// between two frames.
+    ///
+    /// [`describe_moment`]: crate::describe_moment
+    pub fn sample_moment(
+        &self,
+        at_s: f64,
+        window_s: f64,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<Frame>>, String> {
+        let duration_s = self.duration_s().unwrap_or(at_s).max(0.0);
+        let at_s = at_s.clamp(0.0, duration_s);
+        let window_s = window_s.max(0.0);
+        let mut times = vec![
+            (at_s - window_s).max(0.0),
+            at_s,
+            (at_s + window_s).min(duration_s),
+        ];
+        times.sort_by(f64::total_cmp);
+        times.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+        let orientation = self.orientation();
+        let mut frames = Vec::with_capacity(times.len());
+        for time_s in times {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let (pts, image) = match self.frame_at(time_s, gst::SeekFlags::ACCURATE) {
+                Ok(frame) => frame,
+                // A seek right at the clip's own duration can land past the last decodable
+                // frame; skip it once at least one frame (closer to `at_s`) is already in hand,
+                // the same tolerance `sample` gives a whole clip's last window.
+                Err(_) if !frames.is_empty() => continue,
+                Err(e) => return Err(e),
+            };
+            frames.push(Frame {
+                time_s: pts,
+                jpeg: to_jpeg(orient(image, orientation.as_deref()))?,
+            });
+        }
+        Ok(Some(frames))
+    }
 }
 
 /// A small grid of average luma values (Rec. 601 weights), cheap to compare between frames: how
@@ -533,6 +578,79 @@ mod tests {
                     path.display()
                 );
             }
+        }
+    }
+
+    /// `sample_moment` on a real clip: one frame per requested time, in order, clamped to the
+    /// clip's own duration, and never more than the three times asked for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sample_moment_reads_a_frame_around_a_real_time() {
+        for path in ci_clips() {
+            let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+            let duration = clip.duration_s().expect("duration");
+            let at = duration / 2.0;
+            let frames = clip
+                .sample_moment(at, 1.0, &AtomicBool::new(false))
+                .expect("frames")
+                .expect("not cancelled");
+            assert!(!frames.is_empty(), "{}", path.display());
+            assert!(frames.len() <= 3, "{}: {}", path.display(), frames.len());
+            assert!(
+                frames.windows(2).all(|w| w[0].time_s <= w[1].time_s),
+                "{}: not in order",
+                path.display()
+            );
+            for frame in &frames {
+                assert!(
+                    frame.time_s >= 0.0 && frame.time_s <= duration + 1e-3,
+                    "{}: {} outside 0..={duration}",
+                    path.display(),
+                    frame.time_s
+                );
+                assert!(!frame.jpeg.is_empty(), "{}", path.display());
+            }
+        }
+    }
+
+    /// A time past the end, or a window reaching below zero, is clamped rather than failing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sample_moment_clamps_a_time_and_window_outside_the_clip() {
+        let path = ci_clips().into_iter().next().expect("at least one clip");
+        let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+        let duration = clip.duration_s().expect("duration");
+        let past_the_end = clip
+            .sample_moment(duration + 100.0, 1.0, &AtomicBool::new(false))
+            .expect("frames")
+            .expect("not cancelled");
+        assert!(!past_the_end.is_empty());
+        assert!(past_the_end.iter().all(|f| f.time_s <= duration + 1e-3));
+
+        let near_zero = clip
+            .sample_moment(0.0, 1.0, &AtomicBool::new(false))
+            .expect("frames")
+            .expect("not cancelled");
+        assert!(!near_zero.is_empty());
+        assert!(near_zero.iter().all(|f| f.time_s >= 0.0));
+    }
+
+    /// A negative `window_s` (never produced by the CLI or the library's own default, but not
+    /// ruled out by the type) clamps to zero instead of reading nonsensical times.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sample_moment_clamps_a_negative_window_to_zero() {
+        let path = ci_clips().into_iter().next().expect("at least one clip");
+        let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+        let duration = clip.duration_s().expect("duration");
+        let at = duration / 2.0;
+        let frames = clip
+            .sample_moment(at, -5.0, &AtomicBool::new(false))
+            .expect("frames")
+            .expect("not cancelled");
+        assert!(!frames.is_empty());
+        for frame in &frames {
+            assert!((frame.time_s - at).abs() < 1e-2, "{}", frame.time_s);
         }
     }
 

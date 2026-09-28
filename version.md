@@ -1,3 +1,12 @@
+# 0.6.0
+## Added
+- `describe_moment(video, at_s, window_s, subtitles, &options, cancel)`: a name and a
+  one-to-two sentence description for the frame at a given time, for a marker — one small, fast
+  request instead of describing the whole clip. `window_s` (`MOMENT_WINDOW_S`, 1 s, is a
+  reasonable default) is how far each way to read frames and subtitles from. `--at m:ss.f` (also
+  `h:mm:ss.f` or plain seconds) runs it from the command line, on exactly one video, text or
+  `--json`; `--window` overrides the default window.
+
 # 0.5.0
 ## Added
 - ChatGPT (OpenAI) as a second provider: `--provider anthropic|openai` (default `anthropic`)

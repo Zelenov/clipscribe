@@ -34,6 +34,7 @@ pub mod anthropic;
 mod describe;
 #[cfg(feature = "frames")]
 pub mod frames;
+mod moment;
 pub mod openai;
 pub mod provider;
 pub mod srt;
@@ -42,6 +43,7 @@ mod tags;
 use std::time::Duration;
 
 pub use describe::*;
+pub use moment::*;
 pub use provider::{AiError, AiProvider, AiUsage, Provider};
 pub use tags::*;
 
@@ -298,6 +300,60 @@ pub fn suggest_tags(
     })?;
     parse_tags_only_answer(&response, vocabulary, duration_s).map_err(|reason| Error::BadAnswer {
         reason,
+        usage: response.usage,
+    })
+}
+
+/// A named, described moment of a clip: see [`describe_moment`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribedMoment {
+    pub moment: Moment,
+    /// What the request was billed for; see [`Model::cost_usd`].
+    pub usage: AiUsage,
+}
+
+/// Name and describe the frame at `at_s` in `video`, for a marker there, instead of describing
+/// the whole clip ([`describe`]): reads the frame plus `window_s` on each side of it
+/// ([`frames::Clip::sample_moment`]) and any subtitle lines that overlap that same window, and
+/// asks for a short name and a one-to-two sentence description in one small, fast request.
+/// [`MOMENT_WINDOW_S`] is a reasonable default for `window_s`. `cancel` is checked between
+/// frames and while waiting for the answer.
+#[cfg(feature = "frames")]
+pub fn describe_moment(
+    video: &std::path::Path,
+    at_s: f64,
+    window_s: f64,
+    subtitles: &[Cue],
+    options: &Options,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<DescribedMoment, Error> {
+    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
+    let frames = match clip.sample_moment(at_s, window_s, cancel) {
+        Ok(Some(frames)) if !frames.is_empty() => frames,
+        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
+        Ok(None) => return Err(Error::Cancelled),
+        Err(e) => return Err(Error::Unreadable(e)),
+    };
+    drop(clip);
+    let request = build_moment_request(
+        options.model,
+        &frames,
+        subtitles,
+        at_s,
+        window_s,
+        options.language,
+    );
+    let provider = provider_for(options)?;
+    let response = provider.complete(&request, cancel).map_err(|e| match e {
+        AiError::Cancelled => Error::Cancelled,
+        e => Error::Ai(e),
+    })?;
+    let moment = parse_moment_answer(&response).map_err(|reason| Error::BadAnswer {
+        reason,
+        usage: response.usage,
+    })?;
+    Ok(DescribedMoment {
+        moment,
         usage: response.usage,
     })
 }

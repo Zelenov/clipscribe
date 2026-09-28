@@ -1,6 +1,6 @@
 [package]
 name = "clipscribe"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Describe what happens in video clips, and when, with Claude: a video file (and its subtitles) in, a summary and time-ranged key moments out."
 repository = "https://github.com/Zelenov/clipscribe"
