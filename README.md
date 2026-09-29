@@ -24,7 +24,8 @@ out, even for clips with no speech.
   part otherwise — never a moment that just tiles the timeline. `MomentsMode::Full` goes back to
   always covering the whole clip in consecutive stretches. In `important` mode, ranges that
   together cover almost the whole clip are dropped unless the model says the clip is made of
-  clearly different parts, and a range that only repeats the summary is dropped.
+  clearly different parts, a range that only repeats the summary is dropped, and so are ranges
+  that only fill in around the main range or cut it into parts.
 - A clip with a lead-in or lead-out gets a **main range** (`Description::main`, `"main"` in
   `--json`, `Main:` in the text output): the part an editor would keep, as a suggested In/Out.
   It is absent when the whole clip is usable, and never set in `full` mode.

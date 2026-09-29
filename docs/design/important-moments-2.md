@@ -16,7 +16,13 @@ a main range (In/Out).
    the clip is clearly made of different parts (place, shot type, activity) and the ranges are
    those parts. After the other filters, if the union of ranges covers ≥ 90 % of the clip
    (`WHOLE_CLIP_FRACTION`, overlaps counted once) and `distinct_parts` is not true (false or
-   missing), all ranges are dropped: they collapse to the summary.
+   missing), all ranges are dropped: they collapse to the summary. With a main range, tiling
+   also means the ranges plus the main range cover ≥ 90 % of the clip (the rest filled in around
+   it) or the ranges cover ≥ 90 % of the main range (it cut into parts); either way the ranges
+   are dropped and the main range stays. A main range and `distinct_parts: true` contradict each
+   other (one part worth keeping is not a clip of distinct parts), so with a main range
+   `distinct_parts` is ignored. The prompt says the same: ranges do not fill in around main or
+   cut it into parts.
 3. **Main range.** Required answer field `main`: a list of at most one `{start_s, end_s}`
    (a list rather than a nullable object because OpenAI strict schemas need every property
    required and an empty list is the same "none" everywhere). Read as the first valid entry,
@@ -38,3 +44,11 @@ are the `Full` shapes. The answer grows by about 30 tokens.
 - `distinct_parts` is not exposed on `Description`: it is a justification for validation, not
   output.
 - No live evaluation in this session unless `CLIPSCRIBE_LIVE_API_KEY` is set; see the PR.
+
+## Live check (owner's Kenya clips, 14 clips, Haiku 4.5)
+
+The first version of these rules stopped whole-clip tiles, but in 7 of 9 answers with a main
+range the ranges filled the rest of the clip around it or cut it into parts, and one answer
+gave a main range together with `distinct_parts: true` to keep them. The main-range rules
+above come from those answers. Clips like Chess (vendor display, overhead game, low angle) get
+`distinct_parts: true` with no main range and keep their parts, which is what rule 2 allows.

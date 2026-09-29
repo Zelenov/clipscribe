@@ -510,7 +510,9 @@ pub fn build_request(
              segments. Never a segment that covers the whole clip. Finally, main: when the clip \
              has a lead-in or lead-out around the one part an editor would keep (setting up, \
              walking into position, lowering the camera), a list with that one part's start_s and \
-             end_s, the suggested In and Out; an empty list when the whole clip is usable.",
+             end_s, the suggested In and Out; an empty list when the whole clip is usable. \
+             The segments do not fill in the rest of the clip around main or cut main into its \
+             parts: they are only the moments that stand out, inside main or outside it.",
             max_segments(duration_s),
             duration_s,
         ),
@@ -570,9 +572,9 @@ pub fn build_request(
 /// a segment covering almost the whole clip is dropped (that is the summary's job) and adjacent
 /// segments whose descriptions say the same thing are merged — signs the model tiled the
 /// timeline instead of picking out what matters; a segment the summary already says is dropped;
-/// segments that together cover almost the whole clip are dropped unless the answer says the
-/// clip is made of clearly different parts; and the main range is read. [`MomentsMode::Full`]
-/// skips all of that.
+/// the main range is read; and segments that together cover almost the whole clip (counting the
+/// main range) or almost the whole main range are dropped unless the answer says the clip is
+/// made of clearly different parts. [`MomentsMode::Full`] skips all of that.
 pub fn parse_answer(
     response: &AiResponse,
     duration_s: f64,
@@ -622,14 +624,16 @@ pub fn parse_answer(
     let mut main = None;
     if moments == MomentsMode::Important {
         segments.retain(|s| !repeats_summary(&s.description, summary));
-        if !response.json["distinct_parts"].as_bool().unwrap_or(false)
-            && covered_s(&segments) >= WHOLE_CLIP_FRACTION * duration_s
-        {
-            // Ranges that tile the clip without saying it is made of different parts are the
-            // summary said again.
+        main = parse_main(&response.json["main"], duration_s);
+        // A clip with one part worth keeping is not made of distinct parts: with a main range,
+        // `distinct_parts` does not excuse tiling.
+        let distinct_parts =
+            main.is_none() && response.json["distinct_parts"].as_bool().unwrap_or(false);
+        if !distinct_parts && tiles(&segments, main, duration_s) {
+            // Ranges that tile the clip (or the main range) without saying it is made of
+            // different parts are the summary, or the main range, said again.
             segments.clear();
         }
-        main = parse_main(&response.json["main"], duration_s);
     }
     segments.truncate(max_segments(duration_s));
     Ok(Description {
@@ -652,15 +656,31 @@ fn repeats_summary(description: &str, summary: &str) -> bool {
         || (description.chars().count() >= MIN_REPEAT_CHARS && summary.contains(&description))
 }
 
-/// Seconds of the clip covered by `segments` (sorted by `start_s`), overlaps counted once.
-fn covered_s(segments: &[Segment]) -> f64 {
+/// Whether `segments` (sorted by `start_s`) tile the timeline: together with the main range they
+/// cover almost the whole clip (the rest of the clip filled in around the main range), or they
+/// cover almost the whole main range (the main range cut into its parts).
+fn tiles(segments: &[Segment], main: Option<MainRange>, duration_s: f64) -> bool {
+    let covered = covered_s(segments, 0.0, duration_s);
+    let Some(main) = main else {
+        return covered >= WHOLE_CLIP_FRACTION * duration_s;
+    };
+    let main_s = main.end_s - main.start_s;
+    let in_main = covered_s(segments, main.start_s, main.end_s);
+    covered + main_s - in_main >= WHOLE_CLIP_FRACTION * duration_s
+        || in_main >= WHOLE_CLIP_FRACTION * main_s
+}
+
+/// Seconds between `from` and `to` covered by `segments` (sorted by `start_s`), overlaps counted
+/// once.
+fn covered_s(segments: &[Segment], from: f64, to: f64) -> f64 {
     let mut total = 0.0;
-    let mut reached = 0.0_f64;
+    let mut reached = from;
     for s in segments {
         let start = s.start_s.max(reached);
-        if s.end_s > start {
-            total += s.end_s - start;
-            reached = s.end_s;
+        let end = s.end_s.min(to);
+        if end > start {
+            total += end - start;
+            reached = end;
         }
     }
     total
@@ -1116,6 +1136,91 @@ mod tests {
         );
         let d = parse_answer(&answer, 37.0, MomentsMode::Important).expect("description");
         assert_eq!(d.segments.len(), 1);
+    }
+
+    fn with_main(distinct_parts: bool, main: [f64; 2], segments: &[[f64; 2]]) -> AiResponse {
+        let segments: Vec<Value> = segments
+            .iter()
+            .enumerate()
+            .map(|(i, [start_s, end_s])| {
+                json!({"start_s": start_s, "end_s": end_s,
+                    "description": format!("Moment number {i} of the clip")})
+            })
+            .collect();
+        response(
+            json!({"summary": "A man in a yellow hoodie talks to camera at night.",
+            "distinct_parts": distinct_parts,
+            "main": [{"start_s": main[0], "end_s": main[1]}],
+            "segments": segments}),
+            "end_turn",
+        )
+    }
+
+    #[test]
+    fn ranges_that_fill_the_clip_around_the_main_range_collapse_to_it() {
+        // Live answer (0:30 clip): main 0:00–0:22 and the rest of the clip as the one "moment".
+        let d = parse_answer(
+            &with_main(false, [0.0, 22.0], &[[22.0, 30.0]]),
+            30.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert!(d.segments.is_empty(), "{:?}", d.segments);
+        assert!(d.main.is_some(), "the main range stays");
+    }
+
+    #[test]
+    fn ranges_that_cut_the_main_range_into_parts_collapse_to_it() {
+        // Live answer (0:50 clip): main 0:02–0:46 cut into 0:02–0:22 and 0:26–0:46.
+        let d = parse_answer(
+            &with_main(false, [2.0, 46.0], &[[2.0, 22.0], [26.0, 46.0]]),
+            50.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert!(d.segments.is_empty(), "{:?}", d.segments);
+        assert!(d.main.is_some(), "the main range stays");
+    }
+
+    #[test]
+    fn standout_moments_next_to_a_main_range_are_kept() {
+        // Live answer (0:18 clip): main 0:01–0:16 with two moments inside it, most of it free.
+        let d = parse_answer(
+            &with_main(false, [1.0, 16.0], &[[3.0, 9.0], [13.0, 16.0]]),
+            18.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert_eq!(d.segments.len(), 2);
+        // Just under the line either way: main plus moments cover 89 % of the clip, the moments
+        // 89 % of the main range.
+        let d = parse_answer(
+            &with_main(false, [0.0, 80.0], &[[80.0, 89.0]]),
+            100.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert_eq!(d.segments.len(), 1);
+        let d = parse_answer(
+            &with_main(false, [0.0, 80.0], &[[0.0, 71.0]]),
+            100.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert_eq!(d.segments.len(), 1);
+    }
+
+    #[test]
+    fn distinct_parts_does_not_excuse_tiling_when_there_is_a_main_range() {
+        // Live answer (0:30 clip): main 0:00–0:22, the rest as a moment, and distinct_parts true.
+        let d = parse_answer(
+            &with_main(true, [0.0, 22.0], &[[22.0, 30.0]]),
+            30.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert!(d.segments.is_empty(), "{:?}", d.segments);
+        assert!(d.main.is_some());
     }
 
     #[test]

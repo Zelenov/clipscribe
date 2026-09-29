@@ -8,7 +8,9 @@
 ## Changed
 - Important moments, round 2: ranges that together cover almost the whole clip (90 % or more)
   are now dropped unless the model says the clip is really made of clearly different parts, and
-  a range that only says what the summary already says is dropped. A clip like "pose, hold,
+  a range that only says what the summary already says is dropped. Ranges that only fill in
+  the clip around the main range, or cut the main range into its parts, are dropped too (the
+  main range stays). A clip like "pose, hold,
   walk away" now gets a summary plus at most the main range and the moment that stands out,
   not three tiles. Static and uniform clips still get no ranges.
 - Library: `Description` has a new field `main: Option<MainRange>`; add `main: None` where you
