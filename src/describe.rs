@@ -639,11 +639,17 @@ pub fn parse_answer(
     })
 }
 
+/// A description shorter than this is never taken for a repeat of the summary: "A dog" is in
+/// almost any summary and still can be a moment.
+const MIN_REPEAT_CHARS: usize = 20;
+
 /// Whether a segment's description only says what the summary says: the same text once trimmed
-/// and lower-cased, or contained in the summary.
+/// and lower-cased, or (when long enough to mean something) contained in the summary.
 fn repeats_summary(description: &str, summary: &str) -> bool {
     let description = description.trim().to_lowercase();
-    !description.is_empty() && summary.trim().to_lowercase().contains(&description)
+    let summary = summary.trim().to_lowercase();
+    description == summary
+        || (description.chars().count() >= MIN_REPEAT_CHARS && summary.contains(&description))
 }
 
 /// Seconds of the clip covered by `segments` (sorted by `start_s`), overlaps counted once.
@@ -1140,6 +1146,19 @@ mod tests {
     }
 
     #[test]
+    fn a_short_description_inside_the_summary_is_not_a_repeat() {
+        let answer = response(
+            json!({"summary": "A dog runs across the lawn.", "distinct_parts": false,
+            "main": [], "segments": [
+                {"start_s": 1.0, "end_s": 4.0, "description": "A dog"}
+            ]}),
+            "end_turn",
+        );
+        let d = parse_answer(&answer, 30.0, MomentsMode::Important).expect("description");
+        assert_eq!(d.segments.len(), 1);
+    }
+
+    #[test]
     fn the_main_range_is_read_and_kept_inside_the_clip() {
         let read = |main: Value| {
             parse_answer(&issue_example(true, main), 37.0, MomentsMode::Important)
@@ -1169,6 +1188,7 @@ mod tests {
         assert_eq!(read(json!([{"start_s": 40.0, "end_s": 45.0}])), None);
         assert_eq!(read(json!([{"start_s": 0.0, "end_s": 37.0}])), None);
         assert_eq!(read(json!([{"start_s": 0.0, "end_s": 34.0}])), None);
+        assert!(read(json!([{"start_s": 0.0, "end_s": 33.0}])).is_some());
     }
 
     #[test]
