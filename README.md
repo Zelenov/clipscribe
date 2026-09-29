@@ -87,13 +87,81 @@ same window. `MOMENT_WINDOW_S` (1 s) is a reasonable default for `window_s`. Ret
 `DescribedMoment { moment: Moment { name, description }, usage }` — `moment.name` is a few words,
 fit for a marker label; `usage` prices with `Model::cost_usd` like any other call.
 
+### Whole folders
+
+`describe_folder` describes many clips in one call, several at once, and can resume a stopped
+run and stop at a budget:
+
+```rust
+use clipscribe::{
+    cache_path, describe_folder, find_videos, group_clips, Budget, Cache, DescribedClip, RunOptions,
+};
+
+let videos = find_videos(&["footage".into()])?; // the videos in the folder, sorted
+let cache = Cache::open(&cache_path("footage".as_ref(), None))?;
+let budget = Budget::new(Some(5.0)); // US dollars
+let run = describe_folder(&videos, Some(&cache), &RunOptions::default(), &options, &budget,
+    &AtomicBool::new(false), |event| eprintln!("{event:?}"));
+// Only the described (or cached) clips can be grouped: keep each one's index into `videos`.
+let described: Vec<(usize, &DescribedClip)> = run.clips.iter().enumerate()
+    .filter_map(|(i, c)| c.record().map(|r| (i, &r.clip)))
+    .collect();
+let grouping = group_clips(&described.iter().map(|(_, clip)| *clip).collect::<Vec<_>>());
+for ((i, _), groups) in described.iter().zip(&grouping.clips) {
+    println!("{}: group {}", videos[*i].display(), groups.group);
+}
+```
+
+`grouping.clips[n]` belongs to the `n`th clip passed to `group_clips`, which is not `videos[n]`
+as soon as one video failed or was not started: keep the index, as above.
+
+- **Resume.** The `Cache` is a `.clipscribe-cache.jsonl` file next to the videos (or in a
+  directory you pass to `cache_path`). A clip is found by its `FileIdentity` (size, modification
+  time and a hash of its first, middle and last 64 KiB) and the settings it was described with,
+  so a renamed clip is still found and a different model or `.srt` describes it again. Each clip
+  is written as soon as it is done: a crash or a cancel loses only the clips in work.
+  `RunOptions::force` describes everything again.
+- **Several at once.** `RunOptions::jobs` clips (default 4) are in flight; a rate limit on one
+  pauses all of them.
+- **Budget.** Before each request, `Budget` sets aside the most it can cost (the answer counted at
+  its longest, so several times what it usually costs). A request that does not fit only because
+  of the others in flight waits for them to settle; one that could pass the cap even alone is not
+  sent, the clip comes back `ClipOutcome::OverBudget`, and no new clip is described — the clips
+  left are still served from the cache when it has them (`serve_after_stop`, also for a loop over
+  several folders), and `Budget::refused_usd` says what the refused clip could have cost. A
+  timeout or an unreadable answer counts as its whole bound, since it may have been billed. The
+  cap holds as long as each request is billed at most once and within its bound; OpenAI's image
+  billing is taken from its published formulas, and a request retried after a lost connection
+  may, rarely, have been billed twice.
+- **Outcomes.** `FolderRun::clips` has a `ClipOutcome` per video, in order (`Described`, `Cached`,
+  `Failed`, `OverBudget`, `NotStarted`), with `usage` (what this run spent) and `stopped` (why it
+  stopped early, if it did). `FolderEvent`s arrive from the worker threads, for a progress display.
+  A `Cached` clip's `usage` is what it cost when it was first described, not part of this run's.
+- **Grouping.** `group_clips` puts clips, and stretches within them, in one `Group` when they look
+  like the same shot or their descriptions say much the same thing, with a label taken from the
+  descriptions. The pictures (8×8 brightness grids of the frames already sent, whatever the
+  exposure, turned sideways too) find duplicates, re-exports, a clip stored sideways and a
+  camera that did not move. The descriptions' words (shared words over all words, common words
+  dropped) find the same subject or activity filmed again from elsewhere or zoomed, as long as
+  the descriptions say it in similar words — and they also join the same place with something
+  else happening, or different things described with the same everyday words ("a woman in a
+  bright kitchen", "a woman in a bright office"). On a large folder from one shoot described in
+  similar words, those links can chain several groups into a few large ones: check groups before
+  relying on them. Both cost nothing, run offline and give the same groups every time. Both
+  thresholds are provisional: measured on near-duplicates, synthetic patterns and descriptions
+  written for the tests, not yet on real retakes and real descriptions.
+
+To build your own loop instead, the parts are public: `CacheKey`, `Cache::get`/`put`,
+`cached_clip`, `describe_clip` (one clip, within a `Budget`), `Budget::reserve_or_wait` and
+`request_cost_bound`.
+
 ### Features
 
 | Feature | |
 |---|---|
 | `cli` (default) | The `clipscribe` binary (clap, ctrlc). Implies `frames`. |
-| `frames` (default) | GStreamer frame reading and `describe`. |
-| none | Models, languages, request and answer types, the estimate, `srt` and both providers' clients, with no GStreamer. |
+| `frames` (default) | GStreamer frame reading, `describe` and `describe_folder`. |
+| none | Models, languages, request and answer types, the estimate, `srt`, both providers' clients, the cache and `group_clips`, with no GStreamer. |
 
 ## Building
 

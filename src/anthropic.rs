@@ -25,6 +25,8 @@ pub struct Anthropic {
     base_url: String,
     retry: RetryPolicy,
     client: reqwest::blocking::Client,
+    /// Shared with the other clients of a folder run; see [`provider::RateGate`].
+    gate: Option<std::sync::Arc<provider::RateGate>>,
 }
 
 impl Anthropic {
@@ -47,7 +49,18 @@ impl Anthropic {
             base_url,
             retry,
             client,
+            gate: None,
         })
+    }
+
+    /// This client, pausing together with every other client sharing `gate` (on its own with
+    /// `None`).
+    pub(crate) fn with_rate_gate(
+        mut self,
+        gate: Option<std::sync::Arc<provider::RateGate>>,
+    ) -> Self {
+        self.gate = gate;
+        self
     }
 
     fn body(request: &AiRequest) -> Value {
@@ -83,9 +96,13 @@ impl Anthropic {
 impl AiProvider for Anthropic {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError> {
         let body = Self::body(request).to_string();
-        provider::retry_loop(&self.retry, Provider::Anthropic.label(), cancel, || {
-            self.attempt(&body)
-        })
+        provider::retry_loop(
+            &self.retry,
+            Provider::Anthropic.label(),
+            self.gate.as_deref(),
+            cancel,
+            || self.attempt(&body),
+        )
     }
 }
 
