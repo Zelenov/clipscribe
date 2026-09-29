@@ -117,7 +117,12 @@ fn new_tag_ideas_property() -> Value {
 /// (`describe_with_tags`): `describe::schema`'s `summary`/`segments`, plus `tags` and
 /// `new_tag_ideas`.
 pub fn combined_schema() -> Value {
-    let mut schema = describe::schema();
+    combined_schema_for(describe::MomentsMode::Full)
+}
+
+/// [`combined_schema`] on top of `describe::schema_for(moments)`.
+pub fn combined_schema_for(moments: describe::MomentsMode) -> Value {
+    let mut schema = describe::schema_for(moments);
     schema["properties"]["tags"] = tag_suggestion_property();
     schema["properties"]["new_tag_ideas"] = new_tag_ideas_property();
     if let Some(required) = schema["required"].as_array_mut() {
@@ -181,7 +186,7 @@ pub fn build_combined_request(
         );
     };
     instructions.push_str(&tag_instructions(vocabulary));
-    request.schema = combined_schema();
+    request.schema = combined_schema_for(moments);
     request
 }
 
@@ -468,7 +473,10 @@ mod tests {
         assert!(instructions.contains("Indoor"));
         assert!(instructions.contains("new_tag_ideas"));
         assert_eq!(request.content[2], AiContent::Jpeg(vec![1]));
-        assert_eq!(request.schema, combined_schema());
+        assert_eq!(
+            request.schema,
+            combined_schema_for(describe::MomentsMode::Important)
+        );
     }
 
     #[test]
@@ -480,6 +488,7 @@ mod tests {
                 end_s: 5.0,
                 description: "A dog runs past.".to_string(),
             }],
+            main: None,
         };
         let request =
             build_tags_only_request(describe::MODELS[0], &description, &[], &vocabulary(), 10.0);
@@ -582,6 +591,7 @@ mod tests {
         let description = Description {
             summary: "x".repeat(200),
             segments: vec![],
+            main: None,
         };
         let from_frames = estimate_tags_usage(describe::MODELS[0], 60.0, 0, &vocabulary(), None);
         let from_description = estimate_tags_usage(
@@ -636,6 +646,7 @@ mod tests {
         let description = Description {
             summary: "A farm.".to_string(),
             segments: vec![],
+            main: None,
         };
         let request =
             build_tags_only_request(describe::MODELS[0], &description, &[], &vocabulary(), 10.0);

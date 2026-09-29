@@ -22,7 +22,12 @@ out, even for clips with no speech.
 - Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a
   static or uniform clip (the summary already covers it), one per clearly different or standout
   part otherwise — never a moment that just tiles the timeline. `MomentsMode::Full` goes back to
-  always covering the whole clip in consecutive stretches.
+  always covering the whole clip in consecutive stretches. In `important` mode, ranges that
+  together cover almost the whole clip are dropped unless the model says the clip is made of
+  clearly different parts, and a range that only repeats the summary is dropped.
+- A clip with a lead-in or lead-out gets a **main range** (`Description::main`, `"main"` in
+  `--json`, `Main:` in the text output): the part an editor would keep, as a suggested In/Out.
+  It is absent when the whole clip is usable, and never set in `full` mode.
 
 ## As a library
 

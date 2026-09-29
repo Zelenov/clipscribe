@@ -244,6 +244,13 @@ impl std::fmt::Display for SummaryLanguage {
     }
 }
 
+/// The part of a clip an editor would keep: the suggested In and Out, in seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MainRange {
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
 /// A stretch of the clip and what happens in it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
@@ -252,11 +259,15 @@ pub struct Segment {
     pub description: String,
 }
 
-/// What a clip shows: a one-line summary and its segments in order.
+/// What a clip shows: a one-line summary, its segments in order and, when the clip has a lead-in
+/// or lead-out around the part worth keeping, that main range.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Description {
     pub summary: String,
     pub segments: Vec<Segment>,
+    /// The suggested In/Out: `None` when the whole clip is usable (and always in
+    /// [`MomentsMode::Full`]).
+    pub main: Option<MainRange>,
 }
 
 /// Where to take frames in a clip `duration_s` long: one every 2 s, at most 60 (a longer clip
@@ -416,9 +427,17 @@ pub struct Frame {
     pub jpeg: Vec<u8>,
 }
 
-/// The JSON schema of an answer.
+/// The JSON schema of an answer in [`MomentsMode::Full`]: `summary` and `segments`.
 pub fn schema() -> Value {
-    json!({
+    schema_for(MomentsMode::Full)
+}
+
+/// The JSON schema of an answer for `moments`. [`MomentsMode::Important`] adds `main` (a list of
+/// at most one range: the suggested In/Out, empty when the whole clip is usable) and
+/// `distinct_parts` (whether the clip is clearly made of different parts, which the segments
+/// then list); both are required and never optional, so strict schemas (OpenAI) accept them.
+pub fn schema_for(moments: MomentsMode) -> Value {
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "summary": {"type": "string"},
@@ -438,7 +457,27 @@ pub fn schema() -> Value {
         },
         "required": ["summary", "segments"],
         "additionalProperties": false
-    })
+    });
+    if moments == MomentsMode::Important {
+        schema["properties"]["main"] = json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start_s": {"type": "number"},
+                    "end_s": {"type": "number"}
+                },
+                "required": ["start_s", "end_s"],
+                "additionalProperties": false
+            }
+        });
+        schema["properties"]["distinct_parts"] = json!({"type": "boolean"});
+        if let Some(required) = schema["required"].as_array_mut() {
+            required.push(json!("main"));
+            required.push(json!("distinct_parts"));
+        }
+    }
+    schema
 }
 
 /// The request to `model` describing a clip `duration_s` long from its frames and subtitles.
@@ -459,12 +498,19 @@ pub fn build_request(
              editor's attention on its own, in one short sentence each with the key details \
              (place, action, camera, people, objects, on-screen text). An empty list is the \
              right answer when nothing stands out: a static shot, someone talking to camera, or \
-             walking while talking, with nothing changing. A small or vague change is not a \
-             segment. Add a segment for a stretch that clearly stands out from the rest of the \
-             clip (an event, a different activity, something unexpected), and for each part \
-             when the clip is made of clearly different parts (a different place, look, shot \
-             type or activity) — the editor needs the cut points. Never a segment that covers \
-             the whole clip: that is what the summary is for.",
+             walking while talking, with nothing changing. Sometimes the important part is the \
+             whole clip: the summary says so, and there are no segments. A small or vague \
+             change is not a segment. Add a segment for a stretch that clearly stands out from \
+             the rest of the clip (an event, a different activity, something unexpected). \
+             Segments must not tile the clip from start to end: set distinct_parts to true only \
+             when the clip is really made of clearly different parts (a different place, look, \
+             shot type or activity) and the segments are those parts — the editor needs the cut \
+             points — otherwise false. The summary and the segments must not repeat each other: \
+             a segment says only what the summary does not, and the summary does not re-list the \
+             segments. Never a segment that covers the whole clip. Finally, main: when the clip \
+             has a lead-in or lead-out around the one part an editor would keep (setting up, \
+             walking into position, lowering the camera), a list with that one part's start_s and \
+             end_s, the suggested In and Out; an empty list when the whole clip is usable.",
             max_segments(duration_s),
             duration_s,
         ),
@@ -512,7 +558,7 @@ pub fn build_request(
     AiRequest {
         model: model.id.to_string(),
         content,
-        schema: schema(),
+        schema: schema_for(moments),
         max_tokens: model.max_answer_tokens,
         effort: model.effort,
     }
@@ -523,7 +569,10 @@ pub fn build_request(
 /// empty summary is an error with the reason for the failed list. In [`MomentsMode::Important`],
 /// a segment covering almost the whole clip is dropped (that is the summary's job) and adjacent
 /// segments whose descriptions say the same thing are merged — signs the model tiled the
-/// timeline instead of picking out what matters; [`MomentsMode::Full`] skips both.
+/// timeline instead of picking out what matters; a segment the summary already says is dropped;
+/// segments that together cover almost the whole clip are dropped unless the answer says the
+/// clip is made of clearly different parts; and the main range is read. [`MomentsMode::Full`]
+/// skips all of that.
 pub fn parse_answer(
     response: &AiResponse,
     duration_s: f64,
@@ -570,11 +619,56 @@ pub fn parse_answer(
         segments = merge_same_description(segments);
         segments.retain(|s| (s.end_s - s.start_s) < WHOLE_CLIP_FRACTION * duration_s);
     }
+    let mut main = None;
+    if moments == MomentsMode::Important {
+        segments.retain(|s| !repeats_summary(&s.description, summary));
+        if !response.json["distinct_parts"].as_bool().unwrap_or(false)
+            && covered_s(&segments) >= WHOLE_CLIP_FRACTION * duration_s
+        {
+            // Ranges that tile the clip without saying it is made of different parts are the
+            // summary said again.
+            segments.clear();
+        }
+        main = parse_main(&response.json["main"], duration_s);
+    }
     segments.truncate(max_segments(duration_s));
     Ok(Description {
         summary: summary.to_string(),
         segments,
+        main,
     })
+}
+
+/// Whether a segment's description only says what the summary says: the same text once trimmed
+/// and lower-cased, or contained in the summary.
+fn repeats_summary(description: &str, summary: &str) -> bool {
+    let description = description.trim().to_lowercase();
+    !description.is_empty() && summary.trim().to_lowercase().contains(&description)
+}
+
+/// Seconds of the clip covered by `segments` (sorted by `start_s`), overlaps counted once.
+fn covered_s(segments: &[Segment]) -> f64 {
+    let mut total = 0.0;
+    let mut reached = 0.0_f64;
+    for s in segments {
+        let start = s.start_s.max(reached);
+        if s.end_s > start {
+            total += s.end_s - start;
+            reached = s.end_s;
+        }
+    }
+    total
+}
+
+/// The main range of an answer: the first valid entry of `main`, inside the clip, and not the
+/// whole clip (that is what no main range means).
+fn parse_main(value: &Value, duration_s: f64) -> Option<MainRange> {
+    let item = value.as_array()?.first()?;
+    let start_s = item["start_s"].as_f64()?.max(0.0);
+    let end_s = item["end_s"].as_f64()?.min(duration_s);
+    let inside = end_s > start_s && start_s < duration_s;
+    (inside && (end_s - start_s) < WHOLE_CLIP_FRACTION * duration_s)
+        .then_some(MainRange { start_s, end_s })
 }
 
 /// Merge adjacent segments (already sorted by `start_s`) whose descriptions are the same once
@@ -954,6 +1048,138 @@ mod tests {
         let d = parse_answer(&response(answer, "end_turn"), 30.0, MomentsMode::Full)
             .expect("description");
         assert_eq!(d.segments.len(), 1, "full mode keeps it");
+    }
+
+    fn issue_example(distinct_parts: bool, main: Value) -> AiResponse {
+        response(
+            json!({"summary": "A person poses in a red jacket and then walks away.",
+            "distinct_parts": distinct_parts,
+            "main": main,
+            "segments": [
+                {"start_s": 0.0, "end_s": 7.0, "description": "Jumping pose against the sky"},
+                {"start_s": 7.0, "end_s": 28.0, "description": "Standing still, legs spread"},
+                {"start_s": 28.0, "end_s": 37.0, "description": "Walks away across the square"}
+            ]}),
+            "end_turn",
+        )
+    }
+
+    #[test]
+    fn ranges_that_tile_the_clip_without_distinct_parts_collapse_to_the_summary() {
+        let d = parse_answer(
+            &issue_example(false, json!([])),
+            37.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert!(d.segments.is_empty(), "{:?}", d.segments);
+        assert_eq!(d.main, None);
+    }
+
+    #[test]
+    fn tiling_ranges_are_kept_when_the_clip_is_made_of_distinct_parts() {
+        let d = parse_answer(
+            &issue_example(true, json!([])),
+            37.0,
+            MomentsMode::Important,
+        )
+        .expect("description");
+        assert_eq!(d.segments.len(), 3);
+    }
+
+    #[test]
+    fn a_missing_distinct_parts_counts_as_false() {
+        let mut answer = issue_example(true, json!([]));
+        answer
+            .json
+            .as_object_mut()
+            .unwrap()
+            .remove("distinct_parts");
+        let d = parse_answer(&answer, 37.0, MomentsMode::Important).expect("description");
+        assert!(d.segments.is_empty());
+    }
+
+    #[test]
+    fn ranges_that_cover_less_than_the_clip_are_kept_without_distinct_parts() {
+        let answer = response(
+            json!({"summary": "A person poses and walks away.", "distinct_parts": false,
+            "main": [], "segments": [
+                {"start_s": 0.0, "end_s": 7.0, "description": "Jumping pose against the sky"}
+            ]}),
+            "end_turn",
+        );
+        let d = parse_answer(&answer, 37.0, MomentsMode::Important).expect("description");
+        assert_eq!(d.segments.len(), 1);
+    }
+
+    #[test]
+    fn full_mode_ignores_tiling_and_the_main_range() {
+        let d = parse_answer(
+            &issue_example(false, json!([{"start_s": 7.0, "end_s": 28.0}])),
+            37.0,
+            MomentsMode::Full,
+        )
+        .expect("description");
+        assert_eq!(d.segments.len(), 3);
+        assert_eq!(d.main, None);
+    }
+
+    #[test]
+    fn a_segment_the_summary_already_says_is_dropped() {
+        let answer = response(
+            json!({"summary": "A dog runs across the lawn and jumps a fence.",
+            "distinct_parts": false, "main": [], "segments": [
+                {"start_s": 1.0, "end_s": 4.0, "description": "A dog runs across the lawn"},
+                {"start_s": 5.0, "end_s": 7.0, "description": "The owner drops a red ball"}
+            ]}),
+            "end_turn",
+        );
+        let d = parse_answer(&answer, 30.0, MomentsMode::Important).expect("description");
+        assert_eq!(d.segments.len(), 1);
+        assert_eq!(d.segments[0].description, "The owner drops a red ball");
+    }
+
+    #[test]
+    fn the_main_range_is_read_and_kept_inside_the_clip() {
+        let read = |main: Value| {
+            parse_answer(&issue_example(true, main), 37.0, MomentsMode::Important)
+                .expect("description")
+                .main
+        };
+        assert_eq!(
+            read(json!([{"start_s": 7.0, "end_s": 28.0}])),
+            Some(MainRange {
+                start_s: 7.0,
+                end_s: 28.0
+            })
+        );
+        // Past the end: clamped to the clip.
+        assert_eq!(
+            read(json!([{"start_s": 20.0, "end_s": 50.0}])),
+            Some(MainRange {
+                start_s: 20.0,
+                end_s: 37.0
+            })
+        );
+        // Absent, empty, backwards, outside the clip and the whole clip: no main range.
+        assert_eq!(read(json!([])), None);
+        assert_eq!(read(Value::Null), None);
+        assert_eq!(read(json!([{"start_s": 9.0, "end_s": 9.0}])), None);
+        assert_eq!(read(json!([{"start_s": 30.0, "end_s": 10.0}])), None);
+        assert_eq!(read(json!([{"start_s": 40.0, "end_s": 45.0}])), None);
+        assert_eq!(read(json!([{"start_s": 0.0, "end_s": 37.0}])), None);
+        assert_eq!(read(json!([{"start_s": 0.0, "end_s": 34.0}])), None);
+    }
+
+    #[test]
+    fn the_important_schema_asks_for_main_and_distinct_parts_and_full_does_not() {
+        let important = schema_for(MomentsMode::Important);
+        assert_eq!(important["properties"]["main"]["type"], "array");
+        assert_eq!(important["properties"]["distinct_parts"]["type"], "boolean");
+        let required = important["required"].as_array().unwrap();
+        assert!(required.contains(&json!("main")) && required.contains(&json!("distinct_parts")));
+        assert_eq!(schema(), schema_for(MomentsMode::Full));
+        assert!(schema()["properties"].get("main").is_none());
     }
 
     /// The strict `<` in the whole-clip check: a segment at exactly the threshold is dropped

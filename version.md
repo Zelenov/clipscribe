@@ -1,3 +1,23 @@
+# NEXT
+## Added
+- A main range: when a clip has a lead-in or lead-out (setting up, walking into position) around
+  the one part worth keeping, the description carries it as the suggested In/Out —
+  `Description::main` (`Option<MainRange>`), `"main": {"start_s", "end_s"}` (or `null`) in
+  `--json`, and a `Main: m:ss–m:ss` line in the text output. Only in `important` moments mode.
+
+## Changed
+- Important moments, round 2: ranges that together cover almost the whole clip (90 % or more)
+  are now dropped unless the model says the clip is really made of clearly different parts, and
+  a range that only says what the summary already says is dropped. A clip like "pose, hold,
+  walk away" now gets a summary plus at most the main range and the moment that stands out,
+  not three tiles. Static and uniform clips still get no ranges.
+- Library: `Description` has a new field `main: Option<MainRange>`; add `main: None` where you
+  build a `Description` yourself. `describe::schema_for(MomentsMode)` and
+  `tags::combined_schema_for(MomentsMode)` are new; `schema()` and `combined_schema()` are the
+  `full` shapes as before. The `important` request carries two more required answer fields
+  (`main`, `distinct_parts`), so code that builds its own request from `schema()` and parses the
+  answer with `parse_answer(.., MomentsMode::Important)` should use `schema_for`.
+
 # 0.6.0
 ## Added
 - `describe_moment(video, at_s, window_s, subtitles, &options, cancel)`: a name and a
