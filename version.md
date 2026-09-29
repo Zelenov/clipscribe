@@ -1,4 +1,4 @@
-# NEXT
+# 0.7.0
 ## Added
 - A main range: when a clip has a lead-in or lead-out (setting up, walking into position) around
   the one part worth keeping, the description carries it as the suggested In/Out —
