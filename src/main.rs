@@ -611,6 +611,24 @@ fn estimate(
     }
 }
 
+/// The suggested In/Out, when the description has one.
+fn print_main(description: &clipscribe::Description) {
+    if let Some(main) = description.main {
+        println!(
+            "  Main: {}–{}",
+            format_time(main.start_s),
+            format_time(main.end_s)
+        );
+    }
+}
+
+fn main_json(description: &clipscribe::Description) -> serde_json::Value {
+    match description.main {
+        Some(main) => json!({"start_s": main.start_s, "end_s": main.end_s}),
+        None => serde_json::Value::Null,
+    }
+}
+
 fn print_text(video: &Path, described: &Described, model: Model) {
     println!(
         "{}  {} · {} frames · ${:.4}",
@@ -620,6 +638,7 @@ fn print_text(video: &Path, described: &Described, model: Model) {
         model.cost_usd(described.usage)
     );
     println!("  {}", described.description.summary);
+    print_main(&described.description);
     for moment in &described.description.segments {
         println!(
             "  {}–{}  {}",
@@ -637,6 +656,7 @@ fn to_json(video: &Path, described: &Described, model: Model) -> serde_json::Val
         "duration_s": described.duration_s,
         "frames": described.frames,
         "summary": described.description.summary,
+        "main": main_json(&described.description),
         "moments": described.description.segments.iter().map(|m| json!({
             "start_s": m.start_s,
             "end_s": m.end_s,
@@ -660,6 +680,7 @@ fn print_text_with_tags(video: &Path, described: &DescribedWithTags, model: Mode
         model.cost_usd(described.usage)
     );
     println!("  {}", described.description.summary);
+    print_main(&described.description);
     for moment in &described.description.segments {
         println!(
             "  {}–{}  {}",
@@ -703,6 +724,7 @@ fn to_json_with_tags(
         "duration_s": described.duration_s,
         "frames": described.frames,
         "summary": described.description.summary,
+        "main": main_json(&described.description),
         "moments": described.description.segments.iter().map(|m| json!({
             "start_s": m.start_s,
             "end_s": m.end_s,
@@ -777,6 +799,7 @@ mod tests {
                     description: "A herd of goats crosses the path in front of the hikers."
                         .to_string(),
                 }],
+                main: None,
             },
             tags: TagSuggestions {
                 tags: vec![
@@ -867,6 +890,18 @@ mod tests {
         // difference: only videos run with `--tags` get these extra fields at all.
         assert!(json.get("summary").is_some());
         assert!(json.get("moments").is_some());
+    }
+
+    #[test]
+    fn the_main_range_is_printed_and_in_the_json_and_null_when_absent() {
+        let mut described = sample();
+        assert_eq!(main_json(&described.description), serde_json::Value::Null);
+        described.description.main = Some(clipscribe::MainRange {
+            start_s: 7.0,
+            end_s: 28.5,
+        });
+        let json = to_json_with_tags(Path::new("hike.mp4"), &described, MODELS[0]);
+        assert_eq!(json["main"], json!({"start_s": 7.0, "end_s": 28.5}));
     }
 
     #[test]
