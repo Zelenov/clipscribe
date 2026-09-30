@@ -31,6 +31,7 @@
 //! the estimate and the Anthropic client remain.
 
 pub mod anthropic;
+mod debug_frames;
 mod describe;
 #[cfg(feature = "frames")]
 pub mod frames;
@@ -42,6 +43,7 @@ mod tags;
 
 use std::time::Duration;
 
+pub use debug_frames::{debug_frames_dir, dump_frames, set_debug_frames_dir, DEBUG_FRAMES_ENV};
 pub use describe::*;
 pub use moment::*;
 pub use provider::{AiError, AiProvider, AiUsage, Provider};
@@ -148,6 +150,50 @@ fn provider_for(options: &Options) -> Result<Box<dyn provider::AiProvider>, Erro
     }
 }
 
+/// How `sampling` picked the frames of a clip `duration_s` long, for `frames.json`: key frames
+/// fall back to an interval when the budget is one frame or none.
+#[cfg(feature = "frames")]
+fn picked(duration_s: f64, sampling: FrameSampling) -> &'static str {
+    if sampling == FrameSampling::KeyFrames && frame_count(duration_s) > 1 {
+        "key_frame"
+    } else {
+        "interval"
+    }
+}
+
+/// Sample the frames [`describe`] would send for `video` and write them as
+/// [`set_debug_frames_dir`] does, into `dir`, without sending anything: for looking at the
+/// frames without paying for a request. Returns how many were written (a write error is only
+/// logged).
+#[cfg(feature = "frames")]
+pub fn dump_clip_frames(
+    video: &std::path::Path,
+    dir: &std::path::Path,
+    sampling: FrameSampling,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<usize, Error> {
+    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
+    let duration_s = clip
+        .duration_s()
+        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
+    if duration_s > MAX_DURATION_S {
+        return Err(Error::TooLong(duration_s));
+    }
+    let frames = match clip.sample(duration_s, sampling, cancel, |_, _| {}) {
+        Ok(Some(frames)) if !frames.is_empty() => frames,
+        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
+        Ok(None) => return Err(Error::Cancelled),
+        Err(e) => return Err(Error::Unreadable(e)),
+    };
+    debug_frames::dump_frames(
+        dir,
+        &debug_frames::name_of(video),
+        &frames,
+        picked(duration_s, sampling),
+    );
+    Ok(frames.len())
+}
+
 /// Describe the video at `video`, with its `subtitles` (empty when it has none). `cancel` is
 /// checked between frames and while waiting for the answer; `on_stage` follows along.
 #[cfg(feature = "frames")]
@@ -174,6 +220,11 @@ pub fn describe(
         Err(e) => return Err(Error::Unreadable(e)),
     };
     drop(clip);
+    debug_frames::dump_if_on(
+        &debug_frames::name_of(video),
+        &frames,
+        picked(duration_s, options.frame_sampling),
+    );
     let request = build_request(
         options.model,
         &frames,
@@ -241,6 +292,11 @@ pub fn describe_with_tags(
         Err(e) => return Err(Error::Unreadable(e)),
     };
     drop(clip);
+    debug_frames::dump_if_on(
+        &debug_frames::name_of(video),
+        &frames,
+        picked(duration_s, options.frame_sampling),
+    );
     let request = build_combined_request(
         options.model,
         &frames,
@@ -335,6 +391,11 @@ pub fn describe_moment(
         Err(e) => return Err(Error::Unreadable(e)),
     };
     drop(clip);
+    debug_frames::dump_if_on(
+        &format!("{}-at-{at_s:.2}s", debug_frames::name_of(video)),
+        &frames,
+        "moment",
+    );
     let request = build_moment_request(
         options.model,
         &frames,
@@ -409,6 +470,35 @@ mod tests {
             |_| {},
         );
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn a_test_clip_dumps_its_frames_and_an_index() {
+        let dir = std::env::temp_dir().join(format!("clipscribe-lib-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let video = std::path::Path::new("tests/clips/file_example_MOV_480_700kB.mov");
+        let count = dump_clip_frames(
+            video,
+            &dir,
+            FrameSampling::KeyFrames,
+            &AtomicBool::new(false),
+        )
+        .expect("frames");
+        let folder = dir.join("file_example_MOV_480_700kB");
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(folder.join("frames.json")).expect("index"))
+                .expect("json");
+        let entries = index.as_array().expect("array");
+        assert_eq!(entries.len(), count);
+        assert!(count > 1);
+        for entry in entries {
+            let jpeg = std::fs::read(folder.join(entry["file"].as_str().expect("file")))
+                .expect("frame file");
+            assert_eq!(jpeg.len() as u64, entry["bytes"].as_u64().expect("bytes"));
+            assert_eq!(&jpeg[..2], &[0xff, 0xd8], "a JPEG");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

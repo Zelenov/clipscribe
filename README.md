@@ -9,7 +9,7 @@ out, even for clips with no speech.
 ## How it works
 
 - Frames are read with GStreamer, at most 60 per clip, 512 px on the long side, turned upright if
-  the clip has a rotation tag, and encoded as JPEG in memory. Nothing is written to disk. By
+  the clip has a rotation tag, and encoded as JPEG in memory. Nothing is written to disk unless you ask (see *Seeing the frames*). By
   default they are **key frames** (`FrameSampling::KeyFrames`): the clip is split into as many
   equal windows as the frame budget, and the one frame kept from each is wherever the picture
   changes the most in it, so a static shot spends no more of the budget than a clip that keeps
@@ -92,6 +92,16 @@ reading only the frame plus `window_s` on each side of it and any subtitle lines
 same window. `MOMENT_WINDOW_S` (1 s) is a reasonable default for `window_s`. Returns a
 `DescribedMoment { moment: Moment { name, description }, usage }` — `moment.name` is a few words,
 fit for a marker label; `usage` prices with `Model::cost_usd` like any other call.
+
+### Seeing the frames
+
+To check which images the model got, call `set_debug_frames_dir(Some(dir))` (or set
+`CLIPSCRIBE_DEBUG_FRAMES=<dir>`). `describe`, `describe_with_tags` and `describe_moment` then write
+`<dir>/<video name>/`: every frame as the same JPEG bytes that were sent, named by time
+(`0012.40s.jpg`), and a `frames.json` with each frame's time, how it was picked (`key_frame`,
+`interval` or `moment`) and its size. A setter and a variable, not an `Options` field, so nothing
+that builds `Options` changes. A write error is only logged. `dump_clip_frames` writes the frames
+without sending anything.
 
 ### Features
 

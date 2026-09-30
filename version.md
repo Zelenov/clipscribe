@@ -1,3 +1,12 @@
+# NEXT
+## Added
+- Debugging: see exactly which images the model got. `set_debug_frames_dir(Some(dir))` (or the
+  environment variable `CLIPSCRIBE_DEBUG_FRAMES=<dir>`) makes `describe`, `describe_with_tags` and
+  `describe_moment` write the frames of each request to `<dir>/<video name>/` as the same JPEG
+  bytes that were sent, named by time (`0012.40s.jpg`), with a `frames.json` (time, how the frame
+  was picked, size). Off by default; a write error is only logged. `dump_clip_frames` writes the
+  frames without sending a request. Nothing to change in code that builds `Options`.
+
 # 0.7.0
 ## Added
 - A main range: when a clip has a lead-in or lead-out (setting up, walking into position) around

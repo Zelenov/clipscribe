@@ -72,6 +72,12 @@ struct Cli {
     #[arg(long)]
     estimate: bool,
 
+    /// Debugging: write the frames sent to the model into this folder (one subfolder per video),
+    /// as the same JPEG bytes, named by time, with a frames.json. With --estimate the frames are
+    /// read and written but nothing is sent.
+    #[arg(long, value_name = "DIR")]
+    dump_frames: Option<PathBuf>,
+
     /// Name and describe the moment at this time (m:ss.f, h:mm:ss.f or plain seconds) in one
     /// video, instead of describing the whole clip. Fast and cheap: one small request.
     #[arg(long, value_parser = parse_at, conflicts_with_all = ["tags", "estimate", "frames", "moments"])]
@@ -296,7 +302,20 @@ fn main() -> ExitCode {
         None => None,
     };
     if cli.estimate {
-        return estimate(&videos, model, cli.no_subtitles, vocabulary.as_deref());
+        let dump = cli
+            .dump_frames
+            .as_deref()
+            .map(|dir| (dir, cli.frames.sampling()));
+        return estimate(
+            &videos,
+            model,
+            cli.no_subtitles,
+            vocabulary.as_deref(),
+            dump,
+        );
+    }
+    if let Some(dir) = &cli.dump_frames {
+        clipscribe::set_debug_frames_dir(Some(dir.clone()));
     }
     let api_key = cli
         .api_key
@@ -560,6 +579,7 @@ fn estimate(
     model: Model,
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
+    dump: Option<(&Path, FrameSampling)>,
 ) -> ExitCode {
     let mut total = AiUsage::default();
     let mut unreadable = 0;
@@ -596,6 +616,12 @@ fn estimate(
             format_time(duration_s),
             model.cost_usd(usage)
         );
+        if let Some((dir, sampling)) = dump {
+            match clipscribe::dump_clip_frames(video, dir, sampling, &CANCEL) {
+                Ok(count) => println!("  {count} frames written to {}", dir.display()),
+                Err(e) => eprintln!("error: {}: frames not written: {e}", video.display()),
+            }
+        }
     }
     println!(
         "total: about ${:.4} with {} ({} in / {} out tokens)",
