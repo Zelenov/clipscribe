@@ -1,4 +1,4 @@
-# NEXT
+# 0.8.0
 ## Added
 - Debugging: see exactly which images the model got. `set_debug_frames_dir(Some(dir))` (or the
   environment variable `CLIPSCRIBE_DEBUG_FRAMES=<dir>`) makes `describe`, `describe_with_tags` and
