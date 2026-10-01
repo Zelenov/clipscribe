@@ -1,4 +1,4 @@
-# NEXT
+# 0.9.0
 ## Added
 - Write a description into several files from one request: the new `export` module (`Format`, `Export`, `render`, `plan`, `write_all`) renders JSON, Markdown, text, SRT, WebVTT, CSV, YouTube chapters and a Premiere Pro XMP sidecar, named `<video>.clipscribe.<ext>`; pure and deterministic.
 - Command line: `--format json,srt,md,csv,vtt,txt,chapters,xmp` writes each video's files instead of printing it, `--out-dir DIR` and `--force` set where and whether to overwrite; a video whose files all exist is not described again, and `--estimate` lists the files.
