@@ -1,6 +1,11 @@
 use super::*;
 use crate::{MainRange, TagRange, TagSuggestion, MODELS};
 
+/// A golden file as checked out: a Windows checkout may have turned its line ends into CRLF.
+fn golden(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 fn seg(start_s: f64, end_s: f64, description: &str) -> Segment {
     Segment {
         start_s,
@@ -191,7 +196,7 @@ fn text_matches_the_golden_file() {
     let d = fixture();
     let t = tags();
     let out = render(&export(Path::new("clip.mp4"), &d, Some(&t)), Format::Text);
-    assert_eq!(out, include_str!("golden/clip.txt"));
+    assert_eq!(out, golden(include_str!("golden/clip.txt")));
 }
 
 #[test]
@@ -199,7 +204,7 @@ fn json_matches_the_golden_file() {
     let d = fixture();
     let t = tags();
     let out = render(&export(Path::new("clip.mp4"), &d, Some(&t)), Format::Json);
-    assert_eq!(out, include_str!("golden/clip.json"));
+    assert_eq!(out, golden(include_str!("golden/clip.json")));
 }
 
 #[test]
@@ -279,7 +284,7 @@ fn xmp_matches_the_golden_file_and_is_deterministic() {
     let e = export(Path::new("clip.mp4"), &d, None);
     let out = render(&e, Format::Xmp);
     assert_eq!(out, render(&e, Format::Xmp));
-    assert_eq!(out, include_str!("golden/clip.xmp"));
+    assert_eq!(out, golden(include_str!("golden/clip.xmp")));
 }
 
 #[test]
