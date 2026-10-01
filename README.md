@@ -1,10 +1,14 @@
 # clipscribe
 
+<img src="https://raw.githubusercontent.com/Zelenov/clipscribe/main/docs/icon/clipscribe-256.png" align="left" width="128" height="128" alt="clipscribe icon">
+
 Describe what happens in video clips, and when, with Claude or ChatGPT — a Rust crate
 ([frename](https://github.com/Zelenov/frename) uses it).
 
 A video file and its subtitles go in; a one-sentence summary and time-ranged key moments come
 out, even for clips with no speech.
+
+<br clear="left">
 
 ## How it works
 
