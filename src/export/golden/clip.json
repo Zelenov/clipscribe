@@ -1,0 +1,48 @@
+{
+  "cost_usd": 0.002,
+  "duration_s": 3800.0,
+  "file": "clip.mp4",
+  "frames": 60,
+  "main": {
+    "end_s": 3800.0,
+    "start_s": 4.0
+  },
+  "model": "claude-haiku-4-5",
+  "moments": [
+    {
+      "description": "Он режет лук, быстро. Потом солит.",
+      "end_s": 51.5,
+      "start_s": 4.0
+    },
+    {
+      "description": "Says \"hello\", then\nwaves & leaves <fast>",
+      "end_s": 3800.0,
+      "start_s": 3725.25
+    }
+  ],
+  "new_tag_ideas": [
+    "onion"
+  ],
+  "summary": "A cook plates a dish.",
+  "tags": [
+    {
+      "confidence": 0.9,
+      "name": "kitchen",
+      "ranges": []
+    },
+    {
+      "confidence": 0.55,
+      "name": "waving",
+      "ranges": [
+        {
+          "end_s": 3740.0,
+          "start_s": 3730.0
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 1000,
+    "output_tokens": 200
+  }
+}

@@ -1,0 +1,10 @@
+clip.mp4  1:03:20 · 60 frames · $0.0020
+  A cook plates a dish.
+  Main: 0:04–1:03:20
+  0:04–0:51  Он режет лук, быстро. Потом солит.
+  1:02:05–1:03:20  Says "hello", then
+waves & leaves <fast>
+  Tags:
+    kitchen 90%
+    waving 55% (1:02:10–1:02:20)
+  New tag ideas: onion

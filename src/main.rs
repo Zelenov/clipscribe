@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, ValueEnum};
+use clipscribe::export::{self, Export, Format};
 use clipscribe::{
     describe, describe_moment, describe_with_tags, estimate_tags_usage, estimate_usage,
     format_time, frames, parse_vocabulary, srt, AiUsage, Described, DescribedMoment,
@@ -65,8 +66,27 @@ struct Cli {
     no_subtitles: bool,
 
     /// Print JSON (an array with one object per video) instead of text.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "format")]
     json: bool,
+
+    /// Write each description into files instead of printing it: json, md, txt, srt, vtt, csv,
+    /// chapters (YouTube-style 0:00 lines) or xmp (a Premiere Pro sidecar, `<video>.xmp`).
+    /// Repeat the option or separate the formats with commas: `--format json,srt,md`. One
+    /// request serves every format. Files are named `<video>.clipscribe.<ext>` and written next
+    /// to the video, or into --out-dir; stdout then only lists what was written.
+    /// A video whose files all exist already is not described again.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    format: Vec<FormatArg>,
+
+    /// Where --format writes its files (created if needed); the default is next to each video.
+    /// The xmp sidecar only works next to its video: Premiere does not look elsewhere.
+    #[arg(long, value_name = "DIR", requires = "format")]
+    out_dir: Option<PathBuf>,
+
+    /// Overwrite files --format would write; without it an existing file is skipped and
+    /// reported. Beware the xmp sidecar: Premiere writes its own `<video>.xmp` too.
+    #[arg(long, requires = "format")]
+    force: bool,
 
     /// Only print what describing the videos would cost; nothing is sent.
     #[arg(long)]
@@ -109,6 +129,33 @@ fn parse_at(text: &str) -> Result<f64, String> {
         seconds = seconds * 60.0 + value;
     }
     Ok(seconds)
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum FormatArg {
+    Json,
+    Md,
+    Txt,
+    Srt,
+    Vtt,
+    Csv,
+    Chapters,
+    Xmp,
+}
+
+impl FormatArg {
+    fn format(self) -> Format {
+        match self {
+            Self::Json => Format::Json,
+            Self::Md => Format::Markdown,
+            Self::Txt => Format::Text,
+            Self::Srt => Format::Srt,
+            Self::Vtt => Format::Vtt,
+            Self::Csv => Format::Csv,
+            Self::Chapters => Format::Chapters,
+            Self::Xmp => Format::Xmp,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -287,6 +334,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if cli.at.is_some() && !cli.format.is_empty() {
+        eprintln!("error: --at cannot be combined with --format; use --at --json for one moment");
+        return ExitCode::from(2);
+    }
     if cli.at.is_some() && videos.len() != 1 {
         eprintln!("error: --at takes exactly one video, not {}", videos.len());
         return ExitCode::from(2);
@@ -301,6 +352,15 @@ fn main() -> ExitCode {
         },
         None => None,
     };
+    let output = Output {
+        formats: cli.format.iter().map(|f| f.format()).collect(),
+        out_dir: cli.out_dir.clone(),
+        force: cli.force,
+    };
+    if let Err(e) = output.check(&videos) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     if cli.estimate {
         let dump = cli
             .dump_frames
@@ -312,23 +372,34 @@ fn main() -> ExitCode {
             cli.no_subtitles,
             vocabulary.as_deref(),
             dump,
+            &output,
         );
     }
     if let Some(dir) = &cli.dump_frames {
         clipscribe::set_debug_frames_dir(Some(dir.clone()));
     }
+    let needs_request = !output.is_set() || videos.iter().any(|v| !output.all_exist(v));
     let api_key = cli
         .api_key
         .clone()
         .or_else(|| std::env::var(cli.provider.env_var()).ok())
         .filter(|k| !k.trim().is_empty());
-    let Some(api_key) = api_key else {
+    let Some(api_key) = api_key.or_else(|| (!needs_request).then(String::new)) else {
         eprintln!(
             "error: no API key: set {} or pass --api-key",
             cli.provider.env_var()
         );
         return ExitCode::from(2);
     };
+    let to_write: Vec<PathBuf> = videos
+        .iter()
+        .filter(|v| !output.all_exist(v))
+        .cloned()
+        .collect();
+    if let Err(e) = output.prepare(&to_write) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     let _ = ctrlc::set_handler(|| CANCEL.store(true, Ordering::Relaxed));
     let options = Options {
         api_key: api_key.trim().to_string(),
@@ -366,6 +437,9 @@ fn main() -> ExitCode {
                 Vec::new()
             })
         };
+        if output.is_set() && output.skip_existing(video) {
+            continue;
+        }
         let progress = Progress::new(video);
         let error = if let Some(vocabulary) = &vocabulary {
             let result =
@@ -376,10 +450,12 @@ fn main() -> ExitCode {
             match result {
                 Ok(described) => {
                     total += described.usage;
-                    if cli.json {
+                    if output.is_set() {
+                        failed |= !output.write(&Export::with_tags(video, &described, model));
+                    } else if cli.json {
                         results.push(to_json_with_tags(video, &described, model));
                     } else {
-                        print_text_with_tags(video, &described, model);
+                        print_text(&Export::with_tags(video, &described, model));
                     }
                     None
                 }
@@ -393,10 +469,12 @@ fn main() -> ExitCode {
             match result {
                 Ok(described) => {
                     total += described.usage;
-                    if cli.json {
+                    if output.is_set() {
+                        failed |= !output.write(&Export::new(video, &described, model));
+                    } else if cli.json {
                         results.push(to_json(video, &described, model));
                     } else {
-                        print_text(video, &described, model);
+                        print_text(&Export::new(video, &described, model));
                     }
                     None
                 }
@@ -580,6 +658,7 @@ fn estimate(
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
     dump: Option<(&Path, FrameSampling)>,
+    output: &Output,
 ) -> ExitCode {
     let mut total = AiUsage::default();
     let mut unreadable = 0;
@@ -596,6 +675,15 @@ fn estimate(
                 format_time(duration_s),
                 format_time(MAX_DURATION_S)
             );
+            continue;
+        }
+        if output.is_set() && output.all_exist(video) {
+            println!(
+                "{}: {}, not described again: its files exist",
+                video.display(),
+                format_time(duration_s)
+            );
+            output.list(video);
             continue;
         }
         let subtitle_bytes = if no_subtitles {
@@ -616,6 +704,7 @@ fn estimate(
             format_time(duration_s),
             model.cost_usd(usage)
         );
+        output.list(video);
         if let Some((dir, sampling)) = dump {
             match clipscribe::dump_clip_frames(video, dir, sampling, &CANCEL) {
                 Ok(count) => println!("  {count} frames written to {}", dir.display()),
@@ -637,107 +726,13 @@ fn estimate(
     }
 }
 
-/// The suggested In/Out, when the description has one.
-fn print_main(description: &clipscribe::Description) {
-    if let Some(main) = description.main {
-        println!(
-            "  Main: {}–{}",
-            format_time(main.start_s),
-            format_time(main.end_s)
-        );
-    }
-}
-
-fn main_json(description: &clipscribe::Description) -> serde_json::Value {
-    match description.main {
-        Some(main) => json!({"start_s": main.start_s, "end_s": main.end_s}),
-        None => serde_json::Value::Null,
-    }
-}
-
-fn print_text(video: &Path, described: &Described, model: Model) {
-    println!(
-        "{}  {} · {} frames · ${:.4}",
-        video.display(),
-        format_time(described.duration_s),
-        described.frames,
-        model.cost_usd(described.usage)
-    );
-    println!("  {}", described.description.summary);
-    print_main(&described.description);
-    for moment in &described.description.segments {
-        println!(
-            "  {}–{}  {}",
-            format_time(moment.start_s),
-            format_time(moment.end_s),
-            moment.description
-        );
-    }
-    println!();
+/// What the command line prints for a described video: the `txt` export and a blank line.
+fn print_text(export: &Export) {
+    println!("{}", export::render(export, Format::Text));
 }
 
 fn to_json(video: &Path, described: &Described, model: Model) -> serde_json::Value {
-    json!({
-        "file": video.display().to_string(),
-        "duration_s": described.duration_s,
-        "frames": described.frames,
-        "summary": described.description.summary,
-        "main": main_json(&described.description),
-        "moments": described.description.segments.iter().map(|m| json!({
-            "start_s": m.start_s,
-            "end_s": m.end_s,
-            "description": m.description,
-        })).collect::<Vec<_>>(),
-        "model": model.id,
-        "usage": {
-            "input_tokens": described.usage.input_tokens,
-            "output_tokens": described.usage.output_tokens,
-        },
-        "cost_usd": model.cost_usd(described.usage),
-    })
-}
-
-fn print_text_with_tags(video: &Path, described: &DescribedWithTags, model: Model) {
-    println!(
-        "{}  {} · {} frames · ${:.4}",
-        video.display(),
-        format_time(described.duration_s),
-        described.frames,
-        model.cost_usd(described.usage)
-    );
-    println!("  {}", described.description.summary);
-    print_main(&described.description);
-    for moment in &described.description.segments {
-        println!(
-            "  {}–{}  {}",
-            format_time(moment.start_s),
-            format_time(moment.end_s),
-            moment.description
-        );
-    }
-    if !described.tags.tags.is_empty() {
-        println!("  Tags:");
-        for tag in &described.tags.tags {
-            let ranges: Vec<String> = tag
-                .ranges
-                .iter()
-                .map(|r| format!("{}\u{2013}{}", format_time(r.start_s), format_time(r.end_s)))
-                .collect();
-            let where_ = if ranges.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", ranges.join(", "))
-            };
-            println!("    {} {:.0}%{where_}", tag.name, tag.confidence * 100.0);
-        }
-    }
-    if !described.tags.new_tag_ideas.is_empty() {
-        println!(
-            "  New tag ideas: {}",
-            described.tags.new_tag_ideas.join(", ")
-        );
-    }
-    println!();
+    Export::new(video, described, model).to_json()
 }
 
 fn to_json_with_tags(
@@ -745,33 +740,144 @@ fn to_json_with_tags(
     described: &DescribedWithTags,
     model: Model,
 ) -> serde_json::Value {
-    json!({
-        "file": video.display().to_string(),
-        "duration_s": described.duration_s,
-        "frames": described.frames,
-        "summary": described.description.summary,
-        "main": main_json(&described.description),
-        "moments": described.description.segments.iter().map(|m| json!({
-            "start_s": m.start_s,
-            "end_s": m.end_s,
-            "description": m.description,
-        })).collect::<Vec<_>>(),
-        "tags": described.tags.tags.iter().map(|t| json!({
-            "name": t.name,
-            "confidence": t.confidence,
-            "ranges": t.ranges.iter().map(|r| json!({
-                "start_s": r.start_s,
-                "end_s": r.end_s,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "new_tag_ideas": described.tags.new_tag_ideas,
-        "model": model.id,
-        "usage": {
-            "input_tokens": described.usage.input_tokens,
-            "output_tokens": described.usage.output_tokens,
-        },
-        "cost_usd": model.cost_usd(described.usage),
-    })
+    Export::with_tags(video, described, model).to_json()
+}
+
+/// `--format`: which files to write for each video, and where.
+struct Output {
+    formats: Vec<Format>,
+    out_dir: Option<PathBuf>,
+    force: bool,
+}
+
+impl Output {
+    fn is_set(&self) -> bool {
+        !self.formats.is_empty()
+    }
+
+    fn plan(&self, video: &Path) -> Vec<(Format, PathBuf)> {
+        export::plan(video, &self.formats, self.out_dir.as_deref())
+    }
+
+    /// Whether `path` is taken, a dangling symlink included (writing would fail on it).
+    fn taken(path: &Path) -> bool {
+        path.symlink_metadata().is_ok()
+    }
+
+    /// Without --force, every file of `video` exists already, so describing it again would be
+    /// paid for and thrown away.
+    fn all_exist(&self, video: &Path) -> bool {
+        !self.force && self.plan(video).iter().all(|(_, path)| Self::taken(path))
+    }
+
+    /// Make sure the files can be written before anything is paid for: create the folders and
+    /// try a file in each, so a read-only or missing location fails now, not after N requests.
+    fn prepare(&self, videos: &[PathBuf]) -> Result<(), String> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for video in videos.iter().filter(|_| self.is_set()) {
+            for (_, path) in self.plan(video) {
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        for dir in dirs {
+            let shown = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                &dir
+            };
+            std::fs::create_dir_all(shown)
+                .map_err(|e| format!("{} cannot be written to: {e}", shown.display()))?;
+            let probe = shown.join(format!(".clipscribe-probe-{}", std::process::id()));
+            std::fs::write(&probe, b"")
+                .and_then(|()| std::fs::remove_file(&probe))
+                .map_err(|e| format!("{} cannot be written to: {e}", shown.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Refuse, before anything is sent, two videos that would write the same file (`a/clip.mp4`
+    /// and `b/clip.mp4` into one --out-dir, or `clip.mp4` and `clip.mov` side by side): the
+    /// second description would be paid for and then skipped, or overwrite the first.
+    fn check(&self, videos: &[PathBuf]) -> Result<(), String> {
+        // Compared without `.` components and ignoring case: Windows and macOS file systems
+        // treat `Clip` and `clip` as one file.
+        let key = |path: &Path| {
+            path.components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let mut seen: Vec<(Vec<String>, &Path)> = Vec::new();
+        for video in videos.iter().filter(|_| self.is_set()) {
+            for (_, path) in self.plan(video) {
+                if let Some((_, first)) = seen.iter().find(|(k, _)| *k == key(&path)) {
+                    return Err(format!(
+                        "{} and {} would both write {}: describe them in separate runs",
+                        first.display(),
+                        video.display(),
+                        path.display()
+                    ));
+                }
+                seen.push((key(&path), video));
+            }
+        }
+        Ok(())
+    }
+
+    /// Without --force, a video whose files all exist already is not described again: that
+    /// would be paid for and then thrown away. Says so and returns true.
+    fn skip_existing(&self, video: &Path) -> bool {
+        if !self.all_exist(video) {
+            return false;
+        }
+        println!("{}", video.display());
+        for (_, path) in self.plan(video) {
+            println!("  skipped {} (exists, use --force)", path.display());
+        }
+        true
+    }
+
+    /// Write the files of one described video and say what happened, one line per file.
+    /// Returns false when a file could not be written.
+    fn write(&self, export: &Export) -> bool {
+        match export::write_all(export, &self.formats, self.out_dir.as_deref(), self.force) {
+            Ok(written) => {
+                println!("{}", export.video().display());
+                for file in written {
+                    if file.skipped {
+                        println!("  skipped {} (exists, use --force)", file.path.display());
+                    } else {
+                        println!("  wrote {}", file.path.display());
+                    }
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "error: {}: files not written: {e}",
+                    export.video().display()
+                );
+                // The request is paid for: keep what it answered.
+                print_text(export);
+                false
+            }
+        }
+    }
+
+    /// `--estimate`: the files that would be written for `video`.
+    fn list(&self, video: &Path) {
+        for (_, path) in self.plan(video) {
+            let note = if Self::taken(&path) && !self.force {
+                " (exists, would be skipped)"
+            } else {
+                ""
+            };
+            println!("  would write {}{note}", path.display());
+        }
+    }
 }
 
 /// One status line on stderr for the video in work, when stderr is a terminal.
@@ -858,7 +964,11 @@ mod tests {
     /// no live API key is needed since this exercises the CLI's own formatting, not a real answer.
     #[test]
     fn print_text_with_tags_shows_the_summary_segments_tags_and_ideas() {
-        print_text_with_tags(Path::new("hike.mp4"), &sample(), MODELS[0]);
+        print_text(&Export::with_tags(
+            Path::new("hike.mp4"),
+            &sample(),
+            MODELS[0],
+        ));
     }
 
     fn sample_moment() -> DescribedMoment {
@@ -921,7 +1031,10 @@ mod tests {
     #[test]
     fn the_main_range_is_printed_and_in_the_json_and_null_when_absent() {
         let mut described = sample();
-        assert_eq!(main_json(&described.description), serde_json::Value::Null);
+        assert_eq!(
+            Export::with_tags(Path::new("hike.mp4"), &described, MODELS[0]).to_json()["main"],
+            serde_json::Value::Null
+        );
         described.description.main = Some(clipscribe::MainRange {
             start_s: 7.0,
             end_s: 28.5,
@@ -969,5 +1082,122 @@ mod tests {
         assert!(parse_at("1::3").is_err());
         assert!(parse_at("-5").is_err());
         assert!(parse_at("1:-5").is_err());
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("clipscribe").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn format_takes_a_comma_list_and_can_be_repeated() {
+        let cli = parse(&["a.mp4", "--format", "json,srt", "--format", "md"]).expect("parse");
+        let formats: Vec<Format> = cli.format.iter().map(|f| f.format()).collect();
+        assert_eq!(formats, [Format::Json, Format::Srt, Format::Markdown]);
+        assert!(parse(&["a.mp4", "--format", "docx"]).is_err());
+    }
+
+    #[test]
+    fn every_library_format_has_a_command_line_name() {
+        let mapped: Vec<Format> = FormatArg::value_variants()
+            .iter()
+            .map(|a| a.format())
+            .collect();
+        assert_eq!(mapped, Format::ALL);
+    }
+
+    #[test]
+    fn out_dir_and_force_need_format_and_json_and_at_conflict_with_it() {
+        assert!(parse(&["a.mp4", "--out-dir", "o"]).is_err());
+        assert!(parse(&["a.mp4", "--force"]).is_err());
+        assert!(parse(&["a.mp4", "--format", "json", "--json"]).is_err());
+        assert!(parse(&["a.mp4", "--format", "json", "--out-dir", "o", "--force"]).is_ok());
+        assert!(parse(&["a.mp4", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn output_writes_every_format_from_one_description_and_skips_existing_files() {
+        let dir = std::env::temp_dir().join(format!("clipscribe-cli-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let video = dir.join("hike.mp4");
+        let described = Described {
+            description: sample().description,
+            usage: AiUsage::default(),
+            duration_s: 90.0,
+            frames: 3,
+        };
+        let export = Export::new(&video, &described, MODELS[0]);
+        let output = Output {
+            formats: vec![Format::Json, Format::Srt, Format::Csv],
+            out_dir: Some(dir.join("out")),
+            force: false,
+        };
+        assert!(output.write(&export));
+        for ext in ["json", "srt", "csv"] {
+            assert!(dir
+                .join("out")
+                .join(format!("hike.clipscribe.{ext}"))
+                .exists());
+        }
+        std::fs::write(dir.join("out/hike.clipscribe.srt"), "mine").expect("edit");
+        assert!(output.write(&export));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out/hike.clipscribe.srt")).expect("read"),
+            "mine"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn output(dir: &Path, formats: Vec<Format>, force: bool) -> Output {
+        Output {
+            formats,
+            out_dir: Some(dir.to_path_buf()),
+            force,
+        }
+    }
+
+    #[test]
+    fn two_videos_writing_the_same_file_are_refused_before_any_request() {
+        let output = output(Path::new("out"), vec![Format::Json], false);
+        let videos = [PathBuf::from("a/clip.mp4"), PathBuf::from("b/clip.mp4")];
+        let error = output.check(&videos).expect_err("collision");
+        assert!(
+            error.contains("a/clip.mp4") && error.contains("b/clip.mp4"),
+            "{error}"
+        );
+        assert!(error.contains("clip.clipscribe.json"), "{error}");
+        let other = [PathBuf::from("a/one.mp4"), PathBuf::from("b/two.mp4")];
+        assert!(output.check(&other).is_ok());
+        let none = Output {
+            formats: Vec::new(),
+            out_dir: None,
+            force: false,
+        };
+        assert!(
+            none.check(&videos).is_ok(),
+            "without --format nothing is written"
+        );
+    }
+
+    #[test]
+    fn a_video_whose_files_all_exist_is_not_described_again_unless_forced() {
+        let dir = std::env::temp_dir().join(format!("clipscribe-cli-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let video = Path::new("hike.mp4");
+        let formats = vec![Format::Json, Format::Srt];
+        let output = output(&dir, formats.clone(), false);
+        assert!(
+            !output.skip_existing(video),
+            "nothing written yet: describe it"
+        );
+        std::fs::write(dir.join("hike.clipscribe.json"), "{}").expect("json");
+        assert!(
+            !output.skip_existing(video),
+            "one file missing: describe it"
+        );
+        std::fs::write(dir.join("hike.clipscribe.srt"), "").expect("srt");
+        assert!(output.skip_existing(video));
+        assert!(!self::output(&dir, formats, true).skip_existing(video));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

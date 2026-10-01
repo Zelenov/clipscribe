@@ -93,6 +93,18 @@ same window. `MOMENT_WINDOW_S` (1 s) is a reasonable default for `window_s`. Ret
 `DescribedMoment { moment: Moment { name, description }, usage }` — `moment.name` is a few words,
 fit for a marker label; `usage` prices with `Model::cost_usd` like any other call.
 
+### Writing files
+
+`export` turns a description into files, so an editor or a website can use it without another
+request. `Export::new(video, &described, model)` (or `Export::with_tags` for `describe_with_tags`)
+wraps a result; `export::render(&export, Format::Srt)` gives one format as a `String`, and
+`export::write_all(&export, &[Format::Json, Format::Srt], out_dir, force)` writes several, as
+`<video>.clipscribe.<ext>` next to the video or in `out_dir`, leaving an existing file alone
+unless `force`. The formats are `Json`, `Markdown`, `Text`, `Srt` and `Vtt` (moments as cues),
+`Csv` (one row per moment), `Chapters` (YouTube-style `0:00 Title` lines) and `Xmp` (a Premiere Pro
+sidecar, `<video>.xmp`: moments as Comment markers, the main range as an InOut marker). Nothing
+is sent anywhere and the output is deterministic.
+
 ### Seeing the frames
 
 To check which images the model got, call `set_debug_frames_dir(Some(dir))` (or set
