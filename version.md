@@ -1,4 +1,4 @@
-# NEXT
+# 0.8.1
 ## Added
 - The Windows `clipscribe.exe` has the app icon (Explorer, taskbar, file properties), and the README shows it; library and non-Windows builds are unchanged.
 
