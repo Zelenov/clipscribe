@@ -9,7 +9,7 @@ keywords = ["video", "claude", "anthropic", "description", "gstreamer"]
 categories = ["multimedia::video", "command-line-utilities"]
 readme = "README.md"
 # The crate is the code; the test clips and CI scripts stay in the repository.
-include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "version.md"]
+include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "version.md", "build.rs", "docs/icon/clipscribe.ico"]
 
 # docs.rs: the library with `describe`, without the command line.
 [package.metadata.docs.rs]
@@ -46,6 +46,10 @@ url = { version = "2.5", optional = true }
 
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = { version = "3", optional = true }
+
+# The Windows exe icon (build.rs); built only on a Windows host.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 lto = true
