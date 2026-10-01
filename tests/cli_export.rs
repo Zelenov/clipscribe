@@ -27,6 +27,9 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+// `--estimate` reads the clip with GStreamer; like the other decoding tests it runs on Linux, where
+// CI decodes the test clips. The file listing itself is covered by the unit tests in main.rs.
+#[cfg(target_os = "linux")]
 #[test]
 fn estimate_lists_the_files_and_notes_existing_ones() {
     let dir = scratch("estimate");
@@ -106,6 +109,8 @@ fn colliding_outputs_and_an_unwritable_folder_fail_before_any_request() {
     std::fs::write(&out_dir, "").expect("a file in the way");
     let out = run(&[
         a.join("clip.mp4").to_str().expect("utf8"),
+        "--api-key",
+        "unused",
         "--format",
         "json",
         "--out-dir",

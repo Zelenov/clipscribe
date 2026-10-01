@@ -378,10 +378,6 @@ fn main() -> ExitCode {
     if let Some(dir) = &cli.dump_frames {
         clipscribe::set_debug_frames_dir(Some(dir.clone()));
     }
-    if let Err(e) = output.prepare(&videos) {
-        eprintln!("error: {e}");
-        return ExitCode::from(2);
-    }
     let needs_request = !output.is_set() || videos.iter().any(|v| !output.all_exist(v));
     let api_key = cli
         .api_key
@@ -395,6 +391,15 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     };
+    let to_write: Vec<PathBuf> = videos
+        .iter()
+        .filter(|v| !output.all_exist(v))
+        .cloned()
+        .collect();
+    if let Err(e) = output.prepare(&to_write) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     let _ = ctrlc::set_handler(|| CANCEL.store(true, Ordering::Relaxed));
     let options = Options {
         api_key: api_key.trim().to_string(),
