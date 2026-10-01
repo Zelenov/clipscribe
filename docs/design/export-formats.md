@@ -5,7 +5,7 @@ One run writes each description into several files, from the one request already
 ## Library
 
 `clipscribe::export`: `Format`, `Export` (a view of a `Described` / `DescribedWithTags` plus the
-video path and model), `render(&Export, Format) -> String`, `output_path`, `write_all`. No network,
+video path and model), `render(&Export, Format) -> String`, `plan` (the file names), `write_all`. No network,
 no clock, no randomness (marker ids are a hash of file stem, index, start and text), so golden
 tests can pin the bytes. It needs no GStreamer and is available without the `frames` feature.
 
@@ -55,3 +55,11 @@ always `<stem>.xmp`: Premiere only reads that name. Existing files are skipped a
   change; `Format` is `#[non_exhaustive]` for the same reason (edl/fcpxml may follow).
 - `--out-dir` with `xmp` puts the sidecar where Premiere does not look; the help says so, as it
   does for `--force` overwriting Premiere's own sidecar.
+- The name of a format follows the issue: `<stem>.<format>.<ext>` only when two requested
+  formats share an extension, so `txt` alone is `clip.clipscribe.txt` and `txt,chapters` is
+  `clip.txt.txt` plus `clip.chapters.txt`. The skip check uses the names of the current run.
+- Before the first request the output folders are created and probed for writing, and two inputs
+  whose outputs differ only by case or `./` are refused as colliding; a file that fails halfway
+  is removed, and when files cannot be written the paid description is printed instead of lost.
+- The XMP structure is a second writer next to frename-core's; frename can switch to
+  `export::render(.., Format::Xmp)` for new files when its pin moves.

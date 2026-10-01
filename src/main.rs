@@ -378,12 +378,17 @@ fn main() -> ExitCode {
     if let Some(dir) = &cli.dump_frames {
         clipscribe::set_debug_frames_dir(Some(dir.clone()));
     }
+    if let Err(e) = output.prepare(&videos) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
+    let needs_request = !output.is_set() || videos.iter().any(|v| !output.all_exist(v));
     let api_key = cli
         .api_key
         .clone()
         .or_else(|| std::env::var(cli.provider.env_var()).ok())
         .filter(|k| !k.trim().is_empty());
-    let Some(api_key) = api_key else {
+    let Some(api_key) = api_key.or_else(|| (!needs_request).then(String::new)) else {
         eprintln!(
             "error: no API key: set {} or pass --api-key",
             cli.provider.env_var()
@@ -667,6 +672,15 @@ fn estimate(
             );
             continue;
         }
+        if output.is_set() && output.all_exist(video) {
+            println!(
+                "{}: {}, not described again: its files exist",
+                video.display(),
+                format_time(duration_s)
+            );
+            output.list(video);
+            continue;
+        }
         let subtitle_bytes = if no_subtitles {
             0
         } else {
@@ -740,14 +754,61 @@ impl Output {
         export::plan(video, &self.formats, self.out_dir.as_deref())
     }
 
+    /// Whether `path` is taken, a dangling symlink included (writing would fail on it).
+    fn taken(path: &Path) -> bool {
+        path.symlink_metadata().is_ok()
+    }
+
+    /// Without --force, every file of `video` exists already, so describing it again would be
+    /// paid for and thrown away.
+    fn all_exist(&self, video: &Path) -> bool {
+        !self.force && self.plan(video).iter().all(|(_, path)| Self::taken(path))
+    }
+
+    /// Make sure the files can be written before anything is paid for: create the folders and
+    /// try a file in each, so a read-only or missing location fails now, not after N requests.
+    fn prepare(&self, videos: &[PathBuf]) -> Result<(), String> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for video in videos.iter().filter(|_| self.is_set()) {
+            for (_, path) in self.plan(video) {
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        for dir in dirs {
+            let shown = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                &dir
+            };
+            std::fs::create_dir_all(shown)
+                .map_err(|e| format!("{} cannot be written to: {e}", shown.display()))?;
+            let probe = shown.join(format!(".clipscribe-probe-{}", std::process::id()));
+            std::fs::write(&probe, b"")
+                .and_then(|()| std::fs::remove_file(&probe))
+                .map_err(|e| format!("{} cannot be written to: {e}", shown.display()))?;
+        }
+        Ok(())
+    }
+
     /// Refuse, before anything is sent, two videos that would write the same file (`a/clip.mp4`
     /// and `b/clip.mp4` into one --out-dir, or `clip.mp4` and `clip.mov` side by side): the
     /// second description would be paid for and then skipped, or overwrite the first.
     fn check(&self, videos: &[PathBuf]) -> Result<(), String> {
-        let mut seen: Vec<(PathBuf, &Path)> = Vec::new();
+        // Compared without `.` components and ignoring case: Windows and macOS file systems
+        // treat `Clip` and `clip` as one file.
+        let key = |path: &Path| {
+            path.components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let mut seen: Vec<(Vec<String>, &Path)> = Vec::new();
         for video in videos.iter().filter(|_| self.is_set()) {
             for (_, path) in self.plan(video) {
-                if let Some((_, first)) = seen.iter().find(|(p, _)| *p == path) {
+                if let Some((_, first)) = seen.iter().find(|(k, _)| *k == key(&path)) {
                     return Err(format!(
                         "{} and {} would both write {}: describe them in separate runs",
                         first.display(),
@@ -755,7 +816,7 @@ impl Output {
                         path.display()
                     ));
                 }
-                seen.push((path, video));
+                seen.push((key(&path), video));
             }
         }
         Ok(())
@@ -764,7 +825,7 @@ impl Output {
     /// Without --force, a video whose files all exist already is not described again: that
     /// would be paid for and then thrown away. Says so and returns true.
     fn skip_existing(&self, video: &Path) -> bool {
-        if self.force || !self.plan(video).iter().all(|(_, path)| path.exists()) {
+        if !self.all_exist(video) {
             return false;
         }
         println!("{}", video.display());
@@ -794,6 +855,8 @@ impl Output {
                     "error: {}: files not written: {e}",
                     export.video().display()
                 );
+                // The request is paid for: keep what it answered.
+                print_text(export);
                 false
             }
         }
@@ -802,7 +865,7 @@ impl Output {
     /// `--estimate`: the files that would be written for `video`.
     fn list(&self, video: &Path) {
         for (_, path) in self.plan(video) {
-            let note = if path.exists() && !self.force {
+            let note = if Self::taken(&path) && !self.force {
                 " (exists, would be skipped)"
             } else {
                 ""

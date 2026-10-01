@@ -414,3 +414,14 @@ fn write_all_creates_the_out_dir_and_never_touches_the_videos_own_srt() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn chapters_look_at_the_first_moment_that_has_text() {
+    let d = Description {
+        summary: String::new(),
+        segments: vec![seg(0.0, 5.0, "  "), seg(30.0, 40.0, "Late start")],
+        main: None,
+    };
+    let out = render(&export(Path::new("a.mp4"), &d, None), Format::Chapters);
+    assert_eq!(out, "0:00 a\n0:30 Late start\n");
+}

@@ -294,7 +294,7 @@ fn markdown(export: &Export) -> String {
 
 /// `HH:MM:SS<sep>mmm`, rounded to the millisecond.
 fn cue_time(seconds: f64, separator: char) -> String {
-    let total_ms = (seconds.max(0.0) * 1000.0).round() as u64;
+    let total_ms = millis(seconds);
     let (ms, s) = (total_ms % 1000, total_ms / 1000);
     format!(
         "{:02}:{:02}:{:02}{separator}{ms:03}",
@@ -425,13 +425,18 @@ fn title(description: &str, max: usize) -> String {
 }
 
 fn chapters(export: &Export) -> String {
-    let segments = &export.description.segments;
+    let mut moments = export
+        .description
+        .segments
+        .iter()
+        .filter(|m| !m.description.trim().is_empty())
+        .peekable();
     let mut out = String::new();
     // YouTube wants the first chapter at 0:00.
-    if segments.first().is_some_and(|s| s.start_s >= 1.0) {
+    if moments.peek().is_some_and(|m| m.start_s >= 1.0) {
         let _ = writeln!(out, "0:00 {}", export.stem());
     }
-    for moment in segments.iter().filter(|m| !m.description.trim().is_empty()) {
+    for moment in moments {
         let _ = writeln!(
             out,
             "{} {}",
@@ -551,8 +556,11 @@ fn xmp(export: &Export) -> String {
 
 /// What [`write_all`] did with one format.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Written {
+    /// The format that was written.
     pub format: Format,
+    /// The file it went to.
     pub path: PathBuf,
     /// The file already existed and `force` was off, so it was left alone.
     pub skipped: bool,
@@ -626,7 +634,12 @@ pub fn write_all(
         }
         let skipped = match options.open(&path) {
             Ok(mut file) => {
-                std::io::Write::write_all(&mut file, text.as_bytes())?;
+                if let Err(e) = std::io::Write::write_all(&mut file, text.as_bytes()) {
+                    // A truncated file would count as "exists" on the next run.
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
                 false
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
