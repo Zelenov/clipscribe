@@ -1,0 +1,43 @@
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmpDM="http://ns.adobe.com/xmp/1.0/DynamicMedia/">
+   <xmpDM:Tracks><rdf:Bag>
+    <rdf:li rdf:parseType="Resource">
+     <xmpDM:trackName>Comment</xmpDM:trackName>
+     <xmpDM:trackType>Comment</xmpDM:trackType>
+     <xmpDM:frameRate>f1000</xmpDM:frameRate>
+     <xmpDM:markers><rdf:Seq>
+      <rdf:li rdf:parseType="Resource">
+       <xmpDM:startTime>4000</xmpDM:startTime>
+       <xmpDM:duration>47500</xmpDM:duration>
+       <xmpDM:name>Он режет лук, быстро</xmpDM:name>
+       <xmpDM:comment>Он режет лук, быстро. Потом солит.</xmpDM:comment>
+       <xmpDM:guid>e42bc1d2-dd92-c5d7-f031-70e4405ed10c</xmpDM:guid>
+       <xmpDM:cuePointParams><rdf:Seq>
+        <rdf:li rdf:parseType="Resource"><xmpDM:key>marker_guid</xmpDM:key>
+          <xmpDM:value>e42bc1d2-dd92-c5d7-f031-70e4405ed10c</xmpDM:value></rdf:li>
+       </rdf:Seq></xmpDM:cuePointParams>
+      </rdf:li>
+      <rdf:li rdf:parseType="Resource">
+       <xmpDM:startTime>3725250</xmpDM:startTime>
+       <xmpDM:duration>74750</xmpDM:duration>
+       <xmpDM:name>Says &quot;hello&quot;, then waves &amp; leaves &lt;fast&gt;</xmpDM:name>
+       <xmpDM:comment>Says &quot;hello&quot;, then&#xD;waves &amp; leaves &lt;fast&gt;</xmpDM:comment>
+       <xmpDM:guid>bb257724-e016-936f-2dd2-ea355aeecf63</xmpDM:guid>
+       <xmpDM:cuePointParams><rdf:Seq>
+        <rdf:li rdf:parseType="Resource"><xmpDM:key>marker_guid</xmpDM:key>
+          <xmpDM:value>bb257724-e016-936f-2dd2-ea355aeecf63</xmpDM:value></rdf:li>
+       </rdf:Seq></xmpDM:cuePointParams>
+      </rdf:li>
+     </rdf:Seq></xmpDM:markers>
+    </rdf:li>
+    <rdf:li rdf:parseType="Resource">
+     <xmpDM:trackName>InOut</xmpDM:trackName>
+     <xmpDM:trackType>InOut</xmpDM:trackType>
+     <xmpDM:frameRate>f1000</xmpDM:frameRate>
+     <xmpDM:markers><rdf:Seq><rdf:li><rdf:Description xmpDM:startTime="4000" xmpDM:duration="3796000" xmpDM:name="in-out"/></rdf:li></rdf:Seq></xmpDM:markers>
+    </rdf:li>
+   </rdf:Bag></xmpDM:Tracks>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>

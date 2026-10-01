@@ -33,6 +33,7 @@
 pub mod anthropic;
 mod debug_frames;
 mod describe;
+pub mod export;
 #[cfg(feature = "frames")]
 pub mod frames;
 mod moment;
