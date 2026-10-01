@@ -76,14 +76,14 @@ fn static_clip() -> Description {
 }
 
 #[test]
-fn format_names_round_trip_and_aliases_work() {
-    for format in Format::ALL {
-        assert_eq!(Format::from_name(format.name()), Some(format));
-    }
-    assert_eq!(Format::from_name(" MD "), Some(Format::Markdown));
-    assert_eq!(Format::from_name("markdown"), Some(Format::Markdown));
-    assert_eq!(Format::from_name("text"), Some(Format::Text));
-    assert_eq!(Format::from_name("docx"), None);
+fn format_names_and_extensions_are_distinct_per_format() {
+    let names: Vec<&str> = Format::ALL.iter().map(|f| f.name()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len());
+    assert_eq!(Format::Chapters.extension(), "txt");
+    assert_eq!(Format::Markdown.extension(), "md");
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn vtt_uses_dots_and_a_header() {
     assert_eq!(
         out,
         "WEBVTT\n\n00:00:04.000 --> 00:00:51.500\nОн режет лук, быстро. Потом солит.\n\n\
-         01:02:05.250 --> 01:03:20.000\nSays \"hello\", then\nwaves & leaves <fast>\n"
+         01:02:05.250 --> 01:03:20.000\nSays \"hello\", then\nwaves &amp; leaves &lt;fast>\n"
     );
 }
 
@@ -187,13 +187,73 @@ fn markdown_lists_the_main_range_moments_and_tags() {
 }
 
 #[test]
-fn text_matches_the_command_line_layout() {
+fn text_matches_the_golden_file() {
     let d = fixture();
-    let out = render(&export(Path::new("clip.mp4"), &d, None), Format::Text);
-    assert!(out.starts_with("clip.mp4  1:03:20 \u{b7} 60 frames \u{b7} $"));
-    assert!(out.contains(
-        "\n  A cook plates a dish.\n  Main: 0:04\u{2013}1:03:20\n  0:04\u{2013}0:51  Он режет"
-    ));
+    let t = tags();
+    let out = render(&export(Path::new("clip.mp4"), &d, Some(&t)), Format::Text);
+    assert_eq!(out, include_str!("golden/clip.txt"));
+}
+
+#[test]
+fn json_matches_the_golden_file() {
+    let d = fixture();
+    let t = tags();
+    let out = render(&export(Path::new("clip.mp4"), &d, Some(&t)), Format::Json);
+    assert_eq!(out, include_str!("golden/clip.json"));
+}
+
+#[test]
+fn csv_neutralises_formulas() {
+    assert_eq!(csv_field("=1+1"), "'=1+1");
+    assert_eq!(csv_field("@SUM(A1)"), "'@SUM(A1)");
+    assert_eq!(csv_field("-5, ok"), "\"'-5, ok\"");
+    assert_eq!(csv_field("plain"), "plain");
+}
+
+#[test]
+fn vtt_text_cannot_inject_timing_or_markup_and_blank_cues_are_dropped() {
+    let d = Description {
+        summary: String::new(),
+        segments: vec![
+            seg(1.0, 2.0, "a --> b <i>&"),
+            seg(2.0, 3.0, "   \n "),
+            seg(3.0, 4.0, "last"),
+        ],
+        main: None,
+    };
+    let e = export(Path::new("a.mp4"), &d, None);
+    assert_eq!(
+        render(&e, Format::Vtt),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\na --&gt; b &lt;i>&amp;\n\n00:00:03.000 --> 00:00:04.000\nlast\n"
+    );
+    assert_eq!(
+        render(&e, Format::Srt),
+        "1\n00:00:01,000 --> 00:00:02,000\na --> b <i>&\n\n2\n00:00:03,000 --> 00:00:04,000\nlast\n\n",
+        "SRT numbers the cues that are written"
+    );
+    assert_eq!(
+        render(&e, Format::Chapters),
+        "0:00 a\n0:01 a --> b <i>&\n0:03 last\n"
+    );
+}
+
+#[test]
+fn a_title_of_only_punctuation_is_kept_and_xml_drops_forbidden_characters() {
+    assert_eq!(title("...", 50), "...");
+    assert_eq!(xml_escape("a\u{fffe}b\u{1}c\u{1F600}"), "abc\u{1F600}");
+}
+
+#[test]
+fn plan_names_each_format_once_and_removes_nothing_from_disk() {
+    let video = Path::new("d/clip.mp4");
+    let planned = plan(video, &[Format::Json, Format::Json, Format::Xmp], None);
+    assert_eq!(
+        planned,
+        vec![
+            (Format::Json, PathBuf::from("d/clip.clipscribe.json")),
+            (Format::Xmp, PathBuf::from("d/clip.xmp")),
+        ]
+    );
 }
 
 #[test]

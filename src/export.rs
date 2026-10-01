@@ -17,6 +17,7 @@ use crate::{
 
 /// A file format a description can be written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Format {
     /// The object `--json` prints for one video, including the main range, tags and usage.
     Json,
@@ -64,20 +65,6 @@ impl Format {
         }
     }
 
-    /// The format named `name` (case-insensitive); `markdown` and `text` are accepted for `md`
-    /// and `txt`.
-    pub fn from_name(name: &str) -> Option<Self> {
-        let name = name.trim().to_ascii_lowercase();
-        Self::ALL
-            .into_iter()
-            .find(|f| f.name() == name)
-            .or(match name.as_str() {
-                "markdown" => Some(Format::Markdown),
-                "text" => Some(Format::Text),
-                _ => None,
-            })
-    }
-
     /// The file extension, without the dot.
     pub fn extension(self) -> &'static str {
         match self {
@@ -87,20 +74,22 @@ impl Format {
     }
 }
 
-/// A described clip with what [`render`] needs around the description.
+/// A described clip with what [`render`] needs around the description: the video it came
+/// from, its cost, and the tag suggestions when there are any. Built with [`Export::new`] or
+/// [`Export::with_tags`] from what [`crate::describe`] / [`crate::describe_with_tags`] returned.
 #[derive(Debug, Clone)]
 pub struct Export<'a> {
-    pub video: &'a Path,
-    pub description: &'a Description,
-    /// Present when the clip was described with [`crate::describe_with_tags`].
-    pub tags: Option<&'a TagSuggestions>,
-    pub duration_s: f64,
-    pub frames: usize,
-    pub usage: AiUsage,
-    pub model: Model,
+    video: &'a Path,
+    description: &'a Description,
+    tags: Option<&'a TagSuggestions>,
+    duration_s: f64,
+    frames: usize,
+    usage: AiUsage,
+    model: Model,
 }
 
 impl<'a> Export<'a> {
+    /// A clip described with [`crate::describe`]; `model` prices the usage.
     pub fn new(video: &'a Path, described: &'a Described, model: Model) -> Self {
         Self {
             video,
@@ -113,6 +102,7 @@ impl<'a> Export<'a> {
         }
     }
 
+    /// A clip described with [`crate::describe_with_tags`]; `model` prices the usage.
     pub fn with_tags(video: &'a Path, described: &'a DescribedWithTags, model: Model) -> Self {
         Self {
             video,
@@ -125,14 +115,17 @@ impl<'a> Export<'a> {
         }
     }
 
+    /// The video this description is of.
+    pub fn video(&self) -> &Path {
+        self.video
+    }
+
     fn cost_usd(&self) -> f64 {
         self.model.cost_usd(self.usage)
     }
 
     fn stem(&self) -> String {
-        self.video
-            .file_stem()
-            .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
+        stem_of(self.video)
     }
 
     /// The JSON object for this clip: what `--json` prints per video.
@@ -179,6 +172,13 @@ impl<'a> Export<'a> {
         }
         value
     }
+}
+
+/// The video's file name without the extension, `clip` when it has none.
+fn stem_of(video: &Path) -> String {
+    video
+        .file_stem()
+        .map_or_else(|| "clip".to_string(), |s| s.to_string_lossy().into_owned())
 }
 
 /// `export` as `format`. Always ends with a newline (except an empty SRT, which is empty).
@@ -310,11 +310,34 @@ fn cues(export: &Export, vtt: bool) -> String {
     if vtt {
         out.push_str("WEBVTT\n");
     }
-    for (i, moment) in export.description.segments.iter().enumerate() {
+    let mut number = 0;
+    for moment in &export.description.segments {
+        // A blank line would end the cue, so lines are trimmed and empty ones dropped.
+        let text = moment
+            .description
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                if vtt {
+                    // WebVTT reads `-->` as timing and `<` and `&` as markup.
+                    l.replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace("-->", "--&gt;")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            continue;
+        }
+        number += 1;
         if vtt {
             out.push('\n');
         } else {
-            let _ = writeln!(out, "{}", i + 1);
+            let _ = writeln!(out, "{number}");
         }
         let _ = writeln!(
             out,
@@ -322,14 +345,6 @@ fn cues(export: &Export, vtt: bool) -> String {
             cue_time(moment.start_s, separator),
             cue_time(moment.end_s, separator)
         );
-        // A blank line would end the cue.
-        let text = moment
-            .description
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
         let _ = writeln!(out, "{text}");
         if !vtt {
             out.push('\n');
@@ -338,8 +353,13 @@ fn cues(export: &Export, vtt: bool) -> String {
     out
 }
 
-/// A field for a CSV row: quoted when it holds a comma, quote or line break.
+/// A field for a CSV row: quoted when it holds a comma, quote or line break, and a leading
+/// `'` keeps a spreadsheet from reading it as a formula.
 fn csv_field(value: &str) -> String {
+    // A spreadsheet runs a cell that starts with one of these as a formula.
+    if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        return csv_field(&format!("'{value}"));
+    }
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
@@ -395,6 +415,7 @@ fn title(description: &str, max: usize) -> String {
         .find(|&(i, c)| matches!(c, '.' | '!' | '?') && line[i + c.len_utf8()..].starts_with(' '))
         .map_or(line.len(), |(i, c)| i + c.len_utf8());
     let sentence = line[..end].trim_end_matches('.');
+    let sentence = if sentence.is_empty() { &line } else { sentence };
     if sentence.chars().count() <= max {
         sentence.to_string()
     } else {
@@ -410,7 +431,7 @@ fn chapters(export: &Export) -> String {
     if segments.first().is_some_and(|s| s.start_s >= 1.0) {
         let _ = writeln!(out, "0:00 {}", export.stem());
     }
-    for moment in segments {
+    for moment in segments.iter().filter(|m| !m.description.trim().is_empty()) {
         let _ = writeln!(
             out,
             "{} {}",
@@ -432,6 +453,7 @@ fn xml_escape(text: &str) -> String {
             '\n' => out.push_str("&#xD;"),
             '\r' => {}
             c if (c as u32) < 0x20 && c != '\t' => {}
+            '\u{fffe}' | '\u{ffff}' => {}
             c => out.push(c),
         }
     }
@@ -540,15 +562,13 @@ pub struct Written {
 /// `out_dir`. Two of `formats` sharing an extension (`txt` and `chapters`) are named
 /// `<stem>.<format>.<ext>` instead, and the XMP sidecar is always `<stem>.xmp`, the name
 /// Premiere looks for.
-pub fn output_path(
+fn output_path(
     video: &Path,
     out_dir: Option<&Path>,
     format: Format,
     formats: &[Format],
 ) -> PathBuf {
-    let stem = video
-        .file_stem()
-        .map_or_else(|| "clip".to_string(), |s| s.to_string_lossy().into_owned());
+    let stem = stem_of(video);
     let name = if format == Format::Xmp {
         format!("{stem}.xmp")
     } else if formats
@@ -566,40 +586,56 @@ pub fn output_path(
     dir.join(name)
 }
 
-/// Write `export` in each of `formats` (duplicates once). An existing file is left alone and
-/// reported as skipped unless `force`. The output folder is created. Stops at the first
-/// error; files already written stay.
-pub fn write_all(
-    export: &Export,
-    formats: &[Format],
-    out_dir: Option<&Path>,
-    force: bool,
-) -> std::io::Result<Vec<Written>> {
+/// The files [`write_all`] writes for `video`, in the order of `formats` (a format named twice
+/// counts once), with their paths. Nothing is touched, so it also serves to check beforehand
+/// what exists or collides.
+pub fn plan(video: &Path, formats: &[Format], out_dir: Option<&Path>) -> Vec<(Format, PathBuf)> {
     let mut unique: Vec<Format> = Vec::new();
     for &format in formats {
         if !unique.contains(&format) {
             unique.push(format);
         }
     }
+    unique
+        .iter()
+        .map(|&format| (format, output_path(video, out_dir, format, &unique)))
+        .collect()
+}
+
+/// Write `export` in each of `formats` (see [`plan`] for the names). An existing file is left
+/// alone and reported as skipped unless `force`. The output folder is created. Stops at the
+/// first error; files already written stay.
+pub fn write_all(
+    export: &Export,
+    formats: &[Format],
+    out_dir: Option<&Path>,
+    force: bool,
+) -> std::io::Result<Vec<Written>> {
     let mut written = Vec::new();
-    for &format in &unique {
-        let path = output_path(export.video, out_dir, format, &unique);
+    for (format, path) in plan(export.video, formats, out_dir) {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        if !force && path.exists() {
-            written.push(Written {
-                format,
-                path,
-                skipped: true,
-            });
-            continue;
+        let text = render(export, format);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true);
+        if force {
+            options.create(true).truncate(true);
+        } else {
+            options.create_new(true);
         }
-        std::fs::write(&path, render(export, format))?;
+        let skipped = match options.open(&path) {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, text.as_bytes())?;
+                false
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+            Err(e) => return Err(e),
+        };
         written.push(Written {
             format,
             path,
-            skipped: false,
+            skipped,
         });
     }
     Ok(written)

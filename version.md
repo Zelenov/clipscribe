@@ -3,14 +3,17 @@
 - Write a description into files, several formats from one request: the new `export` module has
   `Format` (`Json`, `Markdown`, `Text`, `Srt`, `Vtt`, `Csv`, `Chapters`, `Xmp`), `Export`
   (`Export::new` for a `Described`, `Export::with_tags` for a `DescribedWithTags`),
-  `render(&export, format) -> String` and `write_all(&export, &formats, out_dir, force)`. Files are
+  `render(&export, format) -> String`, `plan(video, &formats, out_dir)` (the file names) and
+  `write_all(&export, &formats, out_dir, force)`. Files are
   named `<video>.clipscribe.<ext>` (the Premiere sidecar is `<video>.xmp`), so the video's own
   `.srt` is never overwritten; an existing file is skipped unless `force`. The XMP sidecar has the
   moments as Comment markers and the main range as an InOut marker, the same structure frename
   writes. Pure: no network, the same input gives the same bytes.
 - Command line: `--format json,srt,md,csv,vtt,txt,chapters,xmp` (repeatable or comma-separated)
   writes each video's files instead of printing it, `--out-dir DIR` puts them in one folder and
-  `--force` overwrites. `--estimate` lists the files that would be written. `--format` cannot be
+  `--force` overwrites. A video whose files all exist is not described again (no request, no
+  cost), and two videos that would write the same file are refused before any request.
+  `--estimate` lists the files that would be written. `--format` cannot be
   combined with `--json` or `--at`.
 
 # 0.8.0
