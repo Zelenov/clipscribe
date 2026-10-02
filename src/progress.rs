@@ -17,6 +17,15 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, P
 /// The width lines are cut to when stderr is not a terminal.
 const PLAIN_WIDTH: usize = 100;
 
+/// Narrower than this the bars are not drawn: the margin that keeps Ctrl+C's echo from wrapping
+/// would leave no room.
+const MIN_WIDTH: usize = 24;
+
+/// Whether the `TERM` variable names a terminal that cannot move the cursor.
+fn is_dumb(term: Option<std::ffi::OsString>) -> bool {
+    term.is_some_and(|t| t == "dumb")
+}
+
 /// What describing the inputs is expected to take, for the line printed before starting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -224,7 +233,7 @@ struct Margin(console::Term);
 
 impl indicatif::TermLike for Margin {
     fn width(&self) -> u16 {
-        self.0.size().1.saturating_sub(2).max(20)
+        self.0.size().1.saturating_sub(2).max(1)
     }
     fn move_cursor_up(&self, n: usize) -> std::io::Result<()> {
         self.0.move_cursor_up(n)
@@ -320,12 +329,16 @@ impl Batch {
     /// bars, the plan and the summary off, leaving the result lines; a stderr that is not a
     /// terminal does the same.
     pub fn new(model: Model, total_videos: usize, footage_s: f64, quiet: bool) -> Self {
-        // `is_attended` is a terminal that can take cursor movement (not `TERM=dumb`).
-        let terminal = console::Term::stderr().features().is_attended();
+        let term = console::Term::stderr();
+        let width = usize::from(term.size().1);
+        // A terminal that takes cursor movement: not `TERM=dumb`, and wide enough to draw in.
+        let terminal = term.features().is_attended()
+            && !is_dumb(std::env::var_os("TERM"))
+            && width >= MIN_WIDTH;
         // Without a terminal the display is only the result lines, as with `--quiet`.
         let quiet = quiet || !terminal;
         let width = if terminal {
-            usize::from(console::Term::stderr().size().1).saturating_sub(2)
+            width.saturating_sub(2)
         } else {
             PLAIN_WIDTH
         };
@@ -602,6 +615,13 @@ mod tests {
             ..plan()
         };
         assert!(plan_line(&one).starts_with("1 video: "));
+    }
+
+    #[test]
+    fn a_dumb_terminal_is_not_a_terminal_for_the_bars() {
+        assert!(is_dumb(Some("dumb".into())));
+        assert!(!is_dumb(Some("xterm-256color".into())));
+        assert!(!is_dumb(None));
     }
 
     #[test]

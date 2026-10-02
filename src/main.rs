@@ -70,9 +70,10 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// No progress bars, plan, summary or token line: only one line per video on stderr, plus
-    /// warnings and why a run stopped (and, as ever, the descriptions on stdout). That is also
-    /// what stderr gets when it is not a terminal (piped, CI), except for the token line.
+    /// No progress bars, plan or summary: only one line per video on stderr, plus warnings and
+    /// why a run stopped (and, as ever, the descriptions on stdout). A stderr that is not a
+    /// terminal (piped, CI) gets the same lines; `--quiet` also drops the token line, which a
+    /// piped stderr keeps.
     #[arg(long, short = 'q')]
     quiet: bool,
 
