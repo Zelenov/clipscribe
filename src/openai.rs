@@ -388,6 +388,26 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_is_reported_with_its_wait_and_reason() {
+        let unavailable = http(
+            "503 Service Unavailable",
+            "",
+            r#"{"error":{"message":"The server is overloaded."}}"#,
+        );
+        let (url, _) = server(vec![unavailable, ok()]);
+        let provider = OpenAi::with_endpoint("k".into(), url, fast_retries()).expect("client");
+        let mut waits = Vec::new();
+        let result = provider.complete_notifying(
+            &request(),
+            &AtomicBool::new(false),
+            &mut |after, reason| waits.push((after, reason)),
+        );
+        assert!(result.is_ok());
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].1, RetryReason::Temporary);
+    }
+
+    #[test]
     fn a_server_error_is_retried_three_times_then_fails() {
         let overloaded = || {
             http(

@@ -48,6 +48,12 @@ fn json_on_stdout_stays_parseable_and_stderr_has_lines_without_escape_codes() {
     assert!(stderr.contains("1 video: "), "the plan line: {stderr}");
     assert!(stderr.contains("1 unreadable"), "{stderr}");
     assert!(stderr.contains("\u{2717} "), "the result line: {stderr}");
+    // Without a terminal an error is never cut: it is in the result line and in the summary.
+    assert_eq!(
+        stderr.matches("could not be read").count(),
+        2,
+        "the error is whole, and listed again at the end: {stderr}"
+    );
     assert!(
         stderr.contains("\u{43f}\u{43b}\u{43e}\u{445}\u{43e}\u{435}.mp4"),
         "{stderr}"

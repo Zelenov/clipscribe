@@ -70,8 +70,9 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// No progress bars, plan or summary: only one line per video on stderr (and, as ever, the
-    /// descriptions on stdout). Bars are off anyway when stderr is not a terminal.
+    /// No progress bars, plan, summary or token line: only one line per video on stderr, plus
+    /// warnings and why a run stopped (and, as ever, the descriptions on stdout). Bars are off
+    /// anyway when stderr is not a terminal.
     #[arg(long, short = 'q')]
     quiet: bool,
 
@@ -361,23 +362,24 @@ fn main() -> ExitCode {
     let run = plan_run(&videos, model, cli.no_subtitles, vocabulary.as_deref());
     let mut batch = Batch::new(model, videos.len(), run.plan.footage_s, cli.quiet);
     batch.plan(&run.plan);
+    let names = display_names(&videos);
     let mut results = Vec::new();
     let mut total = AiUsage::default();
     let mut totals = Totals::default();
     let mut failed = false;
-    for (video, clip) in videos.iter().zip(&run.clips) {
+    let mut handled = 0;
+    for ((video, clip), name) in videos.iter().zip(&run.clips).zip(&names) {
         if CANCEL.load(Ordering::Relaxed) {
             totals.cancelled = true;
             break;
         }
-        let name = video.file_name().map_or_else(
-            || video.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
         if clip.too_long {
             failed = true;
+            handled += 1;
+            totals.skipped += 1;
             let why = format!("over the {} limit", format_time(MAX_DURATION_S));
-            batch.finish_video(&name, 0.0, &Outcome::Skipped(why));
+            let line = batch.finish_video(name, 0.0, &Outcome::Skipped(why));
+            totals.problems.push(line);
             continue;
         }
         let subtitles = if cli.no_subtitles {
@@ -391,7 +393,7 @@ fn main() -> ExitCode {
                 Vec::new()
             })
         };
-        batch.begin(&name);
+        batch.begin(name);
         let (outcome, error) = if let Some(vocabulary) = &vocabulary {
             match describe_with_tags(video, &subtitles, vocabulary, &options, &CANCEL, |stage| {
                 batch.stage(stage)
@@ -433,24 +435,30 @@ fn main() -> ExitCode {
                     totals.described += 1;
                     totals.moments += moments;
                 }
-                batch.finish_video(&name, clip.duration_s, &outcome);
+                handled += 1;
+                batch.finish_video(name, clip.duration_s, &outcome);
             }
             (None, Some(Error::Cancelled)) => {
+                // The video in work was started: it is not "not tried".
+                handled += 1;
                 totals.cancelled = true;
                 break;
             }
             (None, Some(e)) => {
                 failed = true;
+                handled += 1;
                 if let Error::BadAnswer { usage, .. } = &e {
                     total += *usage;
+                    batch.add_cost(model.cost_usd(*usage));
                 }
                 let line =
-                    batch.finish_video(&name, clip.duration_s, &Outcome::Failed(e.to_string()));
+                    batch.finish_video(name, clip.duration_s, &Outcome::Failed(e.to_string()));
                 totals.problems.push(line);
                 // A rejected key or an empty balance would fail every video left the same way.
                 if let Error::Ai(ai) = &e {
                     if let Some(stop) = ai.stops_job() {
                         batch.note(&stop);
+                        totals.stopped = true;
                         break;
                     }
                 }
@@ -460,6 +468,7 @@ fn main() -> ExitCode {
     }
     totals.cost_usd = model.cost_usd(total);
     totals.cancelled |= CANCEL.load(Ordering::Relaxed);
+    totals.not_tried = videos.len().saturating_sub(handled);
     let cancelled = totals.cancelled;
     batch.finish(totals);
     if cli.json {
@@ -609,8 +618,33 @@ fn load_vocabulary(path: &Path) -> Result<Vec<Tag>, String> {
     Ok(vocabulary)
 }
 
-/// Print what describing `videos` with `model` would cost, reading only their lengths.
-/// `vocabulary`, when given, adds the cost of suggesting tags from it.
+/// The names result lines use: the file name, or the path as given when two inputs share a file
+/// name (`a/clip.mp4` and `b/clip.mp4`), so their lines can be told apart.
+fn display_names(videos: &[PathBuf]) -> Vec<String> {
+    let file_name = |video: &PathBuf| {
+        video.file_name().map_or_else(
+            || video.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    };
+    videos
+        .iter()
+        .map(|video| {
+            let name = file_name(video);
+            if videos
+                .iter()
+                .filter(|other| file_name(other) == name)
+                .count()
+                > 1
+            {
+                video.display().to_string()
+            } else {
+                name
+            }
+        })
+        .collect()
+}
+
 /// What a clip is expected to cost, or why it will not be sent.
 enum Estimated {
     Unreadable,
@@ -618,6 +652,7 @@ enum Estimated {
     Ready { duration_s: f64, usage: AiUsage },
 }
 
+/// Read the length of `video` and price describing it.
 fn estimate_clip(
     video: &Path,
     model: Model,
@@ -656,6 +691,7 @@ struct RunPlan {
     clips: Vec<Clip>,
 }
 
+/// Look at every clip before the run: what to tell the user, and what the loop needs.
 fn plan_run(
     videos: &[PathBuf],
     model: Model,
@@ -703,6 +739,8 @@ fn plan_run(
     RunPlan { plan, clips }
 }
 
+/// Print what describing `videos` with `model` would cost, reading only their lengths.
+/// `vocabulary`, when given, adds the cost of suggesting tags from it.
 fn estimate(
     videos: &[PathBuf],
     model: Model,
@@ -1055,5 +1093,18 @@ mod tests {
         assert!(parse_at("1::3").is_err());
         assert!(parse_at("-5").is_err());
         assert!(parse_at("1:-5").is_err());
+    }
+
+    #[test]
+    fn inputs_with_the_same_file_name_are_told_apart_by_their_path() {
+        let videos = [
+            PathBuf::from("a/clip.mp4"),
+            PathBuf::from("b/clip.mp4"),
+            PathBuf::from("c/other.mp4"),
+        ];
+        let names = display_names(&videos);
+        assert_eq!(names[0], PathBuf::from("a/clip.mp4").display().to_string());
+        assert_eq!(names[1], PathBuf::from("b/clip.mp4").display().to_string());
+        assert_eq!(names[2], "other.mp4");
     }
 }

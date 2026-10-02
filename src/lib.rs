@@ -84,8 +84,10 @@ impl std::fmt::Debug for Options {
     }
 }
 
-/// Where [`describe`] is, for a progress display.
+/// Where [`describe`] is, for a progress display. New stages may be added: match with a wildcard
+/// arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Stage {
     /// Reading frame `done + 1` of `total`.
     Frame { done: usize, total: usize },

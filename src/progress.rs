@@ -6,10 +6,12 @@
 //! [`Batch`] only draws them. Nothing here writes to stdout except [`Batch::print`], which
 //! steps the bars aside first.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use clipscribe::{format_time, Model, RetryReason, Stage};
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use clipscribe::{format_time, Model, Provider, RetryReason, Stage};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
 /// The width lines are cut to when stderr is not a terminal.
 const PLAIN_WIDTH: usize = 100;
@@ -76,10 +78,11 @@ impl Outcome {
     }
 }
 
-/// The permanent line of one video, cut to `width` columns (the name gives way first):
+/// The permanent line of one video, cut to `width` columns when there is one (the name gives way
+/// first); a line without a width is never cut, so an error is printed whole:
 /// `✓ clip.mp4  3 moments · main 0:04–0:51 · $0.012`, `· clip.mp4  skipped (…)` or
 /// `✗ clip.mp4  error text`.
-pub fn result_line(name: &str, outcome: &Outcome, width: usize) -> String {
+pub fn result_line(name: &str, outcome: &Outcome, width: Option<usize>) -> String {
     let (mark, detail) = match outcome {
         Outcome::Described {
             moments,
@@ -106,6 +109,9 @@ pub fn result_line(name: &str, outcome: &Outcome, width: usize) -> String {
     };
     // A message is one line, however it was written.
     let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(width) = width else {
+        return format!("{mark} {name}  {detail}");
+    };
     let fixed = console::measure_text_width(&format!("{mark}   {detail}"));
     let name_width = width.saturating_sub(fixed).max(8);
     let name = console::truncate_str(name, name_width, "\u{2026}");
@@ -122,18 +128,30 @@ pub struct Totals {
     pub moments: usize,
     pub cost_usd: f64,
     pub elapsed: Duration,
+    /// Videos not sent because they are over the length limit.
+    pub skipped: usize,
     /// Ctrl+C ended the run before the last video.
     pub cancelled: bool,
+    /// A rejected key or an empty balance ended the run before the last video.
+    pub stopped: bool,
+    /// Videos that were never tried because the run ended early.
+    pub not_tried: usize,
     /// The result lines of the videos that did not come out, for the end.
     pub problems: Vec<String>,
 }
 
 /// The lines closing a run: the totals, then the problems again.
 pub fn summary_lines(totals: &Totals) -> Vec<String> {
-    let mut head = if totals.cancelled {
+    let mut head = if totals.cancelled || totals.stopped {
         format!(
-            "cancelled: {} of {} videos finished",
-            totals.described, totals.total_videos
+            "{}: {} of {} videos finished",
+            if totals.cancelled {
+                "cancelled"
+            } else {
+                "stopped"
+            },
+            totals.described,
+            totals.total_videos
         )
     } else {
         let videos = if totals.described == 1 {
@@ -149,6 +167,12 @@ pub fn summary_lines(totals: &Totals) -> Vec<String> {
         totals.cost_usd,
         format_time(totals.elapsed.as_secs_f64())
     ));
+    if totals.skipped > 0 {
+        head.push_str(&format!(" \u{b7} {} skipped", totals.skipped));
+    }
+    if totals.not_tried > 0 {
+        head.push_str(&format!(" \u{b7} {} not tried", totals.not_tried));
+    }
     let mut lines = vec![head];
     if !totals.problems.is_empty() {
         let n = totals.problems.len();
@@ -171,16 +195,89 @@ pub fn stage_text(stage: Stage, model: &str) -> String {
                 RetryReason::RateLimit => "rate limit",
                 RetryReason::Temporary => "temporary failure",
             };
-            format!("retrying in {} s ({reason})", after.as_secs().max(1))
+            format!(
+                "retrying in {} s ({reason})",
+                (after.as_secs() + u64::from(after.subsec_nanos() > 0)).max(1)
+            )
         }
-        // Stage may grow; an unknown one is shown as waiting.
-        #[allow(unreachable_patterns)]
+        // `Stage` may grow: a stage this version does not know is shown as working.
         _ => "working".to_string(),
+    }
+}
+
+/// The terminal indicatif draws on, two columns narrower than it is. indicatif pads every line to
+/// the full width, so the `^C` the terminal echoes for Ctrl+C would wrap onto the next row and
+/// leave indicatif erasing one row too few: a bar would stay behind. With room to spare the echo
+/// stays on its row.
+#[derive(Debug)]
+struct Margin(console::Term);
+
+impl indicatif::TermLike for Margin {
+    fn width(&self) -> u16 {
+        self.0.size().1.saturating_sub(2).max(20)
+    }
+    fn move_cursor_up(&self, n: usize) -> std::io::Result<()> {
+        self.0.move_cursor_up(n)
+    }
+    fn move_cursor_down(&self, n: usize) -> std::io::Result<()> {
+        self.0.move_cursor_down(n)
+    }
+    fn move_cursor_right(&self, n: usize) -> std::io::Result<()> {
+        self.0.move_cursor_right(n)
+    }
+    fn move_cursor_left(&self, n: usize) -> std::io::Result<()> {
+        self.0.move_cursor_left(n)
+    }
+    fn write_line(&self, s: &str) -> std::io::Result<()> {
+        self.0.write_line(s)
+    }
+    fn write_str(&self, s: &str) -> std::io::Result<()> {
+        self.0.write_str(s)
+    }
+    fn clear_line(&self) -> std::io::Result<()> {
+        self.0.clear_line()
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut &self.0)
+    }
+}
+
+/// What the line of the video in work says. Kept apart from the bar so the text can change as
+/// time passes: a retry countdown, and back to "asking" when the wait is over.
+#[derive(Debug, Clone, Copy)]
+struct Shown {
+    stage: Option<Stage>,
+    since: Instant,
+    /// Who the request went to, for the line after a retry wait.
+    asking: Option<Provider>,
+}
+
+fn shown_text(shown: &Shown, now: Instant, model: &str) -> String {
+    match shown.stage {
+        None => "starting".to_string(),
+        Some(Stage::Retrying { after, reason }) => {
+            let left = after.saturating_sub(now.saturating_duration_since(shown.since));
+            if !left.is_zero() {
+                stage_text(
+                    Stage::Retrying {
+                        after: left,
+                        reason,
+                    },
+                    model,
+                )
+            } else if let Some(provider) = shown.asking {
+                stage_text(Stage::Asking { provider }, model)
+            } else {
+                "waiting for the answer".to_string()
+            }
+        }
+        Some(stage) => stage_text(stage, model),
     }
 }
 
 /// The bars of the video in work.
 struct Current {
+    shown: Arc<Mutex<Shown>>,
     line: ProgressBar,
     frames: ProgressBar,
 }
@@ -200,6 +297,8 @@ pub struct Batch {
     finished: usize,
     cost_usd: f64,
     started: Instant,
+    /// Videos finished, shared with the bar's ETA, which waits for the first one.
+    finished_count: Arc<AtomicUsize>,
 }
 
 fn millis(seconds: f64) -> u64 {
@@ -213,12 +312,12 @@ impl Batch {
     pub fn new(model: Model, total_videos: usize, footage_s: f64, quiet: bool) -> Self {
         let terminal = console::Term::stderr().is_term();
         let width = if terminal {
-            usize::from(console::Term::stderr().size().1)
+            usize::from(console::Term::stderr().size().1).saturating_sub(2)
         } else {
             PLAIN_WIDTH
         };
         let target = if terminal && !quiet {
-            ProgressDrawTarget::stderr()
+            ProgressDrawTarget::term_like(Box::new(Margin(console::Term::stderr())))
         } else {
             ProgressDrawTarget::hidden()
         };
@@ -245,10 +344,24 @@ impl Batch {
         let multi = MultiProgress::with_draw_target(target);
         let total_footage_ms = millis(footage_s).max(1);
         let overall = multi.add(ProgressBar::new(total_footage_ms));
+        let finished_count = Arc::new(AtomicUsize::new(0));
+        let bar_width = if width < 60 { 10 } else { 30 };
+        let eta_seen = Arc::clone(&finished_count);
         overall.set_style(
-            ProgressStyle::with_template("{bar:30.cyan/blue} {percent:>3}% {msg}  ETA {eta}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("=> "),
+            ProgressStyle::with_template(&format!(
+                "{{bar:{bar_width}.cyan/blue}} {{percent:>3}}% {{msg}}{{eta_part}}"
+            ))
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .with_key(
+                "eta_part",
+                move |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    // No ETA until a video is done: before that there is no rate to go by.
+                    if eta_seen.load(Ordering::Relaxed) > 0 {
+                        let _ = write!(w, "  ETA {}", format_time(state.eta().as_secs_f64()));
+                    }
+                },
+            )
+            .progress_chars("=> "),
         );
         let mut batch = Self {
             multi,
@@ -264,6 +377,7 @@ impl Batch {
             finished: 0,
             cost_usd: 0.0,
             started: Instant::now(),
+            finished_count,
         };
         batch.refresh_overall();
         batch
@@ -283,8 +397,10 @@ impl Batch {
 
     /// Print a line on stderr above the bars (or plainly when there are none).
     fn println(&self, line: &str) {
+        // `suspend` erases the bars, prints a whole line and draws them again; indicatif's own
+        // `println` relies on lines filling the terminal width, which the margin below does not.
         if self.interactive {
-            let _ = self.multi.println(line);
+            self.multi.suspend(|| eprintln!("{line}"));
         } else {
             eprintln!("{line}");
         }
@@ -302,21 +418,40 @@ impl Batch {
         if !self.interactive {
             return;
         }
+        let shown = Arc::new(Mutex::new(Shown {
+            stage: None,
+            since: Instant::now(),
+            asking: None,
+        }));
         let line = self.multi.add(ProgressBar::new_spinner());
+        let (text, model) = (Arc::clone(&shown), self.model.label);
         line.set_style(
-            ProgressStyle::with_template("  {spinner} {prefix}: {msg} ({elapsed})")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+            ProgressStyle::with_template("  {spinner} {prefix}: {stage} ({elapsed})")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner())
+                .with_key(
+                    "stage",
+                    move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
+                        if let Ok(shown) = text.lock() {
+                            let _ = w.write_str(&shown_text(&shown, Instant::now(), model));
+                        }
+                    },
+                ),
         );
         let prefix_width = (self.width / 3).max(12);
         line.set_prefix(console::truncate_str(name, prefix_width, "\u{2026}").into_owned());
         line.enable_steady_tick(Duration::from_millis(120));
         let frames = self.multi.add(ProgressBar::new(1));
+        let bar_width = if self.width < 60 { 10 } else { 20 };
         frames.set_style(
-            ProgressStyle::with_template("    {bar:20} {pos}/{len}")
+            ProgressStyle::with_template(&format!("    {{bar:{bar_width}}} {{pos}}/{{len}}"))
                 .unwrap_or_else(|_| ProgressStyle::default_bar())
                 .progress_chars("=> "),
         );
-        self.current = Some(Current { line, frames });
+        self.current = Some(Current {
+            shown,
+            line,
+            frames,
+        });
     }
 
     /// The video in work reached `stage`.
@@ -324,16 +459,33 @@ impl Batch {
         let Some(current) = &self.current else {
             return;
         };
-        current
-            .line
-            .set_message(stage_text(stage, self.model.label));
+        if let Ok(mut shown) = current.shown.lock() {
+            shown.stage = Some(stage);
+            shown.since = Instant::now();
+            if let Stage::Asking { provider } = stage {
+                shown.asking = Some(provider);
+            }
+        }
+        // The text comes from `shown` when the line is drawn: draw now, not at the next tick.
+        current.line.tick();
         match stage {
             Stage::Frame { done, total } => {
                 current.frames.set_length(total.max(1) as u64);
                 current.frames.set_position(done as u64 + 1);
             }
+            Stage::Asking { .. } => {
+                // The time shown is the time since the request went out.
+                current.line.reset_elapsed();
+                current.frames.finish_and_clear();
+            }
             _ => current.frames.finish_and_clear(),
         }
+    }
+
+    /// Cost the bar did not see: a billed answer that could not be used.
+    pub fn add_cost(&mut self, cost_usd: f64) {
+        self.cost_usd += cost_usd;
+        self.refresh_overall();
     }
 
     /// The video `name` (`duration_s` of footage) ended as `outcome`; its line stays on screen.
@@ -344,15 +496,16 @@ impl Batch {
             current.line.finish_and_clear();
         }
         self.finished += 1;
+        self.finished_count.store(self.finished, Ordering::Relaxed);
         self.done_footage_ms =
             (self.done_footage_ms + millis(duration_s)).min(self.total_footage_ms);
         if let Outcome::Described { cost_usd, .. } = outcome {
             self.cost_usd += cost_usd;
         }
         self.refresh_overall();
-        let line = result_line(name, outcome, self.width);
-        self.println(&line);
-        line
+        let width = self.interactive.then_some(self.width);
+        self.println(&result_line(name, outcome, width));
+        result_line(name, outcome, None)
     }
 
     /// A line of its own on stderr, above the bars: a warning or why the run stopped.
@@ -442,34 +595,42 @@ mod tests {
     #[test]
     fn result_lines_for_a_described_skipped_and_failed_video() {
         assert_eq!(
-            result_line("clip.mp4", &described(3, Some((4.0, 51.0))), 100),
+            result_line("clip.mp4", &described(3, Some((4.0, 51.0))), Some(100)),
             "\u{2713} clip.mp4  3 moments \u{b7} main 0:04\u{2013}0:51 \u{b7} $0.012"
         );
         assert_eq!(
-            result_line("a.mp4", &described(1, None), 100),
+            result_line("a.mp4", &described(1, None), Some(100)),
             "\u{2713} a.mp4  1 moment \u{b7} $0.012"
         );
         assert_eq!(
-            result_line("a.mp4", &described(0, None), 100),
+            result_line("a.mp4", &described(0, None), Some(100)),
             "\u{2713} a.mp4  no moments \u{b7} $0.012"
         );
         assert_eq!(
             result_line(
                 "long.mp4",
                 &Outcome::Skipped("over the 30:00 limit".into()),
-                100
+                Some(100)
             ),
             "\u{b7} long.mp4  skipped (over the 30:00 limit)"
         );
         assert_eq!(
-            result_line("bad.mp4", &Outcome::Failed("could not be read".into()), 100),
+            result_line(
+                "bad.mp4",
+                &Outcome::Failed("could not be read".into()),
+                Some(100)
+            ),
             "\u{2717} bad.mp4  could not be read"
         );
     }
 
     #[test]
     fn a_multi_line_error_is_one_line() {
-        let line = result_line("a.mp4", &Outcome::Failed("first\n  second".into()), 100);
+        let line = result_line(
+            "a.mp4",
+            &Outcome::Failed("first\n  second".into()),
+            Some(100),
+        );
         assert_eq!(line, "\u{2717} a.mp4  first second");
     }
 
@@ -477,10 +638,10 @@ mod tests {
     fn cyrillic_names_are_kept_and_long_names_are_cut_to_the_width() {
         let name = "\u{41e}\u{442}\u{43f}\u{443}\u{441}\u{43a}_\u{43d}\u{430}_\u{43c}\u{43e}\u{440}\u{435}_\u{43f}\u{435}\u{440}\u{432}\u{44b}\u{439}_\u{434}\u{435}\u{43d}\u{44c}.mp4";
         let outcome = described(3, Some((4.0, 51.0)));
-        let full = result_line(name, &outcome, 120);
+        let full = result_line(name, &outcome, Some(120));
         assert!(full.contains(name), "{full}");
         for width in [50, 60, 80] {
-            let line = result_line(name, &outcome, width);
+            let line = result_line(name, &outcome, Some(width));
             assert!(
                 console::measure_text_width(&line) <= width,
                 "{width}: {line}"
@@ -492,14 +653,14 @@ mod tests {
         }
         // Too narrow for the details: the line is cut, never wider than the terminal.
         for width in [20, 30, 40] {
-            let line = result_line(name, &outcome, width);
+            let line = result_line(name, &outcome, Some(width));
             assert!(
                 console::measure_text_width(&line) <= width,
                 "{width}: {line}"
             );
         }
         let long = "x".repeat(200);
-        let line = result_line(&long, &Outcome::Failed("boom".into()), 50);
+        let line = result_line(&long, &Outcome::Failed("boom".into()), Some(50));
         assert!(console::measure_text_width(&line) <= 50, "{line}");
         assert!(line.ends_with("boom"), "{line}");
     }
@@ -508,8 +669,8 @@ mod tests {
     fn no_line_has_an_escape_code() {
         let lines = [
             plan_line(&plan()),
-            result_line("a.mp4", &described(2, Some((1.0, 2.0))), 80),
-            result_line("a.mp4", &Outcome::Failed("x".into()), 80),
+            result_line("a.mp4", &described(2, Some((1.0, 2.0))), Some(80)),
+            result_line("a.mp4", &Outcome::Failed("x".into()), Some(80)),
             summary_lines(&Totals {
                 problems: vec!["\u{2717} a.mp4  x".into()],
                 ..Totals::default()
@@ -536,8 +697,8 @@ mod tests {
             moments: 7,
             cost_usd: 0.0456,
             elapsed: Duration::from_secs(252),
-            cancelled: false,
             problems: vec!["\u{2717} bad.mp4  could not be read".into()],
+            ..Totals::default()
         };
         assert_eq!(
             summary_lines(&totals),
@@ -631,24 +792,40 @@ mod tests {
     #[test]
     fn a_run_draws_the_batch_bar_the_stage_and_the_result_on_the_terminal() {
         let screen = Recorder::default();
-        let target = ProgressDrawTarget::term_like(Box::new(screen.clone()));
+        // A high refresh rate: indicatif drops draws that come too fast, and this run is instant.
+        let target = ProgressDrawTarget::term_like_with_hz(Box::new(screen.clone()), 255);
         let mut batch = Batch::with_target(target, true, false, 80, MODELS[0], 2, 60.0);
+        let pause = || std::thread::sleep(Duration::from_millis(20));
+        pause();
         batch.begin("clip.mp4");
+        pause();
         batch.stage(Stage::Frame { done: 4, total: 60 });
+        pause();
         batch.stage(Stage::Asking {
             provider: Provider::OpenAi,
         });
-        batch.finish_video("clip.mp4", 30.0, &described(2, None));
+        pause();
+        // What the line of the video says is its state, whichever frames indicatif drew.
+        let shown = *batch
+            .current
+            .as_ref()
+            .expect("a video is in work")
+            .shown
+            .lock()
+            .expect("lock");
+        assert_eq!(shown_text(&shown, Instant::now(), "M"), "asking OpenAI (M)");
+        pause();
+        let line = batch.finish_video("clip.mp4", 30.0, &described(2, None));
+        // The result line itself goes to stderr between two draws of the bars; the display
+        // returns it for the summary.
+        assert!(line.starts_with("\u{2713} clip.mp4  2 moments"), "{line}");
         let drawn = screen.0.lock().expect("lock").clone();
         assert!(drawn.contains("0/2 videos"), "{drawn}");
         assert!(drawn.contains("1/2 videos"), "{drawn}");
-        assert!(drawn.contains("asking OpenAI"), "{drawn}");
-        assert!(drawn.contains("\u{2713} clip.mp4  2 moments"), "{drawn}");
     }
 
     #[test]
     fn without_a_terminal_nothing_is_drawn_and_the_bars_are_hidden() {
-        let screen = Recorder::default();
         // `interactive` false is what `Batch::new` picks for a stderr that is not a terminal:
         // its draw target is hidden, so no escape code can reach a pipe or a log.
         let mut batch = Batch::with_target(
@@ -665,16 +842,68 @@ mod tests {
             provider: Provider::Anthropic,
         });
         batch.finish_video("clip.mp4", 10.0, &described(1, None));
-        assert!(screen.0.lock().expect("lock").is_empty());
         assert!(batch.current.is_none());
-        // CI and pipes: no terminal, so nothing is drawn. (On a developer's terminal `cargo test`
-        // still has a terminal behind its captured stderr, so only check what holds there too.)
+        assert!(batch.overall.is_hidden());
+        // On a developer's terminal `cargo test` still has a terminal behind its captured
+        // stderr, so only check what holds there too.
         let quiet = Batch::new(MODELS[0], 1, 10.0, true);
         assert!(!quiet.interactive && quiet.overall.is_hidden());
         if !console::Term::stderr().is_term() {
             let plain = Batch::new(MODELS[0], 1, 10.0, false);
             assert!(!plain.interactive && plain.overall.is_hidden());
         }
+    }
+
+    #[test]
+    fn an_error_is_printed_whole_without_a_width_and_cut_with_one() {
+        let long = "x ".repeat(100);
+        let outcome = Outcome::Failed(long.trim().to_string());
+        let whole = result_line("a.mp4", &outcome, None);
+        assert!(whole.ends_with(long.trim()), "{whole}");
+        let cut = result_line("a.mp4", &outcome, Some(60));
+        assert!(console::measure_text_width(&cut) <= 60, "{cut}");
+    }
+
+    #[test]
+    fn a_stopped_run_says_how_many_videos_were_never_tried() {
+        let lines = summary_lines(&Totals {
+            total_videos: 3,
+            described: 1,
+            moments: 2,
+            skipped: 1,
+            stopped: true,
+            not_tried: 1,
+            elapsed: Duration::from_secs(5),
+            ..Totals::default()
+        });
+        assert_eq!(
+            lines[0],
+            "stopped: 1 of 3 videos finished \u{b7} 2 moments \u{b7} $0.00 \u{b7} 0:05 \u{b7} 1 skipped \u{b7} 1 not tried"
+        );
+    }
+
+    #[test]
+    fn the_retry_line_counts_down_and_then_asks_again() {
+        let start = Instant::now();
+        let shown = Shown {
+            stage: Some(Stage::Retrying {
+                after: Duration::from_secs(8),
+                reason: RetryReason::RateLimit,
+            }),
+            since: start,
+            asking: Some(Provider::Anthropic),
+        };
+        let at = |secs| shown_text(&shown, start + Duration::from_secs(secs), "Some Model");
+        assert_eq!(at(0), "retrying in 8 s (rate limit)");
+        assert_eq!(at(5), "retrying in 3 s (rate limit)");
+        assert_eq!(at(8), "asking Anthropic (Some Model)");
+        assert_eq!(at(30), "asking Anthropic (Some Model)");
+        let fresh = Shown {
+            stage: None,
+            since: start,
+            asking: None,
+        };
+        assert_eq!(shown_text(&fresh, start, "m"), "starting");
     }
 
     #[test]
