@@ -1,7 +1,6 @@
 //! Command line: describes each input video with [`clipscribe::describe`] and prints its
 //! summary and key moments, or only what it would cost.
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,10 +9,13 @@ use clap::{Parser, ValueEnum};
 use clipscribe::{
     describe, describe_moment, describe_with_tags, estimate_tags_usage, estimate_usage,
     format_time, frames, parse_vocabulary, srt, AiUsage, Described, DescribedMoment,
-    DescribedWithTags, Error, FrameSampling, Model, MomentsMode, Options, Provider, Stage,
+    DescribedWithTags, Error, FrameSampling, Model, MomentsMode, Options, Provider,
     SummaryLanguage, Tag, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
 };
 use serde_json::json;
+
+mod progress;
+use progress::{Batch, Outcome, Plan, Totals};
 
 /// Describe what happens in video clips, and when, with Claude.
 ///
@@ -67,6 +69,11 @@ struct Cli {
     /// Print JSON (an array with one object per video) instead of text.
     #[arg(long)]
     json: bool,
+
+    /// No progress bars, plan or summary: only one line per video on stderr (and, as ever, the
+    /// descriptions on stdout). Bars are off anyway when stderr is not a terminal.
+    #[arg(long, short = 'q')]
+    quiet: bool,
 
     /// Only print what describing the videos would cost; nothing is sent.
     #[arg(long)]
@@ -351,90 +358,120 @@ fn main() -> ExitCode {
         );
     }
 
+    let run = plan_run(&videos, model, cli.no_subtitles, vocabulary.as_deref());
+    let mut batch = Batch::new(model, videos.len(), run.plan.footage_s, cli.quiet);
+    batch.plan(&run.plan);
     let mut results = Vec::new();
     let mut total = AiUsage::default();
+    let mut totals = Totals::default();
     let mut failed = false;
-    for video in &videos {
+    for (video, clip) in videos.iter().zip(&run.clips) {
         if CANCEL.load(Ordering::Relaxed) {
+            totals.cancelled = true;
             break;
+        }
+        let name = video.file_name().map_or_else(
+            || video.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        if clip.too_long {
+            failed = true;
+            let why = format!("over the {} limit", format_time(MAX_DURATION_S));
+            batch.finish_video(&name, 0.0, &Outcome::Skipped(why));
+            continue;
         }
         let subtitles = if cli.no_subtitles {
             Vec::new()
         } else {
             srt::load_for(video).unwrap_or_else(|e| {
-                eprintln!("warning: {}: subtitles not read: {e}", video.display());
+                batch.note(&format!(
+                    "warning: {}: subtitles not read: {e}",
+                    video.display()
+                ));
                 Vec::new()
             })
         };
-        let progress = Progress::new(video);
-        let error = if let Some(vocabulary) = &vocabulary {
-            let result =
-                describe_with_tags(video, &subtitles, vocabulary, &options, &CANCEL, |stage| {
-                    progress.show(stage)
-                });
-            progress.clear();
-            match result {
+        batch.begin(&name);
+        let (outcome, error) = if let Some(vocabulary) = &vocabulary {
+            match describe_with_tags(video, &subtitles, vocabulary, &options, &CANCEL, |stage| {
+                batch.stage(stage)
+            }) {
                 Ok(described) => {
                     total += described.usage;
+                    let outcome =
+                        Outcome::of(&described.description, model.cost_usd(described.usage));
                     if cli.json {
                         results.push(to_json_with_tags(video, &described, model));
                     } else {
-                        print_text_with_tags(video, &described, model);
+                        batch.print(|| print_text_with_tags(video, &described, model));
                     }
-                    None
+                    (Some(outcome), None)
                 }
-                Err(e) => Some(e),
+                Err(e) => (None, Some(e)),
             }
         } else {
-            let result = describe(video, &subtitles, &options, &CANCEL, |stage| {
-                progress.show(stage)
-            });
-            progress.clear();
-            match result {
+            match describe(video, &subtitles, &options, &CANCEL, |stage| {
+                batch.stage(stage)
+            }) {
                 Ok(described) => {
                     total += described.usage;
+                    let outcome =
+                        Outcome::of(&described.description, model.cost_usd(described.usage));
                     if cli.json {
                         results.push(to_json(video, &described, model));
                     } else {
-                        print_text(video, &described, model);
+                        batch.print(|| print_text(video, &described, model));
                     }
-                    None
+                    (Some(outcome), None)
                 }
-                Err(e) => Some(e),
+                Err(e) => (None, Some(e)),
             }
         };
-        match error {
-            None => {}
-            Some(Error::Cancelled) => {
-                eprintln!("cancelled: {}", video.display());
+        match (outcome, error) {
+            (Some(outcome), _) => {
+                if let Outcome::Described { moments, .. } = &outcome {
+                    totals.described += 1;
+                    totals.moments += moments;
+                }
+                batch.finish_video(&name, clip.duration_s, &outcome);
+            }
+            (None, Some(Error::Cancelled)) => {
+                totals.cancelled = true;
                 break;
             }
-            Some(e) => {
+            (None, Some(e)) => {
                 failed = true;
                 if let Error::BadAnswer { usage, .. } = &e {
                     total += *usage;
                 }
-                eprintln!("error: {}: {e}", video.display());
+                let line =
+                    batch.finish_video(&name, clip.duration_s, &Outcome::Failed(e.to_string()));
+                totals.problems.push(line);
                 // A rejected key or an empty balance would fail every video left the same way.
                 if let Error::Ai(ai) = &e {
                     if let Some(stop) = ai.stops_job() {
-                        eprintln!("{stop}");
+                        batch.note(&stop);
                         break;
                     }
                 }
             }
+            (None, None) => {}
         }
     }
+    totals.cost_usd = model.cost_usd(total);
+    totals.cancelled |= CANCEL.load(Ordering::Relaxed);
+    let cancelled = totals.cancelled;
+    batch.finish(totals);
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&results).unwrap_or_default()
         );
     }
-    if total != AiUsage::default() {
+    if total != AiUsage::default() && !cli.quiet {
         print_usage(total, model);
     }
-    if failed || CANCEL.load(Ordering::Relaxed) {
+    if failed || cancelled {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -574,6 +611,98 @@ fn load_vocabulary(path: &Path) -> Result<Vec<Tag>, String> {
 
 /// Print what describing `videos` with `model` would cost, reading only their lengths.
 /// `vocabulary`, when given, adds the cost of suggesting tags from it.
+/// What a clip is expected to cost, or why it will not be sent.
+enum Estimated {
+    Unreadable,
+    TooLong(f64),
+    Ready { duration_s: f64, usage: AiUsage },
+}
+
+fn estimate_clip(
+    video: &Path,
+    model: Model,
+    no_subtitles: bool,
+    vocabulary: Option<&[Tag]>,
+) -> Estimated {
+    let Some(duration_s) = frames::clip_duration_s(video) else {
+        return Estimated::Unreadable;
+    };
+    if duration_s > MAX_DURATION_S {
+        return Estimated::TooLong(duration_s);
+    }
+    let subtitle_bytes = if no_subtitles {
+        0
+    } else {
+        std::fs::metadata(srt::subtitle_path(video)).map_or(0, |m| m.len() as usize)
+    };
+    let usage = match vocabulary {
+        Some(vocabulary) => {
+            estimate_tags_usage(model, duration_s, subtitle_bytes, vocabulary, None)
+        }
+        None => estimate_usage(model, duration_s, subtitle_bytes),
+    };
+    Estimated::Ready { duration_s, usage }
+}
+
+/// One clip of a run: its length (0 when it cannot be read) and whether it is over the limit.
+struct Clip {
+    duration_s: f64,
+    too_long: bool,
+}
+
+/// The line before a run and what the loop needs from the same look at each clip.
+struct RunPlan {
+    plan: Plan,
+    clips: Vec<Clip>,
+}
+
+fn plan_run(
+    videos: &[PathBuf],
+    model: Model,
+    no_subtitles: bool,
+    vocabulary: Option<&[Tag]>,
+) -> RunPlan {
+    let mut plan = Plan {
+        videos: videos.len(),
+        footage_s: 0.0,
+        cost_usd: 0.0,
+        model: model.label,
+        over_limit: 0,
+        limit_s: MAX_DURATION_S,
+        unreadable: 0,
+    };
+    let mut clips = Vec::new();
+    for video in videos {
+        clips.push(
+            match estimate_clip(video, model, no_subtitles, vocabulary) {
+                Estimated::Unreadable => {
+                    plan.unreadable += 1;
+                    Clip {
+                        duration_s: 0.0,
+                        too_long: false,
+                    }
+                }
+                Estimated::TooLong(duration_s) => {
+                    plan.over_limit += 1;
+                    Clip {
+                        duration_s,
+                        too_long: true,
+                    }
+                }
+                Estimated::Ready { duration_s, usage } => {
+                    plan.footage_s += duration_s;
+                    plan.cost_usd += model.cost_usd(usage);
+                    Clip {
+                        duration_s,
+                        too_long: false,
+                    }
+                }
+            },
+        );
+    }
+    RunPlan { plan, clips }
+}
+
 fn estimate(
     videos: &[PathBuf],
     model: Model,
@@ -584,30 +713,22 @@ fn estimate(
     let mut total = AiUsage::default();
     let mut unreadable = 0;
     for video in videos {
-        let Some(duration_s) = frames::clip_duration_s(video) else {
-            println!("{}: could not be read", video.display());
-            unreadable += 1;
-            continue;
-        };
-        if duration_s > MAX_DURATION_S {
-            println!(
-                "{}: {}, over the {} limit",
-                video.display(),
-                format_time(duration_s),
-                format_time(MAX_DURATION_S)
-            );
-            continue;
-        }
-        let subtitle_bytes = if no_subtitles {
-            0
-        } else {
-            std::fs::metadata(srt::subtitle_path(video)).map_or(0, |m| m.len() as usize)
-        };
-        let usage = match vocabulary {
-            Some(vocabulary) => {
-                estimate_tags_usage(model, duration_s, subtitle_bytes, vocabulary, None)
+        let (duration_s, usage) = match estimate_clip(video, model, no_subtitles, vocabulary) {
+            Estimated::Unreadable => {
+                println!("{}: could not be read", video.display());
+                unreadable += 1;
+                continue;
             }
-            None => estimate_usage(model, duration_s, subtitle_bytes),
+            Estimated::TooLong(duration_s) => {
+                println!(
+                    "{}: {}, over the {} limit",
+                    video.display(),
+                    format_time(duration_s),
+                    format_time(MAX_DURATION_S)
+                );
+                continue;
+            }
+            Estimated::Ready { duration_s, usage } => (duration_s, usage),
         };
         total += usage;
         println!(
@@ -772,41 +893,6 @@ fn to_json_with_tags(
         },
         "cost_usd": model.cost_usd(described.usage),
     })
-}
-
-/// One status line on stderr for the video in work, when stderr is a terminal.
-struct Progress {
-    name: String,
-    shown: bool,
-}
-
-impl Progress {
-    fn new(video: &Path) -> Self {
-        Self {
-            name: video.file_name().map_or_else(
-                || video.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            ),
-            shown: std::io::stderr().is_terminal(),
-        }
-    }
-
-    fn show(&self, stage: Stage) {
-        if !self.shown {
-            return;
-        }
-        let status = match stage {
-            Stage::Frame { done, total } => format!("frame {} of {total}", done + 1),
-            Stage::Asking => "waiting for Claude".to_string(),
-        };
-        eprint!("\r{}: {status}\x1b[K", self.name);
-    }
-
-    fn clear(&self) {
-        if self.shown {
-            eprint!("\r\x1b[K");
-        }
-    }
 }
 
 #[cfg(test)]

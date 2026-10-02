@@ -20,7 +20,7 @@ features = ["frames"]
 default = ["cli", "frames"]
 # The `clipscribe` command line. Programs using clipscribe as a library turn it off
 # (`default-features = false`) and build neither clap nor ctrlc.
-cli = ["frames", "dep:clap", "dep:ctrlc"]
+cli = ["frames", "dep:clap", "dep:ctrlc", "dep:indicatif", "dep:console"]
 # Reading frames from video files with GStreamer, and `describe` itself. Without it the crate
 # still has the models, the request and answer, the estimate and the Anthropic client.
 frames = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:image", "dep:url"]
@@ -28,6 +28,11 @@ frames = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:imag
 [[bin]]
 name = "clipscribe"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli_progress"
+path = "tests/cli_progress.rs"
 required-features = ["cli"]
 
 [dependencies]
@@ -46,6 +51,8 @@ url = { version = "2.5", optional = true }
 
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = { version = "3", optional = true }
+indicatif = { version = "0.18", optional = true }
+console = { version = "0.16", optional = true }
 
 # The Windows exe icon (build.rs); built only on a Windows host.
 [target.'cfg(windows)'.build-dependencies]

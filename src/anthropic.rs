@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::provider::{
     self, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, Attempt, Provider,
-    CONNECT_TIMEOUT,
+    RetryReason, CONNECT_TIMEOUT,
 };
 
 /// Kept for anyone already naming `anthropic::RetryPolicy`: the type now lives in
@@ -82,10 +82,23 @@ impl Anthropic {
 
 impl AiProvider for Anthropic {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError> {
+        self.complete_notifying(request, cancel, &mut |_, _| {})
+    }
+
+    fn complete_notifying(
+        &self,
+        request: &AiRequest,
+        cancel: &AtomicBool,
+        on_retry: &mut dyn FnMut(Duration, RetryReason),
+    ) -> Result<AiResponse, AiError> {
         let body = Self::body(request).to_string();
-        provider::retry_loop(&self.retry, Provider::Anthropic.label(), cancel, || {
-            self.attempt(&body)
-        })
+        provider::retry_loop(
+            &self.retry,
+            Provider::Anthropic.label(),
+            cancel,
+            on_retry,
+            || self.attempt(&body),
+        )
     }
 }
 
@@ -308,6 +321,26 @@ mod tests {
         assert_eq!(response.json["summary"], "S");
         assert_eq!(response.usage.input_tokens, 100);
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_retry_is_reported_with_its_wait_and_reason() {
+        let overloaded = http(
+            "529 Overloaded",
+            "",
+            r#"{"error":{"message":"Overloaded"}}"#,
+        );
+        let (url, _) = server(vec![overloaded, ok()]);
+        let provider = Anthropic::with_endpoint("k".into(), url, fast_retries()).expect("client");
+        let mut waits = Vec::new();
+        let result = provider.complete_notifying(
+            &request(),
+            &AtomicBool::new(false),
+            &mut |after, reason| waits.push((after, reason)),
+        );
+        assert!(result.is_ok());
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].1, RetryReason::Temporary);
     }
 
     #[test]

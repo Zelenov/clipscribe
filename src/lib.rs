@@ -46,7 +46,7 @@ use std::time::Duration;
 pub use debug_frames::{debug_frames_dir, dump_frames, set_debug_frames_dir, DEBUG_FRAMES_ENV};
 pub use describe::*;
 pub use moment::*;
-pub use provider::{AiError, AiProvider, AiUsage, Provider};
+pub use provider::{AiError, AiProvider, AiUsage, Provider, RetryReason};
 pub use tags::*;
 
 /// One subtitle cue, sent with the frames so the description knows what is said.
@@ -89,8 +89,13 @@ impl std::fmt::Debug for Options {
 pub enum Stage {
     /// Reading frame `done + 1` of `total`.
     Frame { done: usize, total: usize },
-    /// The frames are sent; waiting for the answer.
-    Asking,
+    /// The frames are sent to `provider`; waiting for the answer.
+    Asking { provider: Provider },
+    /// The request is waiting `after` before it is sent again, for `reason`.
+    Retrying {
+        after: std::time::Duration,
+        reason: RetryReason,
+    },
 }
 
 /// A described clip.
@@ -233,12 +238,18 @@ pub fn describe(
         options.language,
         options.moments,
     );
-    on_stage(Stage::Asking);
+    on_stage(Stage::Asking {
+        provider: options.model.provider,
+    });
     let provider = provider_for(options)?;
-    let response = provider.complete(&request, cancel).map_err(|e| match e {
-        AiError::Cancelled => Error::Cancelled,
-        e => Error::Ai(e),
-    })?;
+    let response = provider
+        .complete_notifying(&request, cancel, &mut |after, reason| {
+            on_stage(Stage::Retrying { after, reason })
+        })
+        .map_err(|e| match e {
+            AiError::Cancelled => Error::Cancelled,
+            e => Error::Ai(e),
+        })?;
     let description = parse_answer(&response, duration_s, options.moments).map_err(|reason| {
         Error::BadAnswer {
             reason,
@@ -306,12 +317,18 @@ pub fn describe_with_tags(
         options.language,
         options.moments,
     );
-    on_stage(Stage::Asking);
+    on_stage(Stage::Asking {
+        provider: options.model.provider,
+    });
     let provider = provider_for(options)?;
-    let response = provider.complete(&request, cancel).map_err(|e| match e {
-        AiError::Cancelled => Error::Cancelled,
-        e => Error::Ai(e),
-    })?;
+    let response = provider
+        .complete_notifying(&request, cancel, &mut |after, reason| {
+            on_stage(Stage::Retrying { after, reason })
+        })
+        .map_err(|e| match e {
+            AiError::Cancelled => Error::Cancelled,
+            e => Error::Ai(e),
+        })?;
     let (description, tags) =
         parse_combined_answer(&response, duration_s, vocabulary, options.moments).map_err(
             |reason| Error::BadAnswer {
