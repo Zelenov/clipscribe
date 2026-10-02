@@ -1,4 +1,4 @@
-# NEXT
+# 0.9.0
 ## Added
 - Command line: a batch shows a plan line (`24 videos: 41:12 of footage, ≈ $0.38 with …`), one bar for the whole run weighted by footage with cost so far and an ETA, the stage of the video in work (frames, asking the provider, retrying in 8 s), one result line per video and a summary.
 - Command line: without a terminal, and with `-q`/`--quiet`, there are no bars, plan or summary: only the result lines (and warnings, and why a run stopped); `--quiet` also drops the token line.
