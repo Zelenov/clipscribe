@@ -1,6 +1,7 @@
 //! What the command line shows while it describes a batch of videos, on stderr: a plan line, one
 //! bar for the whole run, a line for the video in work, one permanent result line per video and
-//! a summary. Without a terminal (piped, CI) or with `--quiet` there are no bars, only lines.
+//! a summary. Without a terminal (piped, CI) or with `--quiet` there are no bars, no plan and no
+//! summary: only the result lines.
 //!
 //! The line formats are plain functions of their inputs, so they are tested without a terminal;
 //! [`Batch`] only draws them. Nothing here writes to stdout except [`Batch::print`], which
@@ -34,22 +35,31 @@ pub struct Plan {
 /// `24 videos: 41:12 of footage, ≈ $0.38 with Claude Haiku 4.5`, plus what will not be sent.
 pub fn plan_line(plan: &Plan) -> String {
     let videos = if plan.videos == 1 { "video" } else { "videos" };
-    let mut line = format!(
-        "{} {videos}: {} of footage, \u{2248} ${:.2} with {}",
-        plan.videos,
-        format_time(plan.footage_s),
-        plan.cost_usd,
-        plan.model
-    );
+    let mut line = if plan.footage_s > 0.0 {
+        format!(
+            "{} {videos}: {} of footage, \u{2248} ${:.2} with {}",
+            plan.videos,
+            format_time(plan.footage_s),
+            plan.cost_usd,
+            plan.model
+        )
+    } else {
+        format!("{} {videos}", plan.videos)
+    };
+    let mut rest = Vec::new();
     if plan.over_limit > 0 {
-        line.push_str(&format!(
-            ", {} over the {} limit (skipped)",
+        rest.push(format!(
+            "{} over the {} limit (skipped)",
             plan.over_limit,
             format_time(plan.limit_s)
         ));
     }
     if plan.unreadable > 0 {
-        line.push_str(&format!(", {} unreadable", plan.unreadable));
+        rest.push(format!("{} unreadable", plan.unreadable));
+    }
+    if !rest.is_empty() {
+        line.push_str(if plan.footage_s > 0.0 { ", " } else { ": " });
+        line.push_str(&rest.join(", "));
     }
     line
 }
@@ -193,7 +203,7 @@ pub fn stage_text(stage: Stage, model: &str) -> String {
         Stage::Retrying { after, reason } => {
             let reason = match reason {
                 RetryReason::RateLimit => "rate limit",
-                RetryReason::Temporary => "temporary failure",
+                _ => "temporary failure",
             };
             format!(
                 "retrying in {} s ({reason})",
@@ -307,10 +317,13 @@ fn millis(seconds: f64) -> u64 {
 
 impl Batch {
     /// A display for `total_videos` videos with `footage_s` seconds in all. `quiet` turns the
-    /// bars, the plan and the summary off; a stderr that is not a terminal does the same for the
-    /// bars.
+    /// bars, the plan and the summary off, leaving the result lines; a stderr that is not a
+    /// terminal does the same.
     pub fn new(model: Model, total_videos: usize, footage_s: f64, quiet: bool) -> Self {
-        let terminal = console::Term::stderr().is_term();
+        // `is_attended` is a terminal that can take cursor movement (not `TERM=dumb`).
+        let terminal = console::Term::stderr().features().is_attended();
+        // Without a terminal the display is only the result lines, as with `--quiet`.
+        let quiet = quiet || !terminal;
         let width = if terminal {
             usize::from(console::Term::stderr().size().1).saturating_sub(2)
         } else {
@@ -355,8 +368,8 @@ impl Batch {
             .with_key(
                 "eta_part",
                 move |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                    // No ETA until a video is done: before that there is no rate to go by.
-                    if eta_seen.load(Ordering::Relaxed) > 0 {
+                    // No ETA until some footage is done: before that there is no rate to go by.
+                    if eta_seen.load(Ordering::Relaxed) > 0 && state.pos() > 0 {
                         let _ = write!(w, "  ETA {}", format_time(state.eta().as_secs_f64()));
                     }
                 },
@@ -385,14 +398,23 @@ impl Batch {
 
     fn refresh_overall(&mut self) {
         self.overall.set_position(self.done_footage_ms);
-        self.overall.set_message(format!(
-            "{}/{} videos \u{b7} {} of {} \u{b7} ${:.3}",
-            self.finished,
-            self.total_videos,
+        let footage = format!(
+            "{} of {}",
             format_time(self.done_footage_ms as f64 / 1000.0),
-            format_time(self.total_footage_ms as f64 / 1000.0),
-            self.cost_usd
-        ));
+            format_time(self.total_footage_ms as f64 / 1000.0)
+        );
+        // Below 60 columns the footage gives way, so the line stays on one row.
+        self.overall.set_message(if self.width < 60 {
+            format!(
+                "{}/{} \u{b7} ${:.3}",
+                self.finished, self.total_videos, self.cost_usd
+            )
+        } else {
+            format!(
+                "{}/{} videos \u{b7} {footage} \u{b7} ${:.3}",
+                self.finished, self.total_videos, self.cost_usd
+            )
+        });
     }
 
     /// Print a line on stderr above the bars (or plainly when there are none).
@@ -536,6 +558,9 @@ impl Batch {
             for line in summary_lines(&totals) {
                 eprintln!("{line}");
             }
+        } else if totals.cancelled {
+            // The one thing even a quiet run says about how it ended.
+            eprintln!("cancelled");
         }
     }
 }
@@ -577,6 +602,18 @@ mod tests {
             ..plan()
         };
         assert!(plan_line(&one).starts_with("1 video: "));
+    }
+
+    #[test]
+    fn a_plan_with_nothing_readable_says_so_without_a_cost() {
+        let line = plan_line(&Plan {
+            videos: 2,
+            footage_s: 0.0,
+            cost_usd: 0.0,
+            unreadable: 2,
+            ..plan()
+        });
+        assert_eq!(line, "2 videos: 2 unreadable");
     }
 
     #[test]

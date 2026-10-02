@@ -29,7 +29,7 @@ fn not_a_video(name: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn json_on_stdout_stays_parseable_and_stderr_has_lines_without_escape_codes() {
+fn json_on_stdout_stays_parseable_and_stderr_has_only_the_result_line_without_a_terminal() {
     let (dir, file) = not_a_video("json");
     let out = run(&[
         "--api-key",
@@ -45,40 +45,34 @@ fn json_on_stdout_stays_parseable_and_stderr_has_lines_without_escape_codes() {
         !stderr.contains('\u{1b}'),
         "no escape codes without a terminal: {stderr:?}"
     );
-    assert!(stderr.contains("1 video: "), "the plan line: {stderr}");
-    assert!(stderr.contains("1 unreadable"), "{stderr}");
-    assert!(stderr.contains("\u{2717} "), "the result line: {stderr}");
-    // Without a terminal an error is never cut: it is in the result line and in the summary.
-    assert_eq!(
-        stderr.matches("could not be read").count(),
-        2,
-        "the error is whole, and listed again at the end: {stderr}"
-    );
+    // Without a terminal: no bars, no plan, no summary; only the result line, whole.
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("\u{2717} "), "{stderr}");
     assert!(
         stderr.contains("\u{43f}\u{43b}\u{43e}\u{445}\u{43e}\u{435}.mp4"),
         "{stderr}"
     );
-    assert!(stderr.contains("done: 0 videos"), "the summary: {stderr}");
-    assert!(stderr.contains("1 problem:"), "{stderr}");
+    assert!(
+        stderr.contains("could not be read ("),
+        "the error is whole: {stderr}"
+    );
+    assert!(
+        !stderr.contains("video: ") && !stderr.contains("done: "),
+        "{stderr}"
+    );
     assert_eq!(out.status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn quiet_leaves_only_the_result_lines() {
+fn quiet_gives_the_same_result_line_and_the_same_json() {
     let (dir, file) = not_a_video("quiet");
-    let out = run(&[
-        "--api-key",
-        "unused",
-        "--quiet",
-        "--json",
-        file.to_str().expect("utf8"),
-    ]);
-    let stderr = text(&out.stderr);
-    assert!(serde_json::from_str::<serde_json::Value>(&text(&out.stdout)).is_ok());
-    assert!(stderr.contains("\u{2717} "), "{stderr}");
-    assert!(!stderr.contains("1 video: "), "no plan line: {stderr}");
-    assert!(!stderr.contains("done: "), "no summary: {stderr}");
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    let path = file.to_str().expect("utf8");
+    let loud = run(&["--api-key", "unused", "--json", path]);
+    let quiet = run(&["--api-key", "unused", "--quiet", "--json", path]);
+    assert_eq!(text(&quiet.stdout), text(&loud.stdout));
+    assert_eq!(text(&quiet.stderr), text(&loud.stderr));
+    assert_eq!(text(&quiet.stderr).lines().count(), 1);
+    assert_eq!(quiet.status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);
 }

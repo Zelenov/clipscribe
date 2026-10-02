@@ -176,6 +176,7 @@ impl AiError {
 
 /// Why a request waits before it is sent again: see [`crate::Stage::Retrying`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RetryReason {
     /// The provider's rate limit was reached.
     RateLimit,

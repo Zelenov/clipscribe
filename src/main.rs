@@ -71,8 +71,8 @@ struct Cli {
     json: bool,
 
     /// No progress bars, plan, summary or token line: only one line per video on stderr, plus
-    /// warnings and why a run stopped (and, as ever, the descriptions on stdout). Bars are off
-    /// anyway when stderr is not a terminal.
+    /// warnings and why a run stopped (and, as ever, the descriptions on stdout). That is also
+    /// what stderr gets when it is not a terminal (piped, CI), except for the token line.
     #[arg(long, short = 'q')]
     quiet: bool,
 
@@ -467,7 +467,7 @@ fn main() -> ExitCode {
         }
     }
     totals.cost_usd = model.cost_usd(total);
-    totals.cancelled |= CANCEL.load(Ordering::Relaxed);
+    totals.cancelled |= CANCEL.load(Ordering::Relaxed) && !totals.stopped;
     totals.not_tried = videos.len().saturating_sub(handled);
     let cancelled = totals.cancelled;
     batch.finish(totals);

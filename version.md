@@ -1,6 +1,6 @@
 # NEXT
 ## Added
-- Command line: a batch shows a plan line (`24 videos: 41:12 of footage, ≈ $0.38 with …`), one bar for the whole run weighted by footage with cost so far and an ETA, the stage of the video in work (frames, asking the provider, retrying in 8 s), one result line per video and a summary; without a terminal there are no bars, only lines, and `--quiet` leaves just the result lines (and warnings, and why a run stopped; it also drops the token line).
+- Command line: a batch shows a plan line (`24 videos: 41:12 of footage, ≈ $0.38 with …`), one bar for the whole run weighted by footage with cost so far and an ETA, the stage of the video in work (frames, asking the provider, retrying in 8 s), one result line per video and a summary; without a terminal, and with `--quiet`, there are no bars, plan or summary: only the result lines (and warnings, and why a run stopped), and `--quiet` also drops the token line.
 - Library: `Stage::Retrying { after, reason }` tells a progress display that a request waits before it is sent again (`RetryReason::RateLimit` or `Temporary`); `AiProvider::complete_notifying` reports the waits, and an `AiProvider` of your own can keep using `complete` alone.
 
 ## Changed
