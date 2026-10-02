@@ -174,10 +174,33 @@ impl AiError {
     }
 }
 
+/// Why a request waits before it is sent again: see [`crate::Stage::Retrying`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RetryReason {
+    /// The provider's rate limit was reached.
+    RateLimit,
+    /// A temporary failure: the provider was overloaded or failed, or the network did.
+    Temporary,
+}
+
 /// Something that answers [`AiRequest`]s. Blocking: runs on a worker thread. `cancel` is
 /// checked during waits between retries.
 pub trait AiProvider {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError>;
+
+    /// [`AiProvider::complete`], calling `on_retry(wait, reason)` before each wait between
+    /// attempts, so a progress display can say why it is not moving. A provider that never
+    /// retries can leave this as it is.
+    fn complete_notifying(
+        &self,
+        request: &AiRequest,
+        cancel: &AtomicBool,
+        on_retry: &mut dyn FnMut(Duration, RetryReason),
+    ) -> Result<AiResponse, AiError> {
+        let _ = on_retry;
+        self.complete(request, cancel)
+    }
 }
 
 /// What one HTTP attempt decided, for [`retry_loop`]. Every provider's own `classify` builds
@@ -217,6 +240,7 @@ pub(crate) fn retry_loop(
     retry: &RetryPolicy,
     provider_label: &str,
     cancel: &AtomicBool,
+    on_retry: &mut dyn FnMut(Duration, RetryReason),
     mut attempt: impl FnMut() -> Attempt,
 ) -> Result<AiResponse, AiError> {
     let mut retries = retry.delays.iter();
@@ -232,6 +256,7 @@ pub(crate) fn retry_loop(
             Attempt::RateLimited(duration) => {
                 rate_limited += 1;
                 log::info!("ai: rate limited, waiting {} s", duration.as_secs());
+                on_retry(duration, RetryReason::RateLimit);
                 wait(retry, duration, cancel)?;
             }
             Attempt::Retry(why) => {
@@ -240,6 +265,7 @@ pub(crate) fn retry_loop(
                     return Err(AiError::Network(why));
                 };
                 log::warn!("ai: {why}; retrying in {} s", delay.as_secs());
+                on_retry(*delay, RetryReason::Temporary);
                 wait(retry, *delay, cancel)?;
             }
         }
@@ -278,10 +304,16 @@ mod tests {
     fn a_done_attempt_is_returned_without_retrying() {
         let calls = Arc::new(Mutex::new(0));
         let seen = calls.clone();
-        let result = retry_loop(&fast_retries(), "Test", &AtomicBool::new(false), || {
-            *seen.lock().expect("lock") += 1;
-            Attempt::Done(Err(AiError::Timeout))
-        });
+        let result = retry_loop(
+            &fast_retries(),
+            "Test",
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+            || {
+                *seen.lock().expect("lock") += 1;
+                Attempt::Done(Err(AiError::Timeout))
+            },
+        );
         assert_eq!(result, Err(AiError::Timeout));
         assert_eq!(*calls.lock().expect("lock"), 1, "not retried");
     }
@@ -296,6 +328,7 @@ mod tests {
             &fast_retries(),
             "Test",
             &AtomicBool::new(false),
+            &mut |_, _| {},
             move || {
                 let mut n = seen.lock().expect("lock");
                 *n += 1;
@@ -320,6 +353,7 @@ mod tests {
             &fast_retries(),
             "Test",
             &AtomicBool::new(false),
+            &mut |_, _| {},
             move || {
                 let mut n = seen.lock().expect("lock");
                 *n += 1;
@@ -345,6 +379,7 @@ mod tests {
             &fast_retries(),
             "Test",
             &AtomicBool::new(false),
+            &mut |_, _| {},
             move || {
                 *seen.lock().expect("lock") += 1;
                 Attempt::RateLimited(Duration::from_millis(1))
@@ -374,10 +409,34 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
         });
         let started = std::time::Instant::now();
-        let result = retry_loop(&policy, "Test", &cancel, || {
+        let result = retry_loop(&policy, "Test", &cancel, &mut |_, _| {}, || {
             Attempt::RateLimited(Duration::from_secs(30))
         });
         assert_eq!(result, Err(AiError::Cancelled));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn each_wait_between_attempts_is_reported_with_its_reason() {
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let result = retry_loop(
+            &fast_retries(),
+            "Test",
+            &AtomicBool::new(false),
+            &mut |after, reason| waits.push((after, reason)),
+            || {
+                calls += 1;
+                match calls {
+                    1 => Attempt::Retry("overloaded".to_string()),
+                    2 => Attempt::RateLimited(Duration::from_millis(1)),
+                    _ => Attempt::Done(Err(AiError::Timeout)),
+                }
+            },
+        );
+        assert_eq!(result, Err(AiError::Timeout));
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0].1, RetryReason::Temporary);
+        assert_eq!(waits[1], (Duration::from_millis(1), RetryReason::RateLimit));
     }
 }

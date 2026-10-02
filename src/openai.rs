@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::provider::{
     self, timeout_for, AiContent, AiError, AiProvider, AiRequest, AiResponse, AiUsage, Attempt,
-    Provider, RetryPolicy, CONNECT_TIMEOUT,
+    Provider, RetryPolicy, RetryReason, CONNECT_TIMEOUT,
 };
 
 const API_URL: &str = "https://api.openai.com";
@@ -86,10 +86,23 @@ impl OpenAi {
 
 impl AiProvider for OpenAi {
     fn complete(&self, request: &AiRequest, cancel: &AtomicBool) -> Result<AiResponse, AiError> {
+        self.complete_notifying(request, cancel, &mut |_, _| {})
+    }
+
+    fn complete_notifying(
+        &self,
+        request: &AiRequest,
+        cancel: &AtomicBool,
+        on_retry: &mut dyn FnMut(Duration, RetryReason),
+    ) -> Result<AiResponse, AiError> {
         let body = Self::body(request)?.to_string();
-        provider::retry_loop(&self.retry, Provider::OpenAi.label(), cancel, || {
-            self.attempt(&body)
-        })
+        provider::retry_loop(
+            &self.retry,
+            Provider::OpenAi.label(),
+            cancel,
+            on_retry,
+            || self.attempt(&body),
+        )
     }
 }
 
@@ -372,6 +385,26 @@ mod tests {
         assert!(AiError::KeyRejected("OpenAI".to_string())
             .stops_job()
             .is_some());
+    }
+
+    #[test]
+    fn a_retry_is_reported_with_its_wait_and_reason() {
+        let unavailable = http(
+            "503 Service Unavailable",
+            "",
+            r#"{"error":{"message":"The server is overloaded."}}"#,
+        );
+        let (url, _) = server(vec![unavailable, ok()]);
+        let provider = OpenAi::with_endpoint("k".into(), url, fast_retries()).expect("client");
+        let mut waits = Vec::new();
+        let result = provider.complete_notifying(
+            &request(),
+            &AtomicBool::new(false),
+            &mut |after, reason| waits.push((after, reason)),
+        );
+        assert!(result.is_ok());
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].1, RetryReason::Temporary);
     }
 
     #[test]

@@ -55,7 +55,7 @@ let options = Options {
 };
 let subtitles = srt::load_for(video)?;
 let described = describe(video, &subtitles, &options, &AtomicBool::new(false), |stage| {
-    eprintln!("{stage:?}"); // Frame { done, total }, then Asking
+    eprintln!("{stage:?}"); // Frame { done, total }, then Asking { provider }; Retrying while it waits
 })?;
 println!("{}", described.description.summary);
 for moment in &described.description.segments {

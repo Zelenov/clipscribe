@@ -1,3 +1,13 @@
+# 0.9.0
+## Added
+- Command line: a batch shows a plan line (`24 videos: 41:12 of footage, ≈ $0.38 with …`), one bar for the whole run weighted by footage with cost so far and an ETA, the stage of the video in work (frames, asking the provider, retrying in 8 s), one result line per video and a summary.
+- Command line: without a terminal, and with `-q`/`--quiet`, there are no bars, plan or summary: only the result lines (and warnings, and why a run stopped); `--quiet` also drops the token line.
+- Library: `Stage::Retrying { after, reason }` tells a progress display that a request waits before it is sent again (`RetryReason::RateLimit` or `Temporary`); `AiProvider::complete_notifying` reports the waits, and an `AiProvider` of your own can keep using `complete` alone.
+
+## Changed
+- Library: `Stage::Asking` is now `Stage::Asking { provider: Provider }`, `Stage::Retrying` is new and `Stage` is `#[non_exhaustive]`: update `match` arms on `Stage` (`Asking { .. }`, a `Retrying { .. }` arm and a wildcard). The command line no longer says "waiting for Claude" with `--provider openai`.
+- Command line: what a failed video prints on stderr is now `✗ name  message` (the file name, no `error:` prefix) and Ctrl+C prints a summary line (or `cancelled` with `--quiet`): a script that greps stderr for `error:` must change.
+
 # 0.8.1
 ## Added
 - The Windows `clipscribe.exe` has the app icon (Explorer, taskbar, file properties), and the README shows it; library and non-Windows builds are unchanged.
