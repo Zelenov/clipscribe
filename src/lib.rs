@@ -29,13 +29,20 @@
 //! Everything blocks: call it from a worker thread. Without the default `frames` feature the
 //! crate has no GStreamer dependency and no [`describe`]; the models, the request, the answer,
 //! the estimate and the Anthropic client remain.
+//!
+//! Whole folders: [`describe_folder`] describes many clips with several in flight, skipping those
+//! a [`Cache`] already has and stopping within a [`Budget`]; [`group_clips`] groups similar
+//! footage. See `docs/design/whole-folders.md`.
 
 pub mod anthropic;
 pub mod ass;
+mod cache;
 mod debug_frames;
 mod describe;
+mod folder;
 #[cfg(feature = "frames")]
 pub mod frames;
+mod groups;
 mod moment;
 pub mod openai;
 pub mod provider;
@@ -44,8 +51,17 @@ mod tags;
 
 use std::time::Duration;
 
+pub use cache::{cache_path, Cache, CacheKey, ClipRecord, FileIdentity, CACHE_FILE_NAME};
 pub use debug_frames::{debug_frames_dir, dump_frames, set_debug_frames_dir, DEBUG_FRAMES_ENV};
 pub use describe::*;
+pub use folder::{
+    cached_clip, find_videos, request_cost_bound, serve_after_stop, Budget, ClipOutcome,
+    DescribedClip, FolderEvent, FolderRun, FrameFingerprint, Reservation, Reserved, RunOptions,
+    Stop, DEFAULT_JOBS, VIDEO_EXTENSIONS,
+};
+#[cfg(feature = "frames")]
+pub use folder::{describe_clip, describe_folder};
+pub use groups::{group_clips, ClipGroups, Group, GroupOptions, Grouping, Stretch};
 pub use moment::*;
 pub use provider::{AiError, AiProvider, AiUsage, Provider, RetryReason};
 pub use tags::*;
@@ -146,14 +162,23 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The client for `options.model`'s provider.
-fn provider_for(options: &Options) -> Result<Box<dyn provider::AiProvider>, Error> {
+/// The client for `options.model`'s provider; with a `gate`, pausing together with every other
+/// client sharing it (the workers of one folder run).
+fn provider_for(
+    options: &Options,
+    gate: Option<std::sync::Arc<provider::RateGate>>,
+) -> Result<Box<dyn provider::AiProvider>, Error> {
+    let key = options.api_key.clone();
     match options.model.provider {
         Provider::Anthropic => Ok(Box::new(
-            anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?,
+            anthropic::Anthropic::new(key)
+                .map_err(Error::Ai)?
+                .with_rate_gate(gate),
         )),
         Provider::OpenAi => Ok(Box::new(
-            openai::OpenAi::new(options.api_key.clone()).map_err(Error::Ai)?,
+            openai::OpenAi::new(key)
+                .map_err(Error::Ai)?
+                .with_rate_gate(gate),
         )),
     }
 }
@@ -210,61 +235,32 @@ pub fn describe(
     subtitles: &[Cue],
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
-    mut on_stage: impl FnMut(Stage),
+    on_stage: impl FnMut(Stage),
 ) -> Result<Described, Error> {
-    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
-    let duration_s = clip
-        .duration_s()
-        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
-    if duration_s > MAX_DURATION_S {
-        return Err(Error::TooLong(duration_s));
-    }
-    let frames = match clip.sample(duration_s, options.frame_sampling, cancel, |done, total| {
-        on_stage(Stage::Frame { done, total })
-    }) {
-        Ok(Some(frames)) if !frames.is_empty() => frames,
-        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
-        Ok(None) => return Err(Error::Cancelled),
-        Err(e) => return Err(Error::Unreadable(e)),
-    };
-    drop(clip);
-    debug_frames::dump_if_on(
-        &debug_frames::name_of(video),
-        &frames,
-        picked(duration_s, options.frame_sampling),
-    );
-    let request = build_request(
-        options.model,
-        &frames,
+    let clip = uncapped(describe_clip(
+        video,
         subtitles,
-        duration_s,
-        options.language,
-        options.moments,
-    );
-    on_stage(Stage::Asking {
-        provider: options.model.provider,
-    });
-    let provider = provider_for(options)?;
-    let response = provider
-        .complete_notifying(&request, cancel, &mut |after, reason| {
-            on_stage(Stage::Retrying { after, reason })
-        })
-        .map_err(|e| match e {
-            AiError::Cancelled => Error::Cancelled,
-            e => Error::Ai(e),
-        })?;
-    let description = parse_answer(&response, duration_s, options.moments).map_err(|reason| {
-        Error::BadAnswer {
-            reason,
-            usage: response.usage,
-        }
-    })?;
+        None,
+        options,
+        &Budget::new(None),
+        cancel,
+        on_stage,
+    )?);
     Ok(Described {
-        description,
-        usage: response.usage,
-        duration_s,
-        frames: frames.len(),
+        frames: clip.frames.len(),
+        description: clip.description,
+        usage: clip.usage,
+        duration_s: clip.duration_s,
     })
+}
+
+/// What [`describe_clip`] gives with a budget without a cap, which always has room.
+#[cfg(feature = "frames")]
+fn uncapped(clip: Option<DescribedClip>) -> DescribedClip {
+    match clip {
+        Some(clip) => clip,
+        None => unreachable!("a budget without a cap never refuses a request"),
+    }
 }
 
 /// A clip described together with tag suggestions from a vocabulary, from one request: see
@@ -288,63 +284,24 @@ pub fn describe_with_tags(
     vocabulary: &[Tag],
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
-    mut on_stage: impl FnMut(Stage),
+    on_stage: impl FnMut(Stage),
 ) -> Result<DescribedWithTags, Error> {
-    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
-    let duration_s = clip
-        .duration_s()
-        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
-    if duration_s > MAX_DURATION_S {
-        return Err(Error::TooLong(duration_s));
-    }
-    let frames = match clip.sample(duration_s, options.frame_sampling, cancel, |done, total| {
-        on_stage(Stage::Frame { done, total })
-    }) {
-        Ok(Some(frames)) if !frames.is_empty() => frames,
-        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
-        Ok(None) => return Err(Error::Cancelled),
-        Err(e) => return Err(Error::Unreadable(e)),
-    };
-    drop(clip);
-    debug_frames::dump_if_on(
-        &debug_frames::name_of(video),
-        &frames,
-        picked(duration_s, options.frame_sampling),
-    );
-    let request = build_combined_request(
-        options.model,
-        &frames,
+    let clip = uncapped(describe_clip(
+        video,
         subtitles,
-        vocabulary,
-        duration_s,
-        options.language,
-        options.moments,
-    );
-    on_stage(Stage::Asking {
-        provider: options.model.provider,
-    });
-    let provider = provider_for(options)?;
-    let response = provider
-        .complete_notifying(&request, cancel, &mut |after, reason| {
-            on_stage(Stage::Retrying { after, reason })
-        })
-        .map_err(|e| match e {
-            AiError::Cancelled => Error::Cancelled,
-            e => Error::Ai(e),
-        })?;
-    let (description, tags) =
-        parse_combined_answer(&response, duration_s, vocabulary, options.moments).map_err(
-            |reason| Error::BadAnswer {
-                reason,
-                usage: response.usage,
-            },
-        )?;
+        Some(vocabulary),
+        options,
+        &Budget::new(None),
+        cancel,
+        on_stage,
+    )?);
     Ok(DescribedWithTags {
-        description,
-        tags,
-        usage: response.usage,
-        duration_s,
-        frames: frames.len(),
+        frames: clip.frames.len(),
+        description: clip.description,
+        // Always there when a vocabulary was given.
+        tags: clip.tags.unwrap_or_default(),
+        usage: clip.usage,
+        duration_s: clip.duration_s,
     })
 }
 
@@ -369,7 +326,7 @@ pub fn suggest_tags(
         vocabulary,
         duration_s,
     );
-    let provider = provider_for(options)?;
+    let provider = provider_for(options, None)?;
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
@@ -424,7 +381,7 @@ pub fn describe_moment(
         window_s,
         options.language,
     );
-    let provider = provider_for(options)?;
+    let provider = provider_for(options, None)?;
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),

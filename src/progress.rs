@@ -7,6 +7,7 @@
 //! [`Batch`] only draws them. Nothing here writes to stdout except [`Batch::print`], which
 //! steps the bars aside first.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -305,7 +306,8 @@ struct Current {
 pub struct Batch {
     multi: MultiProgress,
     overall: ProgressBar,
-    current: Option<Current>,
+    /// The videos in work, by their index in the run (several at once with `--jobs`).
+    current: BTreeMap<usize, Current>,
     interactive: bool,
     quiet: bool,
     width: usize,
@@ -392,7 +394,7 @@ impl Batch {
         let mut batch = Self {
             multi,
             overall,
-            current: None,
+            current: BTreeMap::new(),
             interactive,
             quiet,
             width: width.max(40),
@@ -448,8 +450,8 @@ impl Batch {
         }
     }
 
-    /// The video `name` starts.
-    pub fn begin(&mut self, name: &str) {
+    /// The video `name`, number `id` of the run, starts.
+    pub fn begin(&mut self, id: usize, name: &str) {
         if !self.interactive {
             return;
         }
@@ -482,16 +484,19 @@ impl Batch {
                 .unwrap_or_else(|_| ProgressStyle::default_bar())
                 .progress_chars("=> "),
         );
-        self.current = Some(Current {
-            shown,
-            line,
-            frames,
-        });
+        self.current.insert(
+            id,
+            Current {
+                shown,
+                line,
+                frames,
+            },
+        );
     }
 
-    /// The video in work reached `stage`.
-    pub fn stage(&mut self, stage: Stage) {
-        let Some(current) = &self.current else {
+    /// The video `id` in work reached `stage`.
+    pub fn stage(&mut self, id: usize, stage: Stage) {
+        let Some(current) = self.current.get(&id) else {
             return;
         };
         if let Ok(mut shown) = current.shown.lock() {
@@ -525,8 +530,14 @@ impl Batch {
 
     /// The video `name` (`duration_s` of footage) ended as `outcome`; its line stays on screen.
     /// Returns the line, for the summary.
-    pub fn finish_video(&mut self, name: &str, duration_s: f64, outcome: &Outcome) -> String {
-        if let Some(current) = self.current.take() {
+    pub fn finish_video(
+        &mut self,
+        id: usize,
+        name: &str,
+        duration_s: f64,
+        outcome: &Outcome,
+    ) -> String {
+        if let Some(current) = self.current.remove(&id) {
             current.frames.finish_and_clear();
             current.line.finish_and_clear();
         }
@@ -541,6 +552,14 @@ impl Batch {
         let width = self.interactive.then_some(self.width);
         self.println(&result_line(name, outcome, width));
         result_line(name, outcome, None)
+    }
+
+    /// The video `id` stopped without a result (Ctrl+C): its bars go, no line is left.
+    pub fn abandon(&mut self, id: usize) {
+        if let Some(current) = self.current.remove(&id) {
+            current.frames.finish_and_clear();
+            current.line.finish_and_clear();
+        }
     }
 
     /// A line of its own on stderr, above the bars: a warning or why the run stopped.
@@ -559,7 +578,7 @@ impl Batch {
 
     /// Clear the bars and print the summary (not with `--quiet`).
     pub fn finish(&mut self, mut totals: Totals) {
-        if let Some(current) = self.current.take() {
+        for current in std::mem::take(&mut self.current).into_values() {
             current.frames.finish_and_clear();
             current.line.finish_and_clear();
         }
@@ -854,25 +873,28 @@ mod tests {
         let mut batch = Batch::with_target(target, true, false, 80, MODELS[0], 2, 60.0);
         let pause = || std::thread::sleep(Duration::from_millis(20));
         pause();
-        batch.begin("clip.mp4");
+        batch.begin(0, "clip.mp4");
         pause();
-        batch.stage(Stage::Frame { done: 4, total: 60 });
+        batch.stage(0, Stage::Frame { done: 4, total: 60 });
         pause();
-        batch.stage(Stage::Asking {
-            provider: Provider::OpenAi,
-        });
+        batch.stage(
+            0,
+            Stage::Asking {
+                provider: Provider::OpenAi,
+            },
+        );
         pause();
         // What the line of the video says is its state, whichever frames indicatif drew.
         let shown = *batch
             .current
-            .as_ref()
+            .get(&0)
             .expect("a video is in work")
             .shown
             .lock()
             .expect("lock");
         assert_eq!(shown_text(&shown, Instant::now(), "M"), "asking OpenAI (M)");
         pause();
-        let line = batch.finish_video("clip.mp4", 30.0, &described(2, None));
+        let line = batch.finish_video(0, "clip.mp4", 30.0, &described(2, None));
         // The result line itself goes to stderr between two draws of the bars; the display
         // returns it for the summary.
         assert!(line.starts_with("\u{2713} clip.mp4  2 moments"), "{line}");
@@ -894,12 +916,15 @@ mod tests {
             1,
             10.0,
         );
-        batch.begin("clip.mp4");
-        batch.stage(Stage::Asking {
-            provider: Provider::Anthropic,
-        });
-        batch.finish_video("clip.mp4", 10.0, &described(1, None));
-        assert!(batch.current.is_none());
+        batch.begin(0, "clip.mp4");
+        batch.stage(
+            0,
+            Stage::Asking {
+                provider: Provider::Anthropic,
+            },
+        );
+        batch.finish_video(0, "clip.mp4", 10.0, &described(1, None));
+        assert!(batch.current.is_empty());
         assert!(batch.overall.is_hidden());
         // On a developer's terminal `cargo test` still has a terminal behind its captured
         // stderr, so only check what holds there too.
@@ -974,10 +999,10 @@ mod tests {
             2,
             100.0,
         );
-        batch.finish_video("short.mp4", 10.0, &described(0, None));
+        batch.finish_video(0, "short.mp4", 10.0, &described(0, None));
         assert_eq!(batch.overall.position(), 10_000);
         assert_eq!(batch.overall.length(), Some(100_000));
-        batch.finish_video("long.mp4", 90.0, &Outcome::Failed("x".into()));
+        batch.finish_video(0, "long.mp4", 90.0, &Outcome::Failed("x".into()));
         assert_eq!(batch.overall.position(), 100_000);
     }
 }

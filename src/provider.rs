@@ -213,6 +213,49 @@ pub(crate) enum Attempt {
     RateLimited(Duration),
 }
 
+/// A pause shared by several clients of one provider, so that a 429 on one of them holds all of
+/// them back instead of each sending into the limit until it gets its own 429: a folder run
+/// ([`crate::describe_folder`]) gives every worker's client the same gate. [`retry_loop`] closes it
+/// for a 429's wait and waits for it to open before every attempt.
+#[derive(Debug, Default)]
+pub(crate) struct RateGate {
+    open_at: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl RateGate {
+    /// Keep the gate closed for at least `duration` from now (never shortens a longer pause).
+    fn close_for(&self, duration: Duration) {
+        let until = std::time::Instant::now() + duration;
+        let mut open_at = self.open_at.lock().unwrap_or_else(|e| e.into_inner());
+        if open_at.is_none_or(|at| at < until) {
+            *open_at = Some(until);
+        }
+    }
+
+    /// How long until the gate opens; zero when it is open.
+    fn closed_for(&self) -> Duration {
+        let open_at = self.open_at.lock().unwrap_or_else(|e| e.into_inner());
+        open_at.map_or(Duration::ZERO, |at| {
+            at.saturating_duration_since(std::time::Instant::now())
+        })
+    }
+
+    /// Wait until the gate is open, however often another client closes it again meanwhile.
+    fn wait_open(&self, retry: &RetryPolicy, cancel: &AtomicBool) -> Result<(), AiError> {
+        loop {
+            let left = self.closed_for();
+            if left.is_zero() {
+                return Ok(());
+            }
+            log::info!(
+                "ai: another request was rate limited, waiting {} s",
+                left.as_secs()
+            );
+            wait(retry, left, cancel)?;
+        }
+    }
+}
+
 /// Sleep `duration` in steps, returning `Cancelled` as soon as `cancel` is set.
 fn wait(retry: &RetryPolicy, duration: Duration, cancel: &AtomicBool) -> Result<(), AiError> {
     use std::sync::atomic::Ordering;
@@ -235,10 +278,12 @@ fn wait(retry: &RetryPolicy, duration: Duration, cancel: &AtomicBool) -> Result<
 /// The retry loop every [`AiProvider`] runs: keeps calling `attempt` (one HTTP round-trip,
 /// classified into an [`Attempt`]) until it is done, retrying a transient failure after
 /// `retry`'s next delay and waiting out rate limits without spending one. `provider_label`
-/// names who ran out of retries or waits (see [`Provider::label`]).
+/// names who ran out of retries or waits (see [`Provider::label`]). `gate`, when given, is shared
+/// with other clients: every attempt waits for it to be open, and a rate limit closes it for all.
 pub(crate) fn retry_loop(
     retry: &RetryPolicy,
     provider_label: &str,
+    gate: Option<&RateGate>,
     cancel: &AtomicBool,
     on_retry: &mut dyn FnMut(Duration, RetryReason),
     mut attempt: impl FnMut() -> Attempt,
@@ -246,6 +291,9 @@ pub(crate) fn retry_loop(
     let mut retries = retry.delays.iter();
     let mut rate_limited = 0;
     loop {
+        if let Some(gate) = gate {
+            gate.wait_open(retry, cancel)?;
+        }
         match attempt() {
             Attempt::Done(result) => return result,
             Attempt::RateLimited(_) if rate_limited >= retry.max_rate_limit_waits => {
@@ -255,6 +303,9 @@ pub(crate) fn retry_loop(
             }
             Attempt::RateLimited(duration) => {
                 rate_limited += 1;
+                if let Some(gate) = gate {
+                    gate.close_for(duration);
+                }
                 log::info!("ai: rate limited, waiting {} s", duration.as_secs());
                 on_retry(duration, RetryReason::RateLimit);
                 wait(retry, duration, cancel)?;
@@ -307,6 +358,7 @@ mod tests {
         let result = retry_loop(
             &fast_retries(),
             "Test",
+            None,
             &AtomicBool::new(false),
             &mut |_, _| {},
             || {
@@ -327,6 +379,7 @@ mod tests {
         let result = retry_loop(
             &fast_retries(),
             "Test",
+            None,
             &AtomicBool::new(false),
             &mut |_, _| {},
             move || {
@@ -352,6 +405,7 @@ mod tests {
         let result = retry_loop(
             &fast_retries(),
             "Test",
+            None,
             &AtomicBool::new(false),
             &mut |_, _| {},
             move || {
@@ -378,6 +432,7 @@ mod tests {
         let result = retry_loop(
             &fast_retries(),
             "Test",
+            None,
             &AtomicBool::new(false),
             &mut |_, _| {},
             move || {
@@ -409,11 +464,87 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
         });
         let started = std::time::Instant::now();
-        let result = retry_loop(&policy, "Test", &cancel, &mut |_, _| {}, || {
+        let result = retry_loop(&policy, "Test", None, &cancel, &mut |_, _| {}, || {
             Attempt::RateLimited(Duration::from_secs(30))
         });
         assert_eq!(result, Err(AiError::Cancelled));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// With several clients sharing one gate (a folder run's workers), a 429 on one of them holds
+    /// back the *other's* next attempt for the 429's wait, instead of letting it send into the
+    /// limit too.
+    #[test]
+    fn a_rate_limit_on_one_client_holds_back_another_sharing_the_gate() {
+        let gate = Arc::new(RateGate::default());
+        let first_gate = gate.clone();
+        let first = std::thread::spawn(move || {
+            let mut calls = 0;
+            retry_loop(
+                &fast_retries(),
+                "Test",
+                Some(&first_gate),
+                &AtomicBool::new(false),
+                &mut |_, _| {},
+                || {
+                    calls += 1;
+                    if calls == 1 {
+                        Attempt::RateLimited(Duration::from_millis(300))
+                    } else {
+                        ok()
+                    }
+                },
+            )
+        });
+        // Start the second client only once the first one's 429 has closed the gate (polling
+        // the gate itself, not a fixed sleep that a slow machine could outlast), and note when it
+        // opens again.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let opens_at = loop {
+            // Read before the gate is asked, so `opens_at` is never later than its real time.
+            let now = std::time::Instant::now();
+            let left = gate.closed_for();
+            if !left.is_zero() {
+                break now + left;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first client never closed the gate"
+            );
+            std::thread::yield_now();
+        };
+        let mut attempted_at = None;
+        let second = retry_loop(
+            &fast_retries(),
+            "Test",
+            Some(&gate),
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+            || {
+                attempted_at = Some(std::time::Instant::now());
+                ok()
+            },
+        );
+        assert!(second.is_ok());
+        assert!(first.join().expect("thread").is_ok());
+        let attempted_at = attempted_at.expect("attempted");
+        assert!(
+            attempted_at >= opens_at,
+            "the second client waited for the first one's 429: {:?} early",
+            opens_at.saturating_duration_since(attempted_at)
+        );
+    }
+
+    #[test]
+    fn a_gate_is_never_shortened_by_a_shorter_pause() {
+        let gate = RateGate::default();
+        assert!(
+            gate.closed_for().is_zero(),
+            "open until something closes it"
+        );
+        gate.close_for(Duration::from_secs(60));
+        gate.close_for(Duration::from_millis(1));
+        assert!(gate.closed_for() > Duration::from_secs(50));
     }
 
     #[test]
@@ -423,6 +554,7 @@ mod tests {
         let result = retry_loop(
             &fast_retries(),
             "Test",
+            None,
             &AtomicBool::new(false),
             &mut |after, reason| waits.push((after, reason)),
             || {
