@@ -13,12 +13,15 @@
   have cost and what to do next. Library: `Budget` (`reserve_or_wait`, `Reserved`,
   `refused_usd`), `request_cost_bound`, `cached_clip`, `serve_after_stop`.
 - `--groups`: groups similar footage — videos, and stretches within them, that look like the same
-  shot (duplicates, re-exports, a camera that did not move) or whose descriptions share many words
-  (the same subject, even after the camera moved) — each group with a label from the descriptions,
-  at no extra cost. Word matches are rough: unrelated videos described in similar everyday words
-  can be joined, and groups can chain together on a large folder — check them. Text ends with a
-  `Groups:` section; JSON clip objects gain `group`, `group_label`, `stretches`, and each moment a
-  `group`. Library: `group_clips`.
+  shot (duplicates, re-exports, a clip stored sideways, a camera that did not move) — each group
+  with a label from the descriptions, at no extra cost. Text ends with a `Groups:` section; JSON
+  clip objects gain `group`, `group_label`, `stretches`, and each moment a `group`. Library:
+  `group_clips(clips, &GroupOptions)`.
+- `--groups=words` (**experimental**): also joins videos whose descriptions share many words (the
+  same subject, even after the camera moved). Its threshold was tuned on descriptions written for
+  the tests, not on real ones: it can join unrelated videos described in similar everyday words,
+  miss the same subject reworded, and chain groups together on a large folder — check them.
+  Library: `GroupOptions { words: true }`, off by default.
 - Library: `describe_folder` runs a whole folder with `FolderEvent`s for a progress display;
   `describe_clip` describes one clip within a `Budget`; `find_videos` lists a folder's videos.
 

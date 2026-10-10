@@ -106,7 +106,8 @@ run and stop at a budget:
 
 ```rust
 use clipscribe::{
-    cache_path, describe_folder, find_videos, group_clips, Budget, Cache, DescribedClip, RunOptions,
+    cache_path, describe_folder, find_videos, group_clips, Budget, Cache, DescribedClip,
+    GroupOptions, RunOptions,
 };
 
 let videos = find_videos(&["footage".into()])?; // the videos in the folder, sorted
@@ -118,7 +119,10 @@ let run = describe_folder(&videos, Some(&cache), &RunOptions::default(), &option
 let described: Vec<(usize, &DescribedClip)> = run.clips.iter().enumerate()
     .filter_map(|(i, c)| c.record().map(|r| (i, &r.clip)))
     .collect();
-let grouping = group_clips(&described.iter().map(|(_, clip)| *clip).collect::<Vec<_>>());
+let grouping = group_clips(
+    &described.iter().map(|(_, clip)| *clip).collect::<Vec<_>>(),
+    &GroupOptions::default(), // pictures only; `words: true` is experimental
+);
 for ((i, _), groups) in described.iter().zip(&grouping.clips) {
     println!("{}: group {}", videos[*i].display(), groups.group);
 }
@@ -149,19 +153,18 @@ as soon as one video failed or was not started: keep the index, as above.
   `Failed`, `OverBudget`, `NotStarted`), with `usage` (what this run spent) and `stopped` (why it
   stopped early, if it did). `FolderEvent`s arrive from the worker threads, for a progress display.
   A `Cached` clip's `usage` is what it cost when it was first described, not part of this run's.
-- **Grouping.** `group_clips` puts clips, and stretches within them, in one `Group` when they look
-  like the same shot or their descriptions say much the same thing, with a label taken from the
+- **Grouping.** `group_clips(clips, &GroupOptions::default())` puts clips, and stretches within
+  them, in one `Group` when they look like the same shot, with a label taken from the
   descriptions. The pictures (8×8 brightness grids of the frames already sent, whatever the
-  exposure, turned sideways too) find duplicates, re-exports, a clip stored sideways and a
-  camera that did not move. The descriptions' words (shared words over all words, common words
-  dropped) find the same subject or activity filmed again from elsewhere or zoomed, as long as
-  the descriptions say it in similar words — and they also join the same place with something
-  else happening, or different things described with the same everyday words ("a woman in a
-  bright kitchen", "a woman in a bright office"). On a large folder from one shoot described in
-  similar words, those links can chain several groups into a few large ones: check groups before
-  relying on them. Both cost nothing, run offline and give the same groups every time. Both
-  thresholds are provisional: measured on near-duplicates, synthetic patterns and descriptions
-  written for the tests, not yet on real retakes and real descriptions.
+  exposure, turned sideways too) find duplicates, re-exports, a clip stored sideways and a camera
+  that did not move. It costs nothing, runs offline and gives the same groups every time; the
+  threshold is provisional, measured on near-duplicates and synthetic patterns, not yet on real
+  retakes. `GroupOptions { words: true }` is **experimental** and off by default: it also joins
+  clips whose descriptions share many words, which finds the same subject filmed again from
+  elsewhere, but can join unrelated clips described in similar everyday words ("a woman in a
+  bright kitchen", "a woman in a bright office"), miss the same subject reworded, and chain
+  groups together on a large folder. Its threshold was tuned on descriptions written for the
+  tests, not on real ones: check the groups before relying on them.
 
 To build your own loop instead, the parts are public: `CacheKey`, `Cache::get`/`put`,
 `cached_clip`, `describe_clip` (one clip, within a `Budget`), `Budget::reserve_or_wait` and

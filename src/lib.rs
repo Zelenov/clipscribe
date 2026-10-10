@@ -61,7 +61,7 @@ pub use folder::{
 };
 #[cfg(feature = "frames")]
 pub use folder::{describe_clip, describe_folder};
-pub use groups::{group_clips, ClipGroups, Group, Grouping, Stretch};
+pub use groups::{group_clips, ClipGroups, Group, GroupOptions, Grouping, Stretch};
 pub use moment::*;
 pub use provider::{AiError, AiProvider, AiUsage, Provider, RetryReason};
 pub use tags::*;

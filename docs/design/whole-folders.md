@@ -114,6 +114,14 @@ next `--resume` rather than left stale.
 | Deterministic, resumable | Yes (embeddings cacheable) | No: a rerun can regroup differently | Yes: fingerprints cached with each clip, grouping a pure function of them |
 | Labels | Need text from elsewhere | Natural | From the existing descriptions |
 
+### Owner decision (2026-10-10): pictures on, words experimental and off
+
+The pictures are the default under `--groups`. The words are an opt-in, `--groups=words` on the
+command line and `GroupOptions { words: true }` in the library, labelled experimental in `--help`,
+the rustdoc, the README and `version.md`: their threshold was only ever tuned on descriptions
+written for the tests. Calibrating it on real descriptions with a live key is a follow-up issue.
+Everything below describes the word signal as it works when asked for.
+
 ### Recommendation: fingerprints and the descriptions' words, together
 
 Chosen: two free signals, either of which joins two stretches.
@@ -245,7 +253,7 @@ lists of a dozen or two word ids for the words; picking each group's label is O(
 members. Measured in a release build on the machine this was developed on, with 5,000 synthetic
 stretches (12.5 M pairs): about 1.6 s for the pictures, 1.1 s for the words and 3 s for the labels
 when most stretches end up in one big group — about 6 s in all. Four times that at 10,000
-stretches (≈ 50 M pairs): 20–25 s, once, after every clip is described. Beyond that a
+stretches (≈ 50 M pairs), extrapolated from the 5,000 measurement and not measured: 20–25 s, once, after every clip is described. Beyond that a
 nearest-neighbour index would be the next step; not needed for "thousands of clips".
 
 ### Measured on the test clips (provisional)
@@ -575,3 +583,11 @@ many clips came from the cache.
 [clip]: https://arxiv.org/abs/2103.00020
 [zauner]: https://www.phash.org/docs/pubs/thesis_zauner.pdf
 [limits]: https://platform.claude.com/docs/en/api/rate-limits
+
+## Review notes not taken
+
+- Joining word links strongest first (Kruskal order) instead of input order: deterministic either
+  way, and only matters for the experimental word mode; left for when that mode is calibrated.
+- More English stop-word inflections ("capturing", "pans"): changing the list moves every measured
+  number above, and it is best-effort anyway; to be done together with the calibration on real
+  descriptions.

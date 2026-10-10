@@ -182,35 +182,44 @@ pub struct Stretch {
     pub group: usize,
 }
 
+/// What [`group_clips`] compares. The default is pictures only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GroupOptions {
+    /// Also join clips whose descriptions share many words. **Experimental**: the threshold was
+    /// tuned on descriptions written for the tests, not on real ones, and it both over-groups
+    /// (unrelated clips described in similar everyday words) and under-groups (the same subject
+    /// reworded). Off by default.
+    pub words: bool,
+}
+
 /// Group `clips`, and stretches within them: each clip is cut into stretches where the picture
-/// changes to something else, and two stretches share a group when either
+/// changes to something else, and two stretches share a group when their pictures are the same
+/// shot: the same average layout of light and dark, whatever the exposure and in any of the four
+/// 90° rotations — a duplicate, a re-export, a clip stored sideways, a camera that did not move
+/// (any two stretches, in the same clip or not). A stretch whose frames are all blank (black, a
+/// flat wall) is a group of its own.
 ///
-/// - their pictures are the same shot: the same average layout of light and dark, whatever the
-///   exposure and in any of the four 90° rotations — a duplicate, a re-export, a clip stored
-///   sideways, a camera that did not move (any two stretches, in the same clip or not); or
-/// - they are in different clips and their descriptions share at least a quarter of their words
-///   (the segments falling in the stretch, and the clip's summary when the stretch is the whole
-///   clip or no segment falls in it; common words and words about the framing dropped, each word
-///   cut to its first four letters) — the same subject or activity, even after the camera moved
-///   or zoomed.
-///
-/// Groups are what those links connect, with one rule: words never put two stretches of one clip
-/// in the same group, not even through other clips (stretches of one clip often carry the same
-/// summary, so every clip described like it would otherwise glue them together). Only their
-/// pictures can: a cut back to the same shot. A link by words that would bring two stretches of
-/// one clip together is skipped; the links by words are taken in input order, so which stretch
-/// of a clip joins a group like that is the first one. A stretch whose frames are all blank
-/// (black, a flat wall) is a group of its own.
+/// With [`GroupOptions::words`] (**experimental**, off by default) two stretches of different
+/// clips also share a group when their descriptions share at least a quarter of their words (the
+/// segments falling in the stretch, and the clip's summary when the stretch is the whole clip or
+/// no segment falls in it; common words and words about the framing dropped, each word cut to its
+/// first four letters) — the same subject or activity, even after the camera moved or zoomed.
+/// Words never put two stretches of one clip in the same group, not even through other clips
+/// (stretches of one clip often carry the same summary, so every clip described like it would
+/// otherwise glue them together): only their pictures can, a cut back to the same shot. A link by
+/// words that would bring two stretches of one clip together is skipped; the links by words are
+/// taken in input order, so which stretch of a clip joins a group like that is the first one.
 ///
 /// The word signal only sees what the descriptions say, and it has false positives: clips of the
 /// same place or person doing different things, and sometimes unrelated clips described in
 /// similar everyday words ("a woman in a bright kitchen", "a woman in a bright office"), share
 /// enough words to be joined; two of the same thing described in different words are not. Groups
 /// are connected sets, so on a large folder from one shoot these links can chain several groups
-/// into one: check groups before relying on them. A group is labelled with the description of its
-/// most typical stretch; no request is made. Deterministic: the same clips in the same order
-/// always give the same groups and ids.
-pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
+/// into one: check groups before relying on them.
+///
+/// A group is labelled with the description of its most typical stretch; no request is made.
+/// Deterministic: the same clips in the same order always give the same groups and ids.
+pub fn group_clips(clips: &[&DescribedClip], options: &GroupOptions) -> Grouping {
     let mut vocabulary: HashMap<String, usize> = HashMap::new();
     let mut pieces: Vec<Piece> = Vec::new();
     for (clip, described) in clips.iter().enumerate() {
@@ -222,7 +231,11 @@ pub fn group_clips(clips: &[&DescribedClip]) -> Grouping {
                 start_s,
                 end_s,
                 turns: signature.map(Turns::new),
-                words: word_ids(text, &mut vocabulary),
+                words: if options.words {
+                    word_ids(text, &mut vocabulary)
+                } else {
+                    Vec::new()
+                },
             });
         }
     }
@@ -823,7 +836,10 @@ mod tests {
             vec![(0.0, turned(&scene(1, 1, 20)))],
         );
         let other = clip("A gradient.", 4.0, vec![(0.0, ramp())]);
-        let grouping = group_clips(&[&a, &brighter, &sideways, &other]);
+        let grouping = group_clips(
+            &[&a, &brighter, &sideways, &other],
+            &GroupOptions::default(),
+        );
         let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
         assert_eq!(ids, vec![1, 1, 1, 2]);
         assert_eq!(grouping.groups.len(), 2);
@@ -838,7 +854,7 @@ mod tests {
     fn a_blank_clip_is_a_group_of_its_own() {
         let black = clip("Black.", 2.0, vec![(0.0, vec![0; 64])]);
         let also_black = clip("Also black.", 2.0, vec![(0.0, vec![1; 64])]);
-        let grouping = group_clips(&[&black, &also_black]);
+        let grouping = group_clips(&[&black, &also_black], &GroupOptions::default());
         assert_eq!(grouping.clips[0].group, 1);
         assert_eq!(
             grouping.clips[1].group, 2,
@@ -878,7 +894,7 @@ mod tests {
             )
         };
         let gradient = clip("A gradient.", 5.0, vec![(1.0, ramp()), (3.0, ramp())]);
-        let grouping = group_clips(&[&cut, &gradient]);
+        let grouping = group_clips(&[&cut, &gradient], &GroupOptions::default());
         let stretches = &grouping.clips[0].stretches;
         assert_eq!(stretches.len(), 2, "{stretches:?}");
         assert_eq!((stretches[0].start_s, stretches[0].end_s), (0.0, 6.0));
@@ -905,7 +921,12 @@ mod tests {
             4.0,
             vec![(0.0, scene(1, 1, 20)), (2.0, scene(2, 1, 20))],
         );
-        assert_eq!(group_clips(&[&moving]).clips[0].stretches.len(), 1);
+        assert_eq!(
+            group_clips(&[&moving], &GroupOptions::default()).clips[0]
+                .stretches
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -913,18 +934,22 @@ mod tests {
         let a = clip("Ramp.", 2.0, vec![(0.0, ramp())]);
         let b = clip("Lamp.", 2.0, vec![(0.0, scene(1, 1, 20))]);
         let c = clip("Ramp again.", 2.0, vec![(0.0, ramp())]);
-        let first = group_clips(&[&a, &b, &c]);
+        let first = group_clips(&[&a, &b, &c], &GroupOptions::default());
         assert_eq!(
             first.clips.iter().map(|c| c.group).collect::<Vec<_>>(),
             vec![1, 2, 1]
         );
-        assert_eq!(first, group_clips(&[&a, &b, &c]), "deterministic");
+        assert_eq!(
+            first,
+            group_clips(&[&a, &b, &c], &GroupOptions::default()),
+            "deterministic"
+        );
     }
 
     #[test]
     fn a_clip_without_frames_still_gets_a_group() {
         let empty = clip("Nothing.", 3.0, vec![]);
-        let grouping = group_clips(&[&empty]);
+        let grouping = group_clips(&[&empty], &GroupOptions::default());
         assert_eq!(grouping.clips[0].group, 1);
         assert_eq!(grouping.clips[0].stretches.len(), 1);
         assert_eq!(grouping.groups[0].label, "Nothing.");
@@ -1080,9 +1105,14 @@ mod tests {
             vec![(0.0, checkers)],
         );
         let blank = clip(text, 4.0, vec![(0.0, vec![9; 64])]);
-        let grouping = group_clips(&[&near, &far, &other, &blank]);
+        let clips = [&near, &far, &other, &blank];
+        let grouping = group_clips(&clips, &GroupOptions { words: true });
         let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
         assert_eq!(ids, [1, 1, 2, 3]);
+        // Words are off unless asked for: the same descriptions alone join nothing.
+        let pictures_only = group_clips(&clips, &GroupOptions::default());
+        let ids: Vec<usize> = pictures_only.clips.iter().map(|c| c.group).collect();
+        assert_eq!(ids, [1, 2, 3, 4]);
 
         // One clip, a cut from the block to the ramp, no segments: both stretches carry the
         // summary, and still are two groups.
@@ -1095,7 +1125,7 @@ mod tests {
                 (6.0, ramp()),
             ],
         );
-        let grouping = group_clips(&[&cut]);
+        let grouping = group_clips(&[&cut], &GroupOptions::default());
         let stretches = &grouping.clips[0].stretches;
         assert_eq!(stretches.len(), 2, "{stretches:?}");
         assert_ne!(stretches[0].group, stretches[1].group);
@@ -1120,7 +1150,7 @@ mod tests {
                 (6.0, ramp()),
             ],
         );
-        let alone = group_clips(&[&cut]);
+        let alone = group_clips(&[&cut], &GroupOptions::default());
         assert_eq!(
             alone.clips[0]
                 .stretches
@@ -1131,7 +1161,7 @@ mod tests {
         );
         // Another picture, described like the first clip's summary.
         let other = clip(text, 4.0, vec![(0.0, checkers.clone())]);
-        let grouping = group_clips(&[&cut, &other]);
+        let grouping = group_clips(&[&cut, &other], &GroupOptions { words: true });
         let stretches: Vec<usize> = grouping.clips[0]
             .stretches
             .iter()
@@ -1165,7 +1195,7 @@ mod tests {
             },
             ..cut.clone()
         };
-        let grouping = group_clips(&[&other, &segmented]);
+        let grouping = group_clips(&[&other, &segmented], &GroupOptions::default());
         let stretches: Vec<usize> = grouping.clips[1]
             .stretches
             .iter()
@@ -1184,7 +1214,7 @@ mod tests {
                 (10.0, scene(1, 1, 22)),
             ],
         );
-        let grouping = group_clips(&[&back, &other]);
+        let grouping = group_clips(&[&back, &other], &GroupOptions::default());
         let stretches: Vec<usize> = grouping.clips[0]
             .stretches
             .iter()

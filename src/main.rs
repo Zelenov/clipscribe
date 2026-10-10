@@ -14,8 +14,8 @@ use clipscribe::{
     cache_path, describe_folder, describe_moment, estimate_tags_usage, estimate_usage, find_videos,
     format_time, frames, group_clips, parse_vocabulary, serve_after_stop, srt, AiUsage, Budget,
     Cache, ClipGroups, ClipOutcome, ClipRecord, DescribedMoment, Error, FolderEvent, FrameSampling,
-    Grouping, Model, MomentsMode, Options, Provider, RunOptions, Stop, SummaryLanguage, Tag,
-    DEFAULT_JOBS, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
+    GroupOptions, Grouping, Model, MomentsMode, Options, Provider, RunOptions, Stop,
+    SummaryLanguage, Tag, DEFAULT_JOBS, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
 };
 use serde_json::json;
 
@@ -105,12 +105,20 @@ struct Cli {
     cache_dir: Option<PathBuf>,
 
     /// Group similar footage: videos, and stretches within them, that look like the same shot
-    /// (duplicates, re-exports, a clip stored sideways) or whose descriptions share many words
-    /// (the same subject, even after the camera moved). Word matches are rough: unrelated videos
-    /// described in similar everyday words can be joined, and groups can chain together on a
-    /// large folder — check them. Each group gets a short label; nothing extra is sent.
-    #[arg(long)]
-    groups: bool,
+    /// (duplicates, re-exports, a clip stored sideways, a camera that did not move). Each group
+    /// gets a short label; nothing extra is sent. `--groups=words` also joins videos whose
+    /// descriptions share many words (the same subject, even after the camera moved): EXPERIMENTAL
+    /// — its threshold was not tuned on real descriptions, it can join unrelated videos described
+    /// in similar everyday words and miss the same subject reworded; check the groups.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "pictures",
+        value_name = "BY"
+    )]
+    groups: Option<GroupsArg>,
 
     /// How many videos are in work at once.
     #[arg(long, default_value_t = DEFAULT_JOBS as u16, value_parser = clap::value_parser!(u16).range(1..))]
@@ -272,6 +280,15 @@ impl std::fmt::Display for ModelArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.cli_value())
     }
+}
+
+/// What `--groups` compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum GroupsArg {
+    /// The pictures of the frames already sent.
+    Pictures,
+    /// The pictures, and the words of the descriptions (experimental).
+    Words,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -530,9 +547,14 @@ fn main() -> ExitCode {
         .enumerate()
         .filter_map(|(i, outcome)| outcome.record().map(|record| (i, record)))
         .collect();
-    let grouping = cli.groups.then(|| {
+    let grouping = cli.groups.map(|by| {
         let clips: Vec<_> = described.iter().map(|(_, record)| &record.clip).collect();
-        group_clips(&clips)
+        group_clips(
+            &clips,
+            &GroupOptions {
+                words: by == GroupsArg::Words,
+            },
+        )
     });
     if cli.json {
         let results: Vec<serde_json::Value> = described
@@ -1409,7 +1431,7 @@ mod tests {
     #[test]
     fn clip_to_json_with_groups_adds_the_group_its_label_stretches_and_moment_groups() {
         let record = sample_without_tags();
-        let grouping = group_clips(&[&record.clip]);
+        let grouping = group_clips(&[&record.clip], &GroupOptions::default());
         let json = clip_to_json(
             Path::new("hike.mp4"),
             &record,
@@ -1451,7 +1473,10 @@ mod tests {
                 .map(|i| if (i / 8 + i % 8) % 2 == 0 { 200 } else { 20 })
                 .collect();
         }
-        let grouping = group_clips(&[&retake.clip, &hike.clip, &again.clip, &elsewhere.clip]);
+        let grouping = group_clips(
+            &[&retake.clip, &hike.clip, &again.clip, &elsewhere.clip],
+            &GroupOptions { words: true },
+        );
         let videos = [
             Path::new("trail-1.mp4"),
             Path::new("black.mp4"),
@@ -1549,7 +1574,7 @@ mod tests {
         Cli::command().debug_assert();
         let parse = |args: &[&str]| Cli::try_parse_from([&["clipscribe"], args].concat());
         let cli = parse(&["footage/", "--resume", "--groups", "--json"]).expect("the issue's");
-        assert!(cli.resume && cli.groups && cli.json);
+        assert!(cli.resume && cli.groups == Some(GroupsArg::Pictures) && cli.json);
         assert_eq!(usize::from(cli.jobs), DEFAULT_JOBS);
         assert!(
             parse(&["a.mp4", "--resume", "--force"]).is_err(),
@@ -1562,6 +1587,14 @@ mod tests {
         assert!(parse(&["a.mp4", "--force", "--cache-dir", "c"]).is_ok());
         assert!(parse(&["a.mp4", "--jobs", "0"]).is_err());
         assert!(parse(&["a.mp4", "--at", "5", "--groups"]).is_err());
+        // `--groups` takes a value only with `=`, so it never swallows the path after it.
+        let cli = parse(&["--groups", "footage/"]).expect("a bare --groups");
+        assert_eq!(cli.groups, Some(GroupsArg::Pictures));
+        assert_eq!(cli.inputs, [PathBuf::from("footage/")]);
+        let cli = parse(&["footage/", "--groups=words"]).expect("words");
+        assert_eq!(cli.groups, Some(GroupsArg::Words));
+        assert_eq!(parse(&["footage/"]).expect("none").groups, None);
+        assert!(parse(&["footage/", "--groups=other"]).is_err());
         assert!(parse(&["a.mp4", "--estimate", "--max-cost", "1"]).is_err());
     }
 

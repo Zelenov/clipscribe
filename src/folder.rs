@@ -1243,7 +1243,7 @@ mod tests {
         use crate::cache::{cache_path, Cache};
         use crate::describe::{FrameSampling, MomentsMode, SummaryLanguage};
         use crate::provider::{AiProvider, RateGate};
-        use crate::{group_clips, Error, Model, Options};
+        use crate::{group_clips, Error, GroupOptions, Model, Options};
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
         use std::path::Path;
@@ -1979,7 +1979,7 @@ mod tests {
                     described_as(&c.record().expect("described").clip, description_of(name))
                 })
                 .collect();
-            let grouping = group_clips(&clips.iter().collect::<Vec<_>>());
+            let grouping = group_clips(&clips.iter().collect::<Vec<_>>(), &GroupOptions::default());
             for (video, groups) in videos.iter().zip(&grouping.clips) {
                 eprintln!(
                     "{}: group {} {:?}",
@@ -2125,7 +2125,10 @@ mod tests {
             // the pinwheel and the rings are both "black and white" around "the centre", and the
             // white ball on black shares "black" and "white" with both: the word signal's false
             // positives, printed above and in the design notes.)
-            let grouping = group_clips(&clips.iter().collect::<Vec<_>>());
+            let grouping = group_clips(
+                &clips.iter().collect::<Vec<_>>(),
+                &GroupOptions { words: true },
+            );
             let ids: Vec<usize> = grouping.clips.iter().map(|c| c.group).collect();
             eprintln!("groups: {ids:?}");
             assert!(ids[..7].iter().all(|&id| id == 1), "{ids:?}");
