@@ -106,6 +106,10 @@ impl std::fmt::Debug for Options {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Stage {
+    /// Only [`describe_moment_notifying`]: the frames are read and the video file is closed, so
+    /// it can be moved or deleted while the request is in flight. Comes before
+    /// [`Stage::Asking`]; not reported when reading the video failed or `cancel` was set.
+    Released,
     /// Reading frame `done + 1` of `total`.
     Frame { done: usize, total: usize },
     /// The frames are sent to `provider`; waiting for the answer.
@@ -350,7 +354,8 @@ pub struct DescribedMoment {
 /// ([`frames::Clip::sample_moment`]) and any subtitle lines that overlap that same window, and
 /// asks for a short name and a one-to-two sentence description in one small, fast request.
 /// [`MOMENT_WINDOW_S`] is a reasonable default for `window_s`. `cancel` is checked between
-/// frames and while waiting for the answer.
+/// frames and while waiting for the answer. See [`describe_moment_notifying`] to learn when the
+/// video file is released.
 #[cfg(feature = "frames")]
 pub fn describe_moment(
     video: &std::path::Path,
@@ -360,6 +365,48 @@ pub fn describe_moment(
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<DescribedMoment, Error> {
+    describe_moment_notifying(video, at_s, window_s, subtitles, options, cancel, |_| {})
+}
+
+/// [`describe_moment`], calling `on_stage` as it goes: [`Stage::Released`] once the frames are
+/// read and `video` is closed (before the request, which can take up to two minutes, so the file
+/// can be moved or deleted meanwhile), then [`Stage::Asking`], and [`Stage::Retrying`] before
+/// each wait between attempts. `on_stage` runs on the calling thread.
+#[cfg(feature = "frames")]
+pub fn describe_moment_notifying(
+    video: &std::path::Path,
+    at_s: f64,
+    window_s: f64,
+    subtitles: &[Cue],
+    options: &Options,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_stage: impl FnMut(Stage),
+) -> Result<DescribedMoment, Error> {
+    describe_moment_with(
+        video,
+        at_s,
+        window_s,
+        subtitles,
+        options,
+        cancel,
+        on_stage,
+        || provider_for(options, None),
+    )
+}
+
+/// [`describe_moment_notifying`] with the provider made by `provider`, which tests replace.
+#[cfg(feature = "frames")]
+#[allow(clippy::too_many_arguments)]
+fn describe_moment_with<'p>(
+    video: &std::path::Path,
+    at_s: f64,
+    window_s: f64,
+    subtitles: &[Cue],
+    options: &Options,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_stage: impl FnMut(Stage),
+    provider: impl FnOnce() -> Result<Box<dyn provider::AiProvider + 'p>, Error>,
+) -> Result<DescribedMoment, Error> {
     let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
     let frames = match clip.sample_moment(at_s, window_s, cancel) {
         Ok(Some(frames)) if !frames.is_empty() => frames,
@@ -368,6 +415,7 @@ pub fn describe_moment(
         Err(e) => return Err(Error::Unreadable(e)),
     };
     drop(clip);
+    on_stage(Stage::Released);
     debug_frames::dump_if_on(
         &format!("{}-at-{at_s:.2}s", debug_frames::name_of(video)),
         &frames,
@@ -381,11 +429,18 @@ pub fn describe_moment(
         window_s,
         options.language,
     );
-    let provider = provider_for(options, None)?;
-    let response = provider.complete(&request, cancel).map_err(|e| match e {
-        AiError::Cancelled => Error::Cancelled,
-        e => Error::Ai(e),
-    })?;
+    let provider = provider()?;
+    on_stage(Stage::Asking {
+        provider: options.model.provider,
+    });
+    let response = provider
+        .complete_notifying(&request, cancel, &mut |after, reason| {
+            on_stage(Stage::Retrying { after, reason })
+        })
+        .map_err(|e| match e {
+            AiError::Cancelled => Error::Cancelled,
+            e => Error::Ai(e),
+        })?;
     let moment = parse_moment_answer(&response).map_err(|reason| Error::BadAnswer {
         reason,
         usage: response.usage,
@@ -447,6 +502,130 @@ mod tests {
             |_| {},
         );
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether this process holds `path` open (Linux: its open file descriptors).
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    fn is_open(path: &std::path::Path) -> bool {
+        let path = path.canonicalize().expect("path");
+        std::fs::read_dir("/proc/self/fd")
+            .expect("fds")
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path))
+    }
+
+    /// Answers like the model would, noting what the notifications said when the request came.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    struct Stub<'a> {
+        seen: &'a std::cell::RefCell<Vec<String>>,
+        clip_open: &'a std::cell::Cell<Option<bool>>,
+        clip: std::path::PathBuf,
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    impl provider::AiProvider for Stub<'_> {
+        fn complete(
+            &self,
+            _: &provider::AiRequest,
+            _: &AtomicBool,
+        ) -> Result<provider::AiResponse, AiError> {
+            self.seen.borrow_mut().push("request".to_string());
+            self.clip_open.set(Some(is_open(&self.clip)));
+            Ok(provider::AiResponse {
+                json: serde_json::json!({"name": "Goat", "description": "A goat walks."}),
+                stop_reason: "end_turn".to_string(),
+                usage: AiUsage::default(),
+            })
+        }
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    fn moment_options() -> Options {
+        Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+        }
+    }
+
+    /// A private copy of a test clip, so no other test holds the same file open.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    fn private_clip(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("clipscribe-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let copy = dir.join("clip.mov");
+        std::fs::copy("tests/clips/file_example_MOV_480_700kB.mov", &copy).expect("copy");
+        (dir, copy)
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn describe_moment_reports_the_clip_released_before_the_request() {
+        let (dir, video) = private_clip("moment-released");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let clip_open = std::cell::Cell::new(None);
+        let stub = Stub {
+            seen: &seen,
+            clip_open: &clip_open,
+            clip: video.clone(),
+        };
+        let result = describe_moment_with(
+            &video,
+            1.0,
+            MOMENT_WINDOW_S,
+            &[],
+            &moment_options(),
+            &AtomicBool::new(false),
+            |stage| {
+                let name = match stage {
+                    Stage::Released => {
+                        assert!(!is_open(&video), "released while the file is still open");
+                        "released"
+                    }
+                    Stage::Asking { .. } => "asking",
+                    _ => "other",
+                };
+                seen.borrow_mut().push(name.to_string());
+            },
+            || Ok(Box::new(stub)),
+        );
+        assert_eq!(result.expect("described").moment.name, "Goat");
+        assert_eq!(*seen.borrow(), ["released", "asking", "request"]);
+        assert_eq!(clip_open.get(), Some(false), "clip open during the request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clip that cannot be read never reaches the request, so it is never "released".
+    #[cfg(feature = "frames")]
+    #[test]
+    fn describe_moment_does_not_report_a_release_for_an_unreadable_clip() {
+        let dir =
+            std::env::temp_dir().join(format!("clipscribe-moment-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let fake = dir.join("fake.mp4");
+        std::fs::write(&fake, b"not a movie").expect("write");
+        let options = Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+        };
+        let mut stages = Vec::new();
+        let result = describe_moment_notifying(
+            &fake,
+            1.0,
+            MOMENT_WINDOW_S,
+            &[],
+            &options,
+            &AtomicBool::new(false),
+            |stage| stages.push(stage),
+        );
+        assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        assert!(stages.is_empty(), "{stages:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

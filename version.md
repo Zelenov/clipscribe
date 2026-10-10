@@ -1,3 +1,10 @@
+# 0.12.0
+## Added
+- Library: `describe_moment_notifying(…, on_stage)` is `describe_moment` with a progress callback,
+  like `describe`'s. The new `Stage::Released` comes as soon as the frames are read and the video
+  file is closed, before the request (which can take up to two minutes): the file can be moved or
+  deleted meanwhile. `Stage::Asking` and `Stage::Retrying` follow. `describe_moment` is unchanged.
+
 # 0.11.0
 ## Added
 - Whole folders: `clipscribe footage/ --resume --groups --json`. `--resume` skips videos already
