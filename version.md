@@ -1,3 +1,7 @@
+# 0.10.0
+## Added
+- Library: `clipscribe::ass` reads `.ass` / `.ssa` subtitles as plain text cues: `ass::parse` (the `[Events]` section by its `Format:` line, `Dialogue:` lines only; override tags and drawings dropped, `\N` and `\n` as line breaks), `ass::existing_path(video)` (`clip.ass`, else `clip.ssa`) and `ass::load_for(video)`. Nothing else changes: `srt` and the command line still read `.srt` only, and no caller has to change.
+
 # 0.9.0
 ## Added
 - Command line: a batch shows a plan line (`24 videos: 41:12 of footage, ≈ $0.38 with …`), one bar for the whole run weighted by footage with cost so far and an ETA, the stage of the video in work (frames, asking the provider, retrying in 8 s), one result line per video and a summary.
