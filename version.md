@@ -1,4 +1,4 @@
-# NEXT
+# 0.11.0
 ## Added
 - Whole folders: `clipscribe footage/ --resume --groups --json`. `--resume` skips videos already
   described (a `.clipscribe-cache.jsonl` next to them, or in `--cache-dir`) and saves each new one
