@@ -3,7 +3,6 @@
 //! summary and key moments, or only what it would cost.
 
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -15,10 +14,13 @@ use clipscribe::{
     cache_path, describe_folder, describe_moment, estimate_tags_usage, estimate_usage, find_videos,
     format_time, frames, group_clips, parse_vocabulary, serve_after_stop, srt, AiUsage, Budget,
     Cache, ClipGroups, ClipOutcome, ClipRecord, DescribedMoment, Error, FolderEvent, FrameSampling,
-    Grouping, Model, MomentsMode, Options, Provider, RunOptions, Stage, Stop, SummaryLanguage, Tag,
+    Grouping, Model, MomentsMode, Options, Provider, RunOptions, Stop, SummaryLanguage, Tag,
     DEFAULT_JOBS, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
 };
 use serde_json::json;
+
+mod progress;
+use progress::{Batch, Outcome, Plan, Totals};
 
 /// Describe what happens in video clips, and when, with Claude.
 ///
@@ -77,6 +79,13 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// No progress bars, plan or summary: only one line per video on stderr, plus warnings and
+    /// why a run stopped (and, as ever, the descriptions on stdout). A stderr that is not a
+    /// terminal (piped, CI) gets the same lines; `--quiet` also drops the token line, which a
+    /// piped stderr keeps.
+    #[arg(long, short = 'q')]
+    quiet: bool,
+
     /// Only print what describing the videos would cost; nothing is sent.
     #[arg(long, conflicts_with_all = FOLDER_RUN_ARGS)]
     estimate: bool,
@@ -113,6 +122,11 @@ struct Cli {
     /// total can stop several videos early.
     #[arg(long, value_parser = parse_cost)]
     max_cost: Option<f64>,
+    /// Debugging: write the frames sent to the model into this folder (one subfolder per video),
+    /// as the same JPEG bytes, named by time, with a frames.json. With --estimate the frames are
+    /// read and written but nothing is sent.
+    #[arg(long, value_name = "DIR")]
+    dump_frames: Option<PathBuf>,
 
     /// Name and describe the moment at this time (m:ss.f, h:mm:ss.f or plain seconds) in one
     /// video, instead of describing the whole clip. Fast and cheap: one small request.
@@ -353,7 +367,20 @@ fn main() -> ExitCode {
         None => None,
     };
     if cli.estimate {
-        return estimate(&videos, model, cli.no_subtitles, vocabulary.as_deref());
+        let dump = cli
+            .dump_frames
+            .as_deref()
+            .map(|dir| (dir, cli.frames.sampling()));
+        return estimate(
+            &videos,
+            model,
+            cli.no_subtitles,
+            vocabulary.as_deref(),
+            dump,
+        );
+    }
+    if let Some(dir) = &cli.dump_frames {
+        clipscribe::set_debug_frames_dir(Some(dir.clone()));
     }
     let api_key = cli
         .api_key
@@ -402,6 +429,9 @@ fn main() -> ExitCode {
         };
         batches.push((cache, range));
     }
+    let run_plan = plan_run(&videos, model, cli.no_subtitles, vocabulary.as_deref());
+    let batch = Batch::new(model, videos.len(), run_plan.plan.footage_s, cli.quiet);
+    batch.plan(&run_plan.plan);
     let run = RunOptions {
         jobs: usize::from(cli.jobs),
         force: cli.force,
@@ -409,7 +439,13 @@ fn main() -> ExitCode {
         vocabulary,
     };
     let budget = Budget::new(cli.max_cost);
-    let status = Mutex::new(Status::new(videos.len(), !cli.json));
+    let status = Mutex::new(Status::new(
+        batch,
+        display_names(&videos),
+        run_plan.clips.iter().map(|c| c.duration_s).collect(),
+        model,
+        !cli.json,
+    ));
 
     let mut outcomes: Vec<ClipOutcome> = Vec::with_capacity(videos.len());
     let mut total = AiUsage::default();
@@ -449,7 +485,45 @@ fn main() -> ExitCode {
         // Ctrl+C overrides whatever stopped the run first, as in `describe_folder`.
         stopped = Some(Stop::Cancelled);
     }
-    lock(&status).clear();
+    let mut status = status.into_inner().unwrap_or_else(|e| e.into_inner());
+
+    let not_done = outcomes.iter().filter(|o| o.record().is_none()).count();
+    match &stopped {
+        Some(Stop::OverBudget) => {
+            let described_now = outcomes
+                .iter()
+                .filter(|o| matches!(o, ClipOutcome::Described(_)))
+                .count();
+            status.batch.note(&budget_stop_message(
+                budget.max_usd().unwrap_or_default(),
+                budget.spent_usd(),
+                budget.refused_usd(),
+                not_done,
+                videos.len(),
+                described_now,
+                caching,
+            ));
+            status.totals.stopped = true;
+        }
+        Some(stop @ Stop::Job(_)) => {
+            status.batch.note(&stop.to_string());
+            status.totals.stopped = true;
+        }
+        // Each cancelled video is said as it stops.
+        Some(Stop::Cancelled) => status.totals.cancelled = true,
+        None => {}
+    }
+    let Status {
+        mut batch,
+        mut totals,
+        ..
+    } = status;
+    totals.cost_usd = model.cost_usd(total);
+    totals.not_tried = outcomes
+        .iter()
+        .filter(|o| matches!(o, ClipOutcome::NotStarted | ClipOutcome::OverBudget))
+        .count();
+    batch.finish(totals);
 
     let described: Vec<(usize, &ClipRecord)> = outcomes
         .iter()
@@ -486,31 +560,7 @@ fn main() -> ExitCode {
         print_groups(&videos, grouping);
     }
 
-    let not_done = outcomes.iter().filter(|o| o.record().is_none()).count();
-    match &stopped {
-        Some(Stop::OverBudget) => {
-            let described_now = outcomes
-                .iter()
-                .filter(|o| matches!(o, ClipOutcome::Described(_)))
-                .count();
-            eprintln!(
-                "{}",
-                budget_stop_message(
-                    budget.max_usd().unwrap_or_default(),
-                    budget.spent_usd(),
-                    budget.refused_usd(),
-                    not_done,
-                    videos.len(),
-                    described_now,
-                    caching,
-                )
-            );
-        }
-        Some(stop @ Stop::Job(_)) => eprintln!("{stop}"),
-        // Each cancelled video is said as it stops.
-        Some(Stop::Cancelled) | None => {}
-    }
-    if total != AiUsage::default() {
+    if total != AiUsage::default() && !cli.quiet {
         print_usage(total, model);
     }
     let cached = outcomes
@@ -721,6 +771,117 @@ fn load_vocabulary(path: &Path) -> Result<Vec<Tag>, String> {
     Ok(vocabulary)
 }
 
+/// The names result lines use: the file name, or the path as given when two inputs share a file
+/// name (`a/clip.mp4` and `b/clip.mp4`), so their lines can be told apart.
+fn display_names(videos: &[PathBuf]) -> Vec<String> {
+    let file_name = |video: &PathBuf| {
+        video.file_name().map_or_else(
+            || video.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    };
+    videos
+        .iter()
+        .map(|video| {
+            let name = file_name(video);
+            if videos
+                .iter()
+                .filter(|other| file_name(other) == name)
+                .count()
+                > 1
+            {
+                video.display().to_string()
+            } else {
+                name
+            }
+        })
+        .collect()
+}
+
+/// What a clip is expected to cost, or why it will not be sent.
+enum Estimated {
+    Unreadable,
+    TooLong(f64),
+    Ready { duration_s: f64, usage: AiUsage },
+}
+
+/// Read the length of `video` and price describing it.
+fn estimate_clip(
+    video: &Path,
+    model: Model,
+    no_subtitles: bool,
+    vocabulary: Option<&[Tag]>,
+) -> Estimated {
+    let Some(duration_s) = frames::clip_duration_s(video) else {
+        return Estimated::Unreadable;
+    };
+    if duration_s > MAX_DURATION_S {
+        return Estimated::TooLong(duration_s);
+    }
+    let subtitle_bytes = if no_subtitles {
+        0
+    } else {
+        std::fs::metadata(srt::subtitle_path(video)).map_or(0, |m| m.len() as usize)
+    };
+    let usage = match vocabulary {
+        Some(vocabulary) => {
+            estimate_tags_usage(model, duration_s, subtitle_bytes, vocabulary, None)
+        }
+        None => estimate_usage(model, duration_s, subtitle_bytes),
+    };
+    Estimated::Ready { duration_s, usage }
+}
+
+/// One clip of a run: its length (0 when it cannot be read).
+struct Clip {
+    duration_s: f64,
+}
+
+/// The line before a run and what the loop needs from the same look at each clip.
+struct RunPlan {
+    plan: Plan,
+    clips: Vec<Clip>,
+}
+
+/// Look at every clip before the run: what to tell the user, and what the loop needs.
+fn plan_run(
+    videos: &[PathBuf],
+    model: Model,
+    no_subtitles: bool,
+    vocabulary: Option<&[Tag]>,
+) -> RunPlan {
+    let mut plan = Plan {
+        videos: videos.len(),
+        footage_s: 0.0,
+        cost_usd: 0.0,
+        model: model.label,
+        over_limit: 0,
+        limit_s: MAX_DURATION_S,
+        unreadable: 0,
+    };
+    let mut clips = Vec::new();
+    for video in videos {
+        clips.push(
+            match estimate_clip(video, model, no_subtitles, vocabulary) {
+                Estimated::Unreadable => {
+                    plan.unreadable += 1;
+                    Clip { duration_s: 0.0 }
+                }
+                Estimated::TooLong(duration_s) => {
+                    plan.over_limit += 1;
+                    Clip { duration_s }
+                }
+                Estimated::Ready { duration_s, usage } => {
+                    plan.footage_s += duration_s;
+                    plan.cost_usd += model.cost_usd(usage);
+                    Clip { duration_s }
+                }
+            },
+        );
+    }
+    RunPlan { plan, clips }
+}
+
 /// Print what describing `videos` with `model` would cost, reading only their lengths.
 /// `vocabulary`, when given, adds the cost of suggesting tags from it.
 fn estimate(
@@ -728,34 +889,27 @@ fn estimate(
     model: Model,
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
+    dump: Option<(&Path, FrameSampling)>,
 ) -> ExitCode {
     let mut total = AiUsage::default();
     let mut unreadable = 0;
     for video in videos {
-        let Some(duration_s) = frames::clip_duration_s(video) else {
-            println!("{}: could not be read", video.display());
-            unreadable += 1;
-            continue;
-        };
-        if duration_s > MAX_DURATION_S {
-            println!(
-                "{}: {}, over the {} limit",
-                video.display(),
-                format_time(duration_s),
-                format_time(MAX_DURATION_S)
-            );
-            continue;
-        }
-        let subtitle_bytes = if no_subtitles {
-            0
-        } else {
-            std::fs::metadata(srt::subtitle_path(video)).map_or(0, |m| m.len() as usize)
-        };
-        let usage = match vocabulary {
-            Some(vocabulary) => {
-                estimate_tags_usage(model, duration_s, subtitle_bytes, vocabulary, None)
+        let (duration_s, usage) = match estimate_clip(video, model, no_subtitles, vocabulary) {
+            Estimated::Unreadable => {
+                println!("{}: could not be read", video.display());
+                unreadable += 1;
+                continue;
             }
-            None => estimate_usage(model, duration_s, subtitle_bytes),
+            Estimated::TooLong(duration_s) => {
+                println!(
+                    "{}: {}, over the {} limit",
+                    video.display(),
+                    format_time(duration_s),
+                    format_time(MAX_DURATION_S)
+                );
+                continue;
+            }
+            Estimated::Ready { duration_s, usage } => (duration_s, usage),
         };
         total += usage;
         println!(
@@ -764,6 +918,12 @@ fn estimate(
             format_time(duration_s),
             model.cost_usd(usage)
         );
+        if let Some((dir, sampling)) = dump {
+            match clipscribe::dump_clip_frames(video, dir, sampling, &CANCEL) {
+                Ok(count) => println!("  {count} frames written to {}", dir.display()),
+                Err(e) => eprintln!("error: {}: frames not written: {e}", video.display()),
+            }
+        }
     }
     println!(
         "total: about ${:.4} with {} ({} in / {} out tokens)",
@@ -776,6 +936,24 @@ fn estimate(
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// The suggested In/Out, when the description has one.
+fn print_main(description: &clipscribe::Description) {
+    if let Some(main) = description.main {
+        println!(
+            "  Main: {}\u{2013}{}",
+            format_time(main.start_s),
+            format_time(main.end_s)
+        );
+    }
+}
+
+fn main_json(description: &clipscribe::Description) -> serde_json::Value {
+    match description.main {
+        Some(main) => json!({"start_s": main.start_s, "end_s": main.end_s}),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -793,6 +971,7 @@ fn print_clip(video: &Path, record: &ClipRecord, cached: bool) {
         if cached { " · cached" } else { "" }
     );
     println!("  {}", clip.description.summary);
+    print_main(&clip.description);
     for moment in &clip.description.segments {
         println!(
             "  {}–{}  {}",
@@ -868,6 +1047,7 @@ fn clip_to_json(
         "duration_s": clip.duration_s,
         "frames": clip.frames.len(),
         "summary": clip.description.summary,
+        "main": main_json(&clip.description),
         "moments": clip.description.segments.iter().enumerate().map(|(n, m)| {
             let mut moment = json!({
                 "start_s": m.start_s,
@@ -921,131 +1101,136 @@ fn clip_to_json(
     value
 }
 
-/// What a run shows while it goes: each clip's text (unless the output is JSON) and errors, in
-/// input order as soon as every earlier clip is done, and one status line on stderr, when it is a
-/// terminal, with how many clips are done and in work.
+/// What a run shows while it goes: the display of [`Batch`] (a line per video in work, a result
+/// line per video as it ends, one bar for the run) and each clip's text (unless the output is
+/// JSON) in input order as soon as every earlier clip is done.
 struct Status {
-    total: usize,
+    batch: Batch,
+    names: Vec<String>,
+    /// Each video's length in seconds, 0 when it could not be read.
+    durations: Vec<f64>,
+    model: Model,
     print_text: bool,
-    terminal: bool,
+    totals: Totals,
     /// The next clip (by input index) to print.
     next: usize,
     /// Finished clips waiting for an earlier one.
     finished: BTreeMap<usize, (PathBuf, ClipOutcome)>,
-    /// Clips in work, and where each one is.
-    in_work: BTreeMap<usize, (String, Option<Stage>)>,
-    shown: bool,
 }
 
 impl Status {
-    fn new(total: usize, print_text: bool) -> Self {
+    fn new(
+        batch: Batch,
+        names: Vec<String>,
+        durations: Vec<f64>,
+        model: Model,
+        print_text: bool,
+    ) -> Self {
         Self {
-            total,
+            batch,
+            names,
+            durations,
+            model,
             print_text,
-            terminal: std::io::stderr().is_terminal(),
+            totals: Totals::default(),
             next: 0,
             finished: BTreeMap::new(),
-            in_work: BTreeMap::new(),
-            shown: false,
         }
     }
 
     /// `event` of the run over the videos from `offset` on.
     fn on_event(&mut self, offset: usize, event: FolderEvent<'_>) {
         match event {
-            FolderEvent::Started { index, video } => {
-                self.in_work
-                    .insert(offset + index, (file_name(video), None));
+            FolderEvent::Started { index, .. } => {
+                let id = offset + index;
+                self.batch.begin(id, &self.names[id]);
             }
-            FolderEvent::Stage { index, stage, .. } => {
-                if let Some((_, at)) = self.in_work.get_mut(&(offset + index)) {
-                    *at = Some(stage);
-                }
-            }
+            FolderEvent::Stage { index, stage, .. } => self.batch.stage(offset + index, stage),
             FolderEvent::Warning { video, message, .. } => {
-                self.clear();
-                eprintln!("warning: {}: {message}", video.display());
+                self.batch
+                    .note(&format!("warning: {}: {message}", video.display()));
             }
             FolderEvent::Finished {
                 index,
                 video,
                 outcome,
             } => {
-                self.in_work.remove(&(offset + index));
+                let id = offset + index;
+                self.end_video(id, outcome);
                 self.finished
-                    .insert(offset + index, (video.to_path_buf(), outcome.clone()));
+                    .insert(id, (video.to_path_buf(), outcome.clone()));
                 self.print_ready();
             }
         }
-        self.show();
     }
 
-    /// Print every finished clip no earlier clip is still waiting for.
+    /// Show how video `id` ended and count it for the summary.
+    fn end_video(&mut self, id: usize, outcome: &ClipOutcome) {
+        let (name, duration_s) = (self.names[id].clone(), self.durations[id]);
+        let model = self.model;
+        let line = match outcome {
+            ClipOutcome::Described(record) | ClipOutcome::Cached(record) => {
+                // A clip from the cache cost nothing in this run.
+                let cost = if matches!(outcome, ClipOutcome::Cached(_)) {
+                    0.0
+                } else {
+                    model.cost_usd(record.clip.usage)
+                };
+                self.totals.described += 1;
+                self.totals.moments += record.clip.description.segments.len();
+                self.batch.finish_video(
+                    id,
+                    &name,
+                    duration_s,
+                    &Outcome::of(&record.clip.description, cost),
+                )
+            }
+            ClipOutcome::Failed(Error::Cancelled) => {
+                // The video in work was started: it is not "not tried".
+                self.totals.cancelled = true;
+                self.batch.abandon(id);
+                return;
+            }
+            ClipOutcome::Failed(Error::TooLong(_)) => {
+                self.totals.skipped += 1;
+                let why = format!("over the {} limit", format_time(MAX_DURATION_S));
+                self.batch
+                    .finish_video(id, &name, 0.0, &Outcome::Skipped(why))
+            }
+            ClipOutcome::Failed(e) => {
+                if let Error::BadAnswer { usage, .. } = e {
+                    self.batch.add_cost(model.cost_usd(*usage));
+                }
+                // A rejected key or an empty balance, which would fail every video left the
+                // same way, is said once at the end (`Stop::Job`).
+                self.batch
+                    .finish_video(id, &name, duration_s, &Outcome::Failed(e.to_string()))
+            }
+            ClipOutcome::OverBudget => self.batch.finish_video(
+                id,
+                &name,
+                0.0,
+                &Outcome::Skipped("not sent: over --max-cost".to_string()),
+            ),
+            ClipOutcome::NotStarted => return,
+        };
+        if matches!(outcome, ClipOutcome::Failed(_) | ClipOutcome::OverBudget) {
+            self.totals.problems.push(line);
+        }
+    }
+
+    /// Print the text of every finished clip no earlier clip is still waiting for.
     fn print_ready(&mut self) {
         while let Some((video, outcome)) = self.finished.remove(&self.next) {
-            self.clear();
-            match &outcome {
-                ClipOutcome::Described(record) | ClipOutcome::Cached(record) => {
-                    if self.print_text {
-                        let cached = matches!(outcome, ClipOutcome::Cached(_));
-                        print_clip(&video, record, cached);
-                    }
+            if let ClipOutcome::Described(record) | ClipOutcome::Cached(record) = &outcome {
+                if self.print_text {
+                    let cached = matches!(outcome, ClipOutcome::Cached(_));
+                    self.batch.print(|| print_clip(&video, record, cached));
                 }
-                ClipOutcome::Failed(Error::Cancelled) => {
-                    eprintln!("cancelled: {}", video.display());
-                }
-                ClipOutcome::Failed(e) => {
-                    // A rejected key or an empty balance, which would fail every video left the
-                    // same way, is said once at the end (`Stop::Job`).
-                    eprintln!("error: {}: {e}", video.display());
-                }
-                ClipOutcome::OverBudget => {
-                    eprintln!("not sent (over --max-cost): {}", video.display());
-                }
-                ClipOutcome::NotStarted => {}
             }
             self.next += 1;
         }
     }
-
-    fn show(&mut self) {
-        let Some((name, stage)) = self.in_work.values().next() else {
-            self.clear();
-            return;
-        };
-        if !self.terminal {
-            return;
-        }
-        let at = match stage {
-            None => "starting".to_string(),
-            Some(Stage::Frame { done, total }) => format!("frame {} of {total}", done + 1),
-            Some(Stage::Asking) => "waiting for the answer".to_string(),
-        };
-        let others = match self.in_work.len() - 1 {
-            0 => String::new(),
-            n => format!(" (+{n} in work)"),
-        };
-        eprint!(
-            "\r[{} of {} done] {name}: {at}{others}\x1b[K",
-            self.next + self.finished.len(),
-            self.total
-        );
-        self.shown = true;
-    }
-
-    fn clear(&mut self) {
-        if self.shown {
-            eprint!("\r\x1b[K");
-            self.shown = false;
-        }
-    }
-}
-
-fn file_name(video: &Path) -> String {
-    video.file_name().map_or_else(
-        || video.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    )
 }
 
 #[cfg(test)]
@@ -1070,6 +1255,7 @@ mod tests {
             model: MODELS[0].id.to_string(),
             clip: DescribedClip {
                 description: Description {
+                    main: None,
                     summary: "Two hikers reach a viewpoint over a valley with goats grazing below."
                         .to_string(),
                     segments: vec![Segment {
@@ -1207,6 +1393,7 @@ mod tests {
                 "duration_s",
                 "file",
                 "frames",
+                "main",
                 "model",
                 "moments",
                 "summary",
@@ -1379,6 +1566,21 @@ mod tests {
     }
 
     #[test]
+    fn the_main_range_is_printed_and_in_the_json_and_null_when_absent() {
+        let mut described = sample();
+        assert_eq!(
+            main_json(&described.clip.description),
+            serde_json::Value::Null
+        );
+        described.clip.description.main = Some(clipscribe::MainRange {
+            start_s: 7.0,
+            end_s: 28.5,
+        });
+        let json = clip_to_json(Path::new("hike.mp4"), &described, false, None);
+        assert_eq!(json["main"], json!({"start_s": 7.0, "end_s": 28.5}));
+    }
+
+    #[test]
     fn resolve_model_picks_each_providers_own_default_when_none_is_given() {
         let anthropic = resolve_model(None, ProviderArg::Anthropic).expect("default");
         assert_eq!(anthropic.id, "claude-haiku-4-5");
@@ -1417,5 +1619,18 @@ mod tests {
         assert!(parse_at("1::3").is_err());
         assert!(parse_at("-5").is_err());
         assert!(parse_at("1:-5").is_err());
+    }
+
+    #[test]
+    fn inputs_with_the_same_file_name_are_told_apart_by_their_path() {
+        let videos = [
+            PathBuf::from("a/clip.mp4"),
+            PathBuf::from("b/clip.mp4"),
+            PathBuf::from("c/other.mp4"),
+        ];
+        let names = display_names(&videos);
+        assert_eq!(names[0], PathBuf::from("a/clip.mp4").display().to_string());
+        assert_eq!(names[1], PathBuf::from("b/clip.mp4").display().to_string());
+        assert_eq!(names[2], "other.mp4");
     }
 }

@@ -634,7 +634,14 @@ mod run {
         match clip.sample_with_fingerprints(duration_s, sampling, cancel, |done, total| {
             on_stage(Stage::Frame { done, total })
         }) {
-            Ok(Some(sampled)) if !sampled.frames.is_empty() => Ok((duration_s, sampled)),
+            Ok(Some(sampled)) if !sampled.frames.is_empty() => {
+                crate::debug_frames::dump_if_on(
+                    &crate::debug_frames::name_of(video),
+                    &sampled.frames,
+                    crate::picked(duration_s, sampling),
+                );
+                Ok((duration_s, sampled))
+            }
             Ok(Some(_)) => Err(Error::Unreadable("no frames".to_string())),
             Ok(None) => Err(Error::Cancelled),
             Err(e) => Err(Error::Unreadable(e)),
@@ -683,8 +690,14 @@ mod run {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(Error::Cancelled);
             }
-            on_stage(Stage::Asking);
-            let response = match self.provider.complete(&request, self.cancel) {
+            on_stage(Stage::Asking {
+                provider: options.model.provider,
+            });
+            let response = match self.provider.complete_notifying(
+                &request,
+                self.cancel,
+                &mut |after, reason| on_stage(Stage::Retrying { after, reason }),
+            ) {
                 Ok(response) => response,
                 // Both may have been billed without saying how much: a timeout, and an answer
                 // that came back but could not be read (its usage is not carried by the error).
@@ -1914,6 +1927,7 @@ mod tests {
         fn described_as(clip: &DescribedClip, summary: &str) -> DescribedClip {
             DescribedClip {
                 description: crate::Description {
+                    main: None,
                     summary: summary.to_string(),
                     segments: Vec::new(),
                 },
@@ -2036,6 +2050,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                     DescribedClip {
                         description: crate::Description {
+                            main: None,
                             summary: description_of(name).to_string(),
                             segments: Vec::new(),
                         },

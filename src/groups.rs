@@ -791,6 +791,7 @@ mod tests {
     fn clip(summary: &str, duration_s: f64, frames: Vec<(f64, Vec<u8>)>) -> DescribedClip {
         DescribedClip {
             description: Description {
+                main: None,
                 summary: summary.to_string(),
                 segments: Vec::new(),
             },
@@ -850,6 +851,7 @@ mod tests {
         // 0–6 s the lamp, then a cut to the gradient; another clip shows only the gradient.
         let cut = DescribedClip {
             description: Description {
+                main: None,
                 summary: "A lamp, then a gradient.".to_string(),
                 segments: vec![
                     Segment {
@@ -1145,6 +1147,7 @@ mod tests {
         // Two segments, one per stretch, each described like a third clip.
         let segmented = DescribedClip {
             description: Description {
+                main: None,
                 summary: "A walk in the hills.".to_string(),
                 segments: vec![
                     Segment {

@@ -29,6 +29,55 @@
   what this run spent (the usage line on stderr counts only this run). The status line shows how
   many videos are done and in work.
 
+# 0.10.0
+## Added
+- Library: `clipscribe::ass` reads `.ass` / `.ssa` subtitles as plain text cues: `ass::parse` (the `[Events]` section by its `Format:` line, `Dialogue:` lines only; override tags and drawings dropped, `\N` and `\n` as line breaks), `ass::existing_path(video)` (`clip.ass`, else `clip.ssa`) and `ass::load_for(video)`. Nothing else changes: `srt` and the command line still read `.srt` only, and no caller has to change.
+
+# 0.9.0
+## Added
+- Command line: a batch shows a plan line (`24 videos: 41:12 of footage, ≈ $0.38 with …`), one bar for the whole run weighted by footage with cost so far and an ETA, the stage of the video in work (frames, asking the provider, retrying in 8 s), one result line per video and a summary.
+- Command line: without a terminal, and with `-q`/`--quiet`, there are no bars, plan or summary: only the result lines (and warnings, and why a run stopped); `--quiet` also drops the token line.
+- Library: `Stage::Retrying { after, reason }` tells a progress display that a request waits before it is sent again (`RetryReason::RateLimit` or `Temporary`); `AiProvider::complete_notifying` reports the waits, and an `AiProvider` of your own can keep using `complete` alone.
+
+## Changed
+- Library: `Stage::Asking` is now `Stage::Asking { provider: Provider }`, `Stage::Retrying` is new and `Stage` is `#[non_exhaustive]`: update `match` arms on `Stage` (`Asking { .. }`, a `Retrying { .. }` arm and a wildcard). The command line no longer says "waiting for Claude" with `--provider openai`.
+- Command line: what a failed video prints on stderr is now `✗ name  message` (the file name, no `error:` prefix) and Ctrl+C prints a summary line (or `cancelled` with `--quiet`): a script that greps stderr for `error:` must change.
+
+# 0.8.1
+## Added
+- The Windows `clipscribe.exe` has the app icon (Explorer, taskbar, file properties), and the README shows it; library and non-Windows builds are unchanged.
+
+# 0.8.0
+## Added
+- Debugging: see exactly which images the model got. `set_debug_frames_dir(Some(dir))` (or the
+  environment variable `CLIPSCRIBE_DEBUG_FRAMES=<dir>`) makes `describe`, `describe_with_tags` and
+  `describe_moment` write the frames of each request to `<dir>/<video name>/` as the same JPEG
+  bytes that were sent, named by time (`0012.40s.jpg`), with a `frames.json` (time, how the frame
+  was picked, size). Off by default; a write error is only logged. `dump_clip_frames` writes the
+  frames without sending a request. Nothing to change in code that builds `Options`.
+
+# 0.7.0
+## Added
+- A main range: when a clip has a lead-in or lead-out (setting up, walking into position) around
+  the one part worth keeping, the description carries it as the suggested In/Out —
+  `Description::main` (`Option<MainRange>`), `"main": {"start_s", "end_s"}` (or `null`) in
+  `--json`, and a `Main: m:ss–m:ss` line in the text output. Only in `important` moments mode.
+
+## Changed
+- Important moments, round 2: ranges that together cover almost the whole clip (90 % or more)
+  are now dropped unless the model says the clip is really made of clearly different parts, and
+  a range that only says what the summary already says is dropped. Ranges that only fill in
+  the clip around the main range, or cut the main range into its parts, are dropped too (the
+  main range stays). A clip like "pose, hold,
+  walk away" now gets a summary plus at most the main range and the moment that stands out,
+  not three tiles. Static and uniform clips still get no ranges.
+- Library: `Description` has a new field `main: Option<MainRange>`; add `main: None` where you
+  build a `Description` yourself. `describe::schema_for(MomentsMode)` and
+  `tags::combined_schema_for(MomentsMode)` are new; `schema()` and `combined_schema()` are the
+  `full` shapes as before. The `important` request carries two more required answer fields
+  (`main`, `distinct_parts`), so code that builds its own request from `schema()` and parses the
+  answer with `parse_answer(.., MomentsMode::Important)` should use `schema_for`.
+
 # 0.6.0
 ## Added
 - `describe_moment(video, at_s, window_s, subtitles, &options, cancel)`: a name and a

@@ -1,15 +1,19 @@
 # clipscribe
 
+<img src="https://raw.githubusercontent.com/Zelenov/clipscribe/main/docs/icon/clipscribe-256.png" align="left" width="128" height="128" alt="clipscribe icon">
+
 Describe what happens in video clips, and when, with Claude or ChatGPT — a Rust crate
 ([frename](https://github.com/Zelenov/frename) uses it).
 
 A video file and its subtitles go in; a one-sentence summary and time-ranged key moments come
 out, even for clips with no speech.
 
+<br clear="left">
+
 ## How it works
 
 - Frames are read with GStreamer, at most 60 per clip, 512 px on the long side, turned upright if
-  the clip has a rotation tag, and encoded as JPEG in memory. Nothing is written to disk. By
+  the clip has a rotation tag, and encoded as JPEG in memory. Nothing is written to disk unless you ask (see *Seeing the frames*). By
   default they are **key frames** (`FrameSampling::KeyFrames`): the clip is split into as many
   equal windows as the frame budget, and the one frame kept from each is wherever the picture
   changes the most in it, so a static shot spends no more of the budget than a clip that keeps
@@ -22,7 +26,13 @@ out, even for clips with no speech.
 - Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a
   static or uniform clip (the summary already covers it), one per clearly different or standout
   part otherwise — never a moment that just tiles the timeline. `MomentsMode::Full` goes back to
-  always covering the whole clip in consecutive stretches.
+  always covering the whole clip in consecutive stretches. In `important` mode, ranges that
+  together cover almost the whole clip are dropped unless the model says the clip is made of
+  clearly different parts, a range that only repeats the summary is dropped, and so are ranges
+  that only fill in around the main range or cut it into parts.
+- A clip with a lead-in or lead-out gets a **main range** (`Description::main`, `"main"` in
+  `--json`, `Main:` in the text output): the part an editor would keep, as a suggested In/Out.
+  It is absent when the whole clip is usable, and never set in `full` mode.
 
 ## As a library
 
@@ -45,7 +55,7 @@ let options = Options {
 };
 let subtitles = srt::load_for(video)?;
 let described = describe(video, &subtitles, &options, &AtomicBool::new(false), |stage| {
-    eprintln!("{stage:?}"); // Frame { done, total }, then Asking
+    eprintln!("{stage:?}"); // Frame { done, total }, then Asking { provider }; Retrying while it waits
 })?;
 println!("{}", described.description.summary);
 for moment in &described.description.segments {
@@ -53,6 +63,8 @@ for moment in &described.description.segments {
 }
 println!("${:.4}", options.model.cost_usd(described.usage));
 ```
+
+`ass::load_for(video)` reads a `.ass` / `.ssa` next to the video the same way, as plain text.
 
 Everything blocks: call it from a worker thread. `describe` fails with `Error::Cancelled`,
 `Unreadable`, `TooLong`, `Ai(AiError)` (rejected key, no credit, limits, network, timeout) or
@@ -154,6 +166,15 @@ as soon as one video failed or was not started: keep the index, as above.
 To build your own loop instead, the parts are public: `CacheKey`, `Cache::get`/`put`,
 `cached_clip`, `describe_clip` (one clip, within a `Budget`), `Budget::reserve_or_wait` and
 `request_cost_bound`.
+### Seeing the frames
+
+To check which images the model got, call `set_debug_frames_dir(Some(dir))` (or set
+`CLIPSCRIBE_DEBUG_FRAMES=<dir>`). `describe`, `describe_with_tags` and `describe_moment` then write
+`<dir>/<video name>/`: every frame as the same JPEG bytes that were sent, named by time
+(`0012.40s.jpg`), and a `frames.json` with each frame's time, how it was picked (`key_frame`,
+`interval` or `moment`) and its size. A setter and a variable, not an `Options` field, so nothing
+that builds `Options` changes. A write error is only logged. `dump_clip_frames` writes the frames
+without sending anything.
 
 ### Features
 
@@ -161,7 +182,7 @@ To build your own loop instead, the parts are public: `CacheKey`, `Cache::get`/`
 |---|---|
 | `cli` (default) | The `clipscribe` binary (clap, ctrlc). Implies `frames`. |
 | `frames` (default) | GStreamer frame reading, `describe` and `describe_folder`. |
-| none | Models, languages, request and answer types, the estimate, `srt`, both providers' clients, the cache and `group_clips`, with no GStreamer. |
+| none | Models, languages, request and answer types, the estimate, `srt`, `ass`, both providers' clients, the cache and `group_clips`, with no GStreamer. |
 
 ## Building
 

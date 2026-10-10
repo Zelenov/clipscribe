@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::describe::{Description, FrameSampling, MomentsMode, Segment};
+use crate::describe::{Description, FrameSampling, MainRange, MomentsMode, Segment};
 use crate::folder::{DescribedClip, FrameFingerprint};
 use crate::provider::AiUsage;
 use crate::tags::{Tag, TagRange, TagSuggestion, TagSuggestions};
@@ -332,6 +332,7 @@ fn record_to_json(record: &ClipRecord) -> Value {
             "output_tokens": clip.usage.output_tokens,
         },
         "summary": clip.description.summary,
+        "main": clip.description.main.map(|m| json!({"start_s": m.start_s, "end_s": m.end_s})),
         "segments": clip.description.segments.iter().map(|s| json!({
             "start_s": s.start_s,
             "end_s": s.end_s,
@@ -375,6 +376,14 @@ fn record_from_json(value: &Value) -> Option<ClipRecord> {
             })
         })
         .collect::<Option<Vec<_>>>()?;
+    // Absent in lines written before the main range existed, and `null` for a clip without one.
+    let main = match (
+        value["main"]["start_s"].as_f64(),
+        value["main"]["end_s"].as_f64(),
+    ) {
+        (Some(start_s), Some(end_s)) => Some(MainRange { start_s, end_s }),
+        _ => None,
+    };
     let tags = match &value["tags"] {
         Value::Null => None,
         tags => Some(TagSuggestions {
@@ -428,6 +437,7 @@ fn record_from_json(value: &Value) -> Option<ClipRecord> {
             description: Description {
                 summary: string(&value["summary"])?,
                 segments,
+                main,
             },
             tags,
             usage: AiUsage {
@@ -480,6 +490,10 @@ mod tests {
                         end_s: 2.5,
                         description: "Привет — a goat looks up.".to_string(),
                     }],
+                    main: Some(MainRange {
+                        start_s: 0.5,
+                        end_s: 2.75,
+                    }),
                 },
                 tags: Some(TagSuggestions {
                     tags: vec![TagSuggestion {
