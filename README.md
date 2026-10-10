@@ -98,6 +98,9 @@ reading only the frame plus `window_s` on each side of it and any subtitle lines
 same window. `MOMENT_WINDOW_S` (1 s) is a reasonable default for `window_s`. Returns a
 `DescribedMoment { moment: Moment { name, description }, usage }` — `moment.name` is a few words,
 fit for a marker label; `usage` prices with `Model::cost_usd` like any other call.
+`describe_moment_notifying(…, on_stage)` does the same and calls `on_stage` with `Stage::Released`
+once the frames are read and the video file is closed (before the request, which can take a
+while), then `Stage::Asking` and `Stage::Retrying`.
 
 ### Whole folders
 
