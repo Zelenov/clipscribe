@@ -115,7 +115,7 @@ without sending anything.
 |---|---|
 | `cli` (default) | The `clipscribe` binary (clap, ctrlc). Implies `frames`. |
 | `frames` (default) | GStreamer frame reading and `describe`. |
-| none | Models, languages, request and answer types, the estimate, `srt` and both providers' clients, with no GStreamer. |
+| none | Models, languages, request and answer types, the estimate, `srt`, `ass` and both providers' clients, with no GStreamer. |
 
 ## Building
 

@@ -4,6 +4,7 @@
 //! Subtitle Edit, YouTube and ffmpeg order the columns differently), `Dialogue:` lines only
 //! (`Comment:` lines are skipped). Override tags (`{\b1}`, `{\pos(…)}`, `{\an8}`), drawing
 //! commands (`{\p1}`…`{\p0}`) and styles are dropped; `\N` and `\n` become line breaks.
+//! Files are read as UTF-8 (a BOM is fine); another encoding gives no cues.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -32,6 +33,7 @@ pub fn parse(source: &str) -> Vec<Cue> {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
+        let key = key.trim();
         if key.eq_ignore_ascii_case("format") {
             columns = Columns::from_format(value);
         } else if key.eq_ignore_ascii_case("dialogue") {
@@ -71,10 +73,14 @@ struct Columns {
 
 impl Columns {
     fn from_format(format: &str) -> Option<Self> {
-        let names: Vec<String> = format
+        let mut names: Vec<String> = format
             .split(',')
             .map(|name| name.trim().to_ascii_lowercase())
             .collect();
+        // Some tools end the line with a comma.
+        while names.last().is_some_and(String::is_empty) {
+            names.pop();
+        }
         let find = |wanted: &str| names.iter().position(|name| name == wanted);
         Some(Self {
             count: names.len(),
@@ -116,8 +122,14 @@ fn parse_timestamp(value: &str) -> Option<Duration> {
     }
     let digits = &fraction[..fraction.len().min(3)];
     let millis = digits.parse::<u64>().ok()? * 10u64.pow(3 - digits.len() as u32);
+    // A junk line (`99999999999999999:00:00.00`) is skipped, not an overflow.
+    let seconds = hours
+        .checked_mul(60)?
+        .checked_add(minutes)?
+        .checked_mul(60)?
+        .checked_add(seconds)?;
     Some(Duration::from_millis(
-        ((hours * 60 + minutes) * 60 + seconds) * 1000 + millis,
+        seconds.checked_mul(1000)?.checked_add(millis)?,
     ))
 }
 
@@ -125,10 +137,13 @@ fn parse_timestamp(value: &str) -> Option<Duration> {
 fn plain_text(raw: &str) -> String {
     let mut out = String::new();
     let mut drawing = false;
+    // Once a `{` has no `}` after it, no later one has: they are text, and not searched for again.
+    let mut closes = raw.contains('}');
     let mut rest = raw;
     while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix('{') {
+        if let Some(after) = rest.strip_prefix('{').filter(|_| closes) {
             // An unclosed brace is text.
+            closes = after.contains('}');
             if let Some((block, tail)) = after.split_once('}') {
                 if let Some(mode) = drawing_mode(block) {
                     drawing = mode;
@@ -279,6 +294,39 @@ mod tests {
             "[Fonts]\nDialogue: 0:00:01.00,0:00:02.00,Nope\n[Events]\nDialogue: 0:00:01.00,0:00:02.00,No format\n",
         );
         assert!(cues.is_empty());
+    }
+
+    #[test]
+    fn absurd_times_skip_the_line_instead_of_overflowing() {
+        let cues = parse(
+            "[Events]\nFormat: Start, End, Text\n\
+             Dialogue: 99999999999999999:00:00.00,99999999999999999:00:01.00,Huge\n\
+             Dialogue: 18446744073709551615:00:00.00,18446744073709551615:00:01.00,Max\n\
+             Dialogue: 0:00:01.00,0:00:02.00,Fine\n",
+        );
+        let texts: Vec<&str> = cues.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["Fine"]);
+    }
+
+    #[test]
+    fn a_trailing_comma_in_format_and_a_space_before_the_colon_are_fine() {
+        let cues = parse(
+            "[Events]\nFormat : Start, End, Text,\nDialogue: 0:00:01.00,0:00:02.00,Hi, there\n",
+        );
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "Hi, there");
+    }
+
+    #[test]
+    fn many_unclosed_braces_are_text_and_do_not_slow_the_parse_down() {
+        let line = format!(
+            "[Events]\nFormat: Start, End, Text\nDialogue: 0:00:01.00,0:00:02.00,{}\n",
+            "{".repeat(200_000)
+        );
+        let started = std::time::Instant::now();
+        let cues = parse(&line);
+        assert_eq!(cues[0].text.len(), 200_000);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
