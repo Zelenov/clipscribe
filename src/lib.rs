@@ -31,6 +31,7 @@
 //! the estimate and the Anthropic client remain.
 
 pub mod anthropic;
+pub mod ass;
 mod debug_frames;
 mod describe;
 #[cfg(feature = "frames")]

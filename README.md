@@ -64,6 +64,8 @@ for moment in &described.description.segments {
 println!("${:.4}", options.model.cost_usd(described.usage));
 ```
 
+`ass::load_for(video)` reads a `.ass` / `.ssa` next to the video the same way, as plain text.
+
 Everything blocks: call it from a worker thread. `describe` fails with `Error::Cancelled`,
 `Unreadable`, `TooLong`, `Ai(AiError)` (rejected key, no credit, limits, network, timeout) or
 `BadAnswer` (billed, but not usable). `estimate_usage` and `Model::cost_usd` price a clip
@@ -113,7 +115,7 @@ without sending anything.
 |---|---|
 | `cli` (default) | The `clipscribe` binary (clap, ctrlc). Implies `frames`. |
 | `frames` (default) | GStreamer frame reading and `describe`. |
-| none | Models, languages, request and answer types, the estimate, `srt` and both providers' clients, with no GStreamer. |
+| none | Models, languages, request and answer types, the estimate, `srt`, `ass` and both providers' clients, with no GStreamer. |
 
 ## Building
 
