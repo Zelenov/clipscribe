@@ -1,4 +1,4 @@
-# NEXT
+# 0.13.0
 ## Added
 - Library: `detect_shots(video, cancel)` finds the shots of an edited video: cuts to the frame,
   and dissolves and fades as ranges that belong to no shot (their start can be found up to a
