@@ -1,10 +1,12 @@
 # NEXT
 ## Added
-- Library: `detect_shots(video, cancel)` finds the cuts, dissolves and fades of an edited video to
-  the frame, and returns its shots (`Shots`, `Shot`, `Transition`, `TransitionKind`). It reads the
-  clip once at 64×36 grey and sends nothing to Claude. The frame-by-shot sampling and the
-  command line (`--shots`) come in later releases. `shots::find_shots` is the same on frames you
-  decoded yourself.
+- Library: `detect_shots(video, cancel)` finds the shots of an edited video: cuts to the frame,
+  and dissolves and fades as ranges that belong to no shot (their start can be found up to a
+  third of a second late; the thresholds are still first values). It reads the clip once at
+  64×36 grey and sends nothing to Claude. Returns `Shots`, `Shot`, `Transition`,
+  `TransitionKind`. A clip over 30 minutes is refused (`Error::TooLong`), a file with no video is
+  `Error::Unreadable`. The frame-by-shot sampling and the command line (`--shots`) come in later
+  releases. `shots::find_shots` is the same on frames you decoded yourself.
 
 # 0.12.0
 ## Added

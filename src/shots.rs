@@ -44,6 +44,7 @@ const MIN_SHOT_S: f64 = 0.5;
 
 /// How the picture changes from one shot to the next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransitionKind {
     /// From one frame to the next.
     Cut,
@@ -68,7 +69,10 @@ impl TransitionKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transition {
     pub kind: TransitionKind,
+    /// Seconds from the clip's start: where a dissolve or fade begins (found up to a third of a
+    /// second late for now), the first frame of the new picture for a cut.
     pub start_s: f64,
+    /// Seconds: the first frame of the new picture; equal to `start_s` for a cut.
     pub end_s: f64,
 }
 
@@ -76,7 +80,10 @@ pub struct Transition {
 /// shot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Shot {
+    /// Seconds from the clip's start: the first frame (after a dissolve or fade, the end of it).
     pub start_s: f64,
+    /// Seconds: where the next transition starts (for a cut, its first new frame), or the clip's
+    /// end. Between this and the next shot's `start_s` lies a dissolve or fade.
     pub end_s: f64,
     /// How the shot begins; `None` for the first one.
     pub enters_by: Option<TransitionKind>,
@@ -85,7 +92,9 @@ pub struct Shot {
 /// The shots of a clip and the transitions between them, in time order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Shots {
+    /// In time order; empty only for a clip without frames.
     pub shots: Vec<Shot>,
+    /// In time order; always one fewer than `shots`.
     pub transitions: Vec<Transition>,
 }
 
@@ -127,6 +136,9 @@ struct Gradual {
 /// order, `times_s` their times, `end_s` the clip's end. Fewer than two frames are one shot.
 pub fn find_shots<F: AsRef<[u8]>>(frames: &[F], times_s: &[f64], end_s: f64) -> Shots {
     let n = frames.len().min(times_s.len());
+    debug_assert!(frames
+        .iter()
+        .all(|f| f.as_ref().len() == FRAME_WIDTH * FRAME_HEIGHT));
     if n == 0 {
         return Shots::default();
     }
@@ -158,7 +170,7 @@ pub fn find_shots<F: AsRef<[u8]>>(frames: &[F], times_s: &[f64], end_s: f64) -> 
     }
 
     let second = (fps.round() as usize).max(1);
-    let (cuts, _flashes) = cuts(&views, &d, &score, n, second);
+    let cuts = cuts(&views, &d, &score, n, second);
     let min_frames = ((MIN_SHOT_S * fps).round() as usize).max(1);
     let gradual = gradual(&views, &d, &cuts, n, min_frames.max(2));
 
@@ -217,15 +229,9 @@ pub fn find_shots<F: AsRef<[u8]>>(frames: &[F], times_s: &[f64], end_s: f64) -> 
     Shots { shots, transitions }
 }
 
-/// The frames that start a cut, and the flashes ignored.
-fn cuts(
-    f: &[&[u8]],
-    d: &[f32],
-    score: &[f32],
-    n: usize,
-    second: usize,
-) -> (Vec<usize>, Vec<usize>) {
-    let (mut cuts, mut flashes) = (Vec::new(), Vec::new());
+/// The frames that start a cut; flashes are skipped.
+fn cuts(f: &[&[u8]], d: &[f32], score: &[f32], n: usize, second: usize) -> Vec<usize> {
+    let mut cuts = Vec::new();
     let mut skip = vec![false; n];
     for i in 2..n {
         if skip[i] || score[i] < CUT_SCORE {
@@ -243,13 +249,12 @@ fn cuts(
             .min_by(|a, b| a.0.total_cmp(&b.0));
         match back {
             Some((distance, j)) if distance < FLASH_RETURN * d[i] => {
-                flashes.push(i);
                 skip[i..=j].iter_mut().for_each(|s| *s = true);
             }
             _ => cuts.push(i),
         }
     }
-    (cuts, flashes)
+    cuts
 }
 
 /// Dissolves and fades: half-second spans that change a lot in small steps by mixing two pictures.

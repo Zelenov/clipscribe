@@ -14,13 +14,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::shots::{find_shots, Shots, FRAME_HEIGHT, FRAME_WIDTH};
-use crate::Error;
-
 use crate::describe::{
     candidate_times, frame_count, frame_size, sample_times, select_key_frames, Frame,
-    FrameSampling, FRAME_LONG_SIDE,
+    FrameSampling, FRAME_LONG_SIDE, MAX_DURATION_S,
 };
+use crate::shots::{find_shots, Shots, FRAME_HEIGHT, FRAME_WIDTH};
+use crate::Error;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -44,32 +43,46 @@ pub(crate) struct Sampled {
 pub struct Clip {
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
+    _stop: StopOnDrop,
 }
 
-impl Drop for Clip {
+/// Stops a pipeline when dropped.
+struct StopOnDrop(gst::Pipeline);
+
+impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let _ = self.0.set_state(gst::State::Null);
     }
+}
+
+/// The `file://` URI of the video at `path`.
+fn file_uri(path: &Path) -> Result<url::Url, String> {
+    let absolute = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    url::Url::from_file_path(&absolute)
+        .map_err(|()| format!("not a file path: {}", absolute.display()))
+}
+
+fn make_element(factory: &str) -> Result<gst::Element, String> {
+    gst::ElementFactory::make(factory)
+        .build()
+        .map_err(|e| format!("{factory}: {e}"))
+}
+
+/// A `uridecodebin` for the video at `path`.
+fn decoder(path: &Path) -> Result<gst::Element, String> {
+    gst::ElementFactory::make("uridecodebin")
+        .property("uri", file_uri(path)?.as_str())
+        .build()
+        .map_err(|e| format!("uridecodebin: {e}"))
 }
 
 impl Clip {
     /// Open the clip at `path` and wait up to `timeout` for its first frame.
     pub fn open(path: &Path, timeout: Duration) -> Result<Self, String> {
         gst::init().map_err(|e| e.to_string())?;
-        let absolute = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-        let uri = url::Url::from_file_path(&absolute)
-            .map_err(|()| format!("not a file path: {}", absolute.display()))?;
-
-        let make = |factory: &str| {
-            gst::ElementFactory::make(factory)
-                .build()
-                .map_err(|e| format!("{factory}: {e}"))
-        };
+        let make = make_element;
         let pipeline = gst::Pipeline::new();
-        let decode = gst::ElementFactory::make("uridecodebin")
-            .property("uri", uri.as_str())
-            .build()
-            .map_err(|e| format!("uridecodebin: {e}"))?;
+        let decode = decoder(path)?;
         let scale = make("videoscale")?;
         // At most 512 px on each side with square pixels; videoscale keeps the aspect ratio
         // within that, so the long side becomes 512.
@@ -105,7 +118,11 @@ impl Clip {
             .ok_or("videoscale has no sink pad")?;
         route_streams(&pipeline, &decode, video_in);
 
-        let clip = Self { pipeline, sink };
+        let clip = Self {
+            _stop: StopOnDrop(pipeline.clone()),
+            pipeline,
+            sink,
+        };
         clip.pipeline.set_state(gst::State::Paused).map_err(|_| {
             clip.bus_error()
                 .unwrap_or_else(|| "cannot open".to_string())
@@ -465,25 +482,19 @@ fn route_streams(pipeline: &gst::Pipeline, decode: &gst::Element, video_in: gst:
 }
 
 /// The shots of the clip at `video`: one continuous decode to 64×36 grey frames, then
-/// [`find_shots`]. Blocks for about as long as decoding the clip takes; `cancel` stops it.
+/// [`find_shots`]. Blocks for about as long as decoding the clip takes; `cancel` stops it. Every
+/// frame is kept in memory (2.3 KB), so a clip over [`MAX_DURATION_S`] is refused with
+/// [`Error::TooLong`]. Frames are not rotated (cuts do not depend on it); times are the clip's.
 pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
-    let unreadable = |reason: String| Error::Unreadable(reason);
+    if let Some(duration_s) = clip_duration_s(video).filter(|d| *d > MAX_DURATION_S) {
+        return Err(Error::TooLong(duration_s));
+    }
+    let unreadable = Error::Unreadable;
     gst::init().map_err(|e| unreadable(e.to_string()))?;
-    let absolute = std::fs::canonicalize(video).map_err(|e| unreadable(e.to_string()))?;
-    let uri = url::Url::from_file_path(&absolute)
-        .map_err(|()| unreadable(format!("not a file path: {}", absolute.display())))?;
-    let make = |factory: &str| {
-        gst::ElementFactory::make(factory)
-            .build()
-            .map_err(|e| unreadable(format!("{factory}: {e}")))
-    };
     let pipeline = gst::Pipeline::new();
-    let decode = gst::ElementFactory::make("uridecodebin")
-        .property("uri", uri.as_str())
-        .build()
-        .map_err(|e| unreadable(format!("uridecodebin: {e}")))?;
-    let convert = make("videoconvert")?;
-    let scale = make("videoscale")?;
+    let decode = decoder(video).map_err(unreadable)?;
+    let scale = make_element("videoscale").map_err(unreadable)?;
+    let convert = make_element("videoconvert").map_err(unreadable)?;
     let sink = gst_app::AppSink::builder()
         .caps(
             &gst::Caps::builder("video/x-raw")
@@ -496,13 +507,13 @@ pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
         .max_buffers(16)
         .build();
     pipeline
-        .add_many([&decode, &convert, &scale, sink.upcast_ref()])
+        .add_many([&decode, &scale, &convert, sink.upcast_ref()])
         .map_err(|e| unreadable(e.to_string()))?;
-    gst::Element::link_many([&convert, &scale, sink.upcast_ref()])
+    gst::Element::link_many([&scale, &convert, sink.upcast_ref()])
         .map_err(|e| unreadable(e.to_string()))?;
-    let video_in = convert
+    let video_in = scale
         .static_pad("sink")
-        .ok_or_else(|| unreadable("videoconvert has no sink pad".to_string()))?;
+        .ok_or_else(|| unreadable("videoscale has no sink pad".to_string()))?;
     route_streams(&pipeline, &decode, video_in);
     let _stop = StopOnDrop(pipeline.clone());
     pipeline
@@ -515,11 +526,15 @@ pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
     let mut frames: Vec<Vec<u8>> = Vec::new();
     let mut times = Vec::new();
     let mut last_end = 0.0f64;
+    // A file with no video stream never posts EOS (the sink is never fed), so a silent pipeline
+    // is an error after a while, like `Clip::open`'s timeout.
+    let mut quiet_since = std::time::Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
         if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+            quiet_since = std::time::Instant::now();
             let buffer = sample
                 .buffer()
                 .ok_or_else(|| unreadable("frame without data".to_string()))?;
@@ -535,6 +550,18 @@ pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
             times.push(pts);
         } else if sink.is_eos() {
             break;
+        } else if quiet_since.elapsed()
+            > if frames.is_empty() {
+                OPEN_TIMEOUT
+            } else {
+                FRAME_TIMEOUT
+            }
+        {
+            return Err(unreadable(if frames.is_empty() {
+                "no video stream".to_string()
+            } else {
+                "no frame in time".to_string()
+            }));
         }
         while let Some(message) = bus.pop() {
             if let gst::MessageView::Error(e) = message.view() {
@@ -546,15 +573,6 @@ pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
         return Err(unreadable("no video stream".to_string()));
     }
     Ok(find_shots(&frames, &times, last_end))
-}
-
-/// Stops a pipeline when dropped.
-struct StopOnDrop(gst::Pipeline);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.set_state(gst::State::Null);
-    }
 }
 
 /// The length in seconds of the clip at `path`, for an estimate before describing it; `None`
@@ -1150,5 +1168,35 @@ mod tests {
             ),
             Err(Error::Unreadable(_))
         ));
+    }
+
+    /// A file with sound only never feeds the sink and so never ends: it must fail, not hang.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_shots_refuses_a_file_without_video() {
+        // One second of 8-bit silence at 8 kHz as a WAV file.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + 8000).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        for field in [1u16, 1] {
+            wav.extend_from_slice(&field.to_le_bytes());
+        }
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&[128u8; 8000]);
+        let path =
+            std::env::temp_dir().join(format!("clipscribe-silence-{}.wav", std::process::id()));
+        std::fs::write(&path, wav).expect("write");
+        let started = std::time::Instant::now();
+        let result = detect_shots(&path, &AtomicBool::new(false));
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }
