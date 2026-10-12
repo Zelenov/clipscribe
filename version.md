@@ -1,3 +1,13 @@
+# 0.13.0
+## Added
+- Library: `detect_shots(video, cancel)` finds the shots of an edited video: cuts to the frame,
+  and dissolves and fades as ranges that belong to no shot (their start can be found up to a
+  third of a second late; the thresholds are still first values). It reads the clip once at
+  64×36 grey and sends nothing to Claude. Returns `Shots`, `Shot`, `Transition`,
+  `TransitionKind`. A clip over 30 minutes is refused (`Error::TooLong`), a file with no video is
+  `Error::Unreadable`. The frame-by-shot sampling and the command line (`--shots`) come in later
+  releases. `shots::find_shots` is the same on frames you decoded yourself.
+
 # 0.12.0
 ## Added
 - Library: `describe_moment_notifying(…, on_stage)` is `describe_moment` with a progress callback,

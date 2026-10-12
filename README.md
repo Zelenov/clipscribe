@@ -102,6 +102,28 @@ fit for a marker label; `usage` prices with `Model::cost_usd` like any other cal
 once the frames are read and the video file is closed (before the request, which can take a
 while), then `Stage::Asking` and `Stage::Retrying`.
 
+### Shots of an edit
+
+`detect_shots(video, cancel)` finds where an edited video changes picture: one pass over the clip
+(it blocks while it decodes; `cancel` stops it), no request and no cost.
+
+```rust
+let shots = clipscribe::detect_shots("edit.mp4".as_ref(), &AtomicBool::new(false))?;
+for shot in &shots.shots {
+    println!("{:.2}–{:.2} s", shot.start_s, shot.end_s);
+}
+```
+
+Each `Shot` has `start_s`, `end_s` and `enters_by` (`None` for the first, then `Cut`, `Dissolve`
+or `Fade`); each `Transition` in `shots.transitions` has its `kind` and start and end (the same
+for a cut). A dissolve or fade belongs to no shot: it is the gap between one shot's `end_s` and
+the next one's `start_s`. Cuts are found to the frame; the start of a dissolve can come up to a
+third of a second late, because the thresholds are first values, not yet tuned on many real
+edits. A camera flash, a pan or a zoom is not a cut, and a shot is at least half a second. A clip
+without cuts is one shot. A clip over 30 minutes is refused, as for `describe`.
+`shots::find_shots` does the same on frames you decoded yourself, and works without the `frames`
+feature.
+
 ### Whole folders
 
 `describe_folder` describes many clips in one call, several at once, and can resume a stopped
