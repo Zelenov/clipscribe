@@ -6,3 +6,5 @@ tests/clips/Short.Travel.Health.Views.file_example_WEBM_480_900KB.webm
 # stores a portrait clip; frames must come out upright. Made with
 # ffmpeg -display_rotation 90 -i tests/clips/file_example_MP4_480_1_5MG.mp4 -t 6 -c copy -an tests/clips/rotated-90.mp4
 tests/clips/rotated-90.mp4
+# shots-edit.mp4: a 10 s edit with a dissolve and two cuts (see detect_shots_finds_the_cuts_and_the_dissolve_of_an_edit).
+tests/clips/shots-edit.mp4

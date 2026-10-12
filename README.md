@@ -102,6 +102,16 @@ fit for a marker label; `usage` prices with `Model::cost_usd` like any other cal
 once the frames are read and the video file is closed (before the request, which can take a
 while), then `Stage::Asking` and `Stage::Retrying`.
 
+### Shots of an edit
+
+`detect_shots(video, cancel)` finds where an edited video changes picture: one fast pass over the
+clip, no request and no cost. It returns `Shots { shots, transitions }`: each `Shot` has `start_s`,
+`end_s` and `enters_by` (`None` for the first, then `Cut`, `Dissolve` or `Fade`), and each
+`Transition` has a `kind` and the time it starts and ends (the same for a cut). A camera flash, a
+pan or a zoom is not a cut, and a shot is at least half a second. A clip without cuts is one
+shot. The thresholds are first values, not yet tuned on many real edits. `shots::find_shots` does
+the same on frames you decoded yourself, and works without the `frames` feature.
+
 ### Whole folders
 
 `describe_folder` describes many clips in one call, several at once, and can resume a stopped

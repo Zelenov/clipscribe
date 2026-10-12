@@ -46,6 +46,7 @@ mod groups;
 mod moment;
 pub mod openai;
 pub mod provider;
+pub mod shots;
 pub mod srt;
 mod tags;
 
@@ -61,6 +62,8 @@ pub use folder::{
 };
 #[cfg(feature = "frames")]
 pub use folder::{describe_clip, describe_folder};
+#[cfg(feature = "frames")]
+pub use frames::detect_shots;
 pub use groups::{group_clips, ClipGroups, Group, GroupOptions, Grouping, Stretch};
 pub use moment::*;
 pub use provider::{AiError, AiProvider, AiUsage, Provider, RetryReason};

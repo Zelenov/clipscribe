@@ -14,6 +14,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::shots::{find_shots, Shots, FRAME_HEIGHT, FRAME_WIDTH};
+use crate::Error;
+
 use crate::describe::{
     candidate_times, frame_count, frame_size, sample_times, select_key_frames, Frame,
     FrameSampling, FRAME_LONG_SIDE,
@@ -97,38 +100,10 @@ impl Clip {
         gst::Element::link_many([&scale, &scaled, &convert, sink.upcast_ref()])
             .map_err(|e| e.to_string())?;
 
-        // The first video stream goes to the scaler; everything else (sound, a second video
-        // stream) to a sink of its own that drops it, so no stream stalls the others.
         let video_in = scale
             .static_pad("sink")
             .ok_or("videoscale has no sink pad")?;
-        // Weak: the pipeline owns the decoder that owns this closure.
-        let bin = pipeline.downgrade();
-        decode.connect_pad_added(move |_, pad| {
-            let is_video = pad
-                .current_caps()
-                .or_else(|| Some(pad.query_caps(None)))
-                .and_then(|caps| caps.structure(0).map(|s| s.name().starts_with("video/")))
-                .unwrap_or(false);
-            if is_video && !video_in.is_linked() && pad.link(&video_in).is_ok() {
-                return;
-            }
-            let Ok(drop) = gst::ElementFactory::make("fakesink")
-                .property("sync", false)
-                .build()
-            else {
-                return;
-            };
-            let Some(bin) = bin.upgrade() else {
-                return;
-            };
-            if bin.add(&drop).is_ok() {
-                let _ = drop.sync_state_with_parent();
-                if let Some(sink_pad) = drop.static_pad("sink") {
-                    let _ = pad.link(&sink_pad);
-                }
-            }
-        });
+        route_streams(&pipeline, &decode, video_in);
 
         let clip = Self { pipeline, sink };
         clip.pipeline.set_state(gst::State::Paused).map_err(|_| {
@@ -455,6 +430,131 @@ fn to_jpeg(image: image::RgbImage) -> Result<Vec<u8>, String> {
         .encode_image(&image)
         .map_err(|e| e.to_string())?;
     Ok(jpeg)
+}
+
+/// Send the first video stream of `decode` to `video_in`; everything else (sound, a second video
+/// stream) to a sink of its own that drops it, so no stream stalls the others.
+fn route_streams(pipeline: &gst::Pipeline, decode: &gst::Element, video_in: gst::Pad) {
+    // Weak: the pipeline owns the decoder that owns this closure.
+    let bin = pipeline.downgrade();
+    decode.connect_pad_added(move |_, pad| {
+        let is_video = pad
+            .current_caps()
+            .or_else(|| Some(pad.query_caps(None)))
+            .and_then(|caps| caps.structure(0).map(|s| s.name().starts_with("video/")))
+            .unwrap_or(false);
+        if is_video && !video_in.is_linked() && pad.link(&video_in).is_ok() {
+            return;
+        }
+        let Ok(drop) = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+        else {
+            return;
+        };
+        let Some(bin) = bin.upgrade() else {
+            return;
+        };
+        if bin.add(&drop).is_ok() {
+            let _ = drop.sync_state_with_parent();
+            if let Some(sink_pad) = drop.static_pad("sink") {
+                let _ = pad.link(&sink_pad);
+            }
+        }
+    });
+}
+
+/// The shots of the clip at `video`: one continuous decode to 64×36 grey frames, then
+/// [`find_shots`]. Blocks for about as long as decoding the clip takes; `cancel` stops it.
+pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
+    let unreadable = |reason: String| Error::Unreadable(reason);
+    gst::init().map_err(|e| unreadable(e.to_string()))?;
+    let absolute = std::fs::canonicalize(video).map_err(|e| unreadable(e.to_string()))?;
+    let uri = url::Url::from_file_path(&absolute)
+        .map_err(|()| unreadable(format!("not a file path: {}", absolute.display())))?;
+    let make = |factory: &str| {
+        gst::ElementFactory::make(factory)
+            .build()
+            .map_err(|e| unreadable(format!("{factory}: {e}")))
+    };
+    let pipeline = gst::Pipeline::new();
+    let decode = gst::ElementFactory::make("uridecodebin")
+        .property("uri", uri.as_str())
+        .build()
+        .map_err(|e| unreadable(format!("uridecodebin: {e}")))?;
+    let convert = make("videoconvert")?;
+    let scale = make("videoscale")?;
+    let sink = gst_app::AppSink::builder()
+        .caps(
+            &gst::Caps::builder("video/x-raw")
+                .field("format", "GRAY8")
+                .field("width", FRAME_WIDTH as i32)
+                .field("height", FRAME_HEIGHT as i32)
+                .build(),
+        )
+        .sync(false)
+        .max_buffers(16)
+        .build();
+    pipeline
+        .add_many([&decode, &convert, &scale, sink.upcast_ref()])
+        .map_err(|e| unreadable(e.to_string()))?;
+    gst::Element::link_many([&convert, &scale, sink.upcast_ref()])
+        .map_err(|e| unreadable(e.to_string()))?;
+    let video_in = convert
+        .static_pad("sink")
+        .ok_or_else(|| unreadable("videoconvert has no sink pad".to_string()))?;
+    route_streams(&pipeline, &decode, video_in);
+    let _stop = StopOnDrop(pipeline.clone());
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|_| unreadable("cannot open".to_string()))?;
+
+    let bus = pipeline
+        .bus()
+        .ok_or_else(|| unreadable("no bus".to_string()))?;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut times = Vec::new();
+    let mut last_end = 0.0f64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+            let buffer = sample
+                .buffer()
+                .ok_or_else(|| unreadable("frame without data".to_string()))?;
+            let map = buffer
+                .map_readable()
+                .map_err(|_| unreadable("unreadable frame".to_string()))?;
+            if map.len() < FRAME_WIDTH * FRAME_HEIGHT {
+                return Err(unreadable("short frame".to_string()));
+            }
+            let pts = buffer.pts().map_or(last_end, |t| t.nseconds() as f64 / 1e9);
+            last_end = pts + buffer.duration().map_or(0.0, |t| t.nseconds() as f64 / 1e9);
+            frames.push(map[..FRAME_WIDTH * FRAME_HEIGHT].to_vec());
+            times.push(pts);
+        } else if sink.is_eos() {
+            break;
+        }
+        while let Some(message) = bus.pop() {
+            if let gst::MessageView::Error(e) = message.view() {
+                return Err(unreadable(e.error().to_string()));
+            }
+        }
+    }
+    if frames.is_empty() {
+        return Err(unreadable("no video stream".to_string()));
+    }
+    Ok(find_shots(&frames, &times, last_end))
+}
+
+/// Stops a pipeline when dropped.
+struct StopOnDrop(gst::Pipeline);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.set_state(gst::State::Null);
+    }
 }
 
 /// The length in seconds of the clip at `path`, for an estimate before describing it; `None`
@@ -977,5 +1077,78 @@ mod tests {
                 assert_eq!(fp[gy * 8 + gx], 255);
             }
         }
+    }
+
+    /// `tests/clips/shots-edit.mp4`: 3 s of test pattern dissolving into a fractal from 2 to 3 s,
+    /// cut to a green cell pattern at 5 s and to colour bars at 7 s, 10 s in all. Made with
+    /// FFmpeg: `testsrc2`, `mandelbrot`, `life`, `rgbtestsrc` joined by `xfade` and `concat`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_shots_finds_the_cuts_and_the_dissolve_of_an_edit() {
+        use crate::shots::TransitionKind;
+        let shots = detect_shots(
+            &repo().join("tests/clips/shots-edit.mp4"),
+            &AtomicBool::new(false),
+        )
+        .expect("shots");
+        let t0 = shots.shots[0].start_s;
+        let kinds: Vec<_> = shots.transitions.iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                TransitionKind::Dissolve,
+                TransitionKind::Cut,
+                TransitionKind::Cut
+            ],
+            "{shots:?}"
+        );
+        let [dissolve, first_cut, second_cut] = shots.transitions[..] else {
+            panic!("{shots:?}");
+        };
+        assert!(
+            (2.0..=2.5).contains(&(dissolve.start_s - t0)),
+            "{dissolve:?}"
+        );
+        assert!((2.9..=3.2).contains(&(dissolve.end_s - t0)), "{dissolve:?}");
+        assert!((first_cut.start_s - t0 - 5.0).abs() < 0.04, "{first_cut:?}");
+        assert!(
+            (second_cut.start_s - t0 - 7.0).abs() < 0.04,
+            "{second_cut:?}"
+        );
+        assert_eq!(shots.shots.len(), 4);
+        assert!((shots.shots[3].end_s - t0 - 10.0).abs() < 0.2, "{shots:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_shots_reads_the_ci_clips() {
+        for clip in ci_clips() {
+            let shots = detect_shots(&clip, &AtomicBool::new(false)).expect("shots");
+            assert!(!shots.shots.is_empty(), "{}", clip.display());
+            let duration = clip_duration_s(&clip).expect("duration");
+            let end = shots.shots.last().expect("a shot").end_s;
+            assert!(
+                (end - duration).abs() < 1.0,
+                "{}: {end} vs {duration}",
+                clip.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_shots_can_be_cancelled_and_reports_a_missing_file() {
+        let clip = repo().join("tests/clips/shots-edit.mp4");
+        assert_eq!(
+            detect_shots(&clip, &AtomicBool::new(true)),
+            Err(Error::Cancelled)
+        );
+        assert!(matches!(
+            detect_shots(
+                &repo().join("tests/clips/missing.mp4"),
+                &AtomicBool::new(false)
+            ),
+            Err(Error::Unreadable(_))
+        ));
     }
 }
