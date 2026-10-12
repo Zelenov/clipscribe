@@ -71,9 +71,40 @@ inherit them. This was rejected for the same reason as in `key-frames.md`.
 
 ## Measurement
 
-Neither repository has a real edit to test on. The owner's `ending.mp4` could not be downloaded
-here because the session's network policy blocks its host. So a test edit was built from the
-repository's test clips with FFmpeg, 30.3 s at 30 fps, with every event known to the frame:
+Two inputs: the owner's real edit, and a generated edit with traps.
+
+### The owner's edit (`ending.mp4`)
+
+The owner's `ending.mp4` is 16.1 s, 1080p at 29.97 fps, a fast travel montage. Looking at its
+frames gives 10 hard cuts: 1.80, 3.54, 9.64, 10.74, 11.64, 12.45, 13.31, 14.18, 15.08 and 16.05 s.
+From 10.7 s on, the cuts come every 0.8 to 0.9 s. Inside the shots there is a plane wing over
+fields, a city view, a person walking into frame, a handheld street shot and shaking hands, all
+motion that is not a cut. The file is not in the repository, because it is the owner's footage.
+
+| Method | Cuts found (of 10) | False cuts | Time |
+|---|---|---|---|
+| FFmpeg `scdet`, threshold 10 | 10, each on the exact frame | 0 | 2.7 s (1080p decode) |
+| First prototype (isolated spikes only) | 4 | 1 duplicate, plus 2 false dissolves (a person walking in, a shaking camera) | about 1 s |
+| Prototype (below) | 10, each on the exact frame | 0 | about 1 s (Python, 64×36) |
+
+Lessons from the first prototype:
+- an "isolated spike" rule alone fails on fast montages, because neighbouring cuts hide each other.
+  A score of 10 or more is always a cut; isolation is only needed for weak cuts;
+- a "middle frame is a blend of the ends" test accepts a person walking in. A dissolve changes
+  most of the frame by the same fraction, and that is what the test must check.
+
+Today's key frames on this edit send 9 frames:
+- the long 6 s city shot gets 3 of them, two of which are nearly the same picture;
+- 3 of the 10 shots get none (10.74–11.64, 12.45–13.31 and 15.08–16.05), so the model never sees
+  them.
+
+On a montage, sampling by time misses whole shots.
+
+### Generated edit
+
+To cover what the owner's edit does not have (a same-scene cut, a flash, a dissolve, a fade), a
+test edit was built from the repository's test clips with FFmpeg, 30.3 s at 30 fps, with every
+event known to the frame:
 
 | Time (s) | Event | What a detector should do |
 |---|---|---|
@@ -90,7 +121,7 @@ Results:
 |---|---|---|---|---|---|---|
 | FFmpeg `scdet`, threshold 10 | 7, each on the exact frame | missed (score 0.76) | 2 false cuts (42, 43) | ignored (scores 3 to 4) | not seen (max 0.06) | 0.26 s |
 | clipscribe key frames today | no cut list; frames land 0.07 s after 7 cuts | frame landed after it | missed by luck | ignored | one of the 16 frames is mid-dissolve (a mix of two pictures) | about 1 s |
-| Prototype (below) | 8, each on the exact frame | found | ignored | ignored | both found as gradual | 0.27 s (Python, 64×36) |
+| Prototype (below) | 8, each on the exact frame | found | ignored (flash rule) | ignored | dissolve 9.83–10.83, fade 22.33–23.30 | 0.3 s (Python, 64×36) |
 
 Today's 16 key frames on the test edit (`shot-detection/keyframes-today.jpg`):
 - frame 5 is the dissolve, a mix of two pictures;
@@ -119,24 +150,26 @@ and keeps only the 2 KB per frame. Then:
 
 Per frame `i`, with `d[i]` the MAFD of luma to frame `i−1`:
 - **score** = FFmpeg's `min(d[i], |d[i] − d[i−1]|)`, so steady motion is suppressed;
-- **cut:** score ≥ 0.5 and score ≥ 4 × the highest other score within ±1 s, ignoring `i±1`.
-  This is an isolated spike, the adaptive idea of PySceneDetect, measured against the neighbours'
-  maximum. It finds the same-scene cut (0.76 against about 0.01 around it) and rejects a pan's
-  jittery scores;
+- **cut:** the score is at least 10 (FFmpeg's default, which got every cut of the owner's fast
+  montage right); or the score is a weak but isolated spike. That means at least 0.5 and at least
+  4 × the highest other score within ±1 s, ignoring `i±1` and other cuts of 10 or more. This
+  follows the adaptive idea of PySceneDetect. It finds the same-scene cut (0.76 against about
+  0.01 around it) and rejects a pan's jittery scores of 3 to 4. Two cuts closer than the minimum
+  shot keep only the stronger one;
 - **flash:** a frame 1 to 4 frames after a spike is back within 35 % of the frame before it.
-  Ignore the flash and its return. On the test edit, the isolated-spike rule already rejected the
-  2-frame flash, because its in and out spikes are each other's neighbours. This rule is the
-  backstop for a flash that lasts longer;
+  Ignore the flash and its return;
 - **gradual transition:** frames 0.5 s apart differ by at least 5 while every single step is under
-  35 % of that, and the middle frame is close to a weighted mix of the two ends (blend error under
-  25 % of the span). The blend test is what separates a dissolve from a pan. It is a fade when one
-  end is near black;
-- **minimum shot:** 15 frames (0.5 s), as PySceneDetect does. A cut within a gradual transition
-  merges into it. The prototype still reports one extra cut at a dissolve's first frame; that is
-  the merge rule's job.
+  35 % of that. On an 8×8 grid, at least 60 % of the cells moved, and they moved by about the same
+  fraction of the way from one end to the other (the middle 60 % of the fractions lie within 0.3 of
+  each other, around 0.15–0.85). That separates a dissolve from a pan or a person walking in. No
+  cut of 10 or more may be within the range. It is a fade when one end is near black;
+- **minimum shot:** 15 frames (0.5 s), as PySceneDetect does. A weak cut at the start of a gradual
+  transition is its first step and merges into it.
 
-All thresholds are provisional. Tune them on real edits, starting with the owner's `ending.mp4`,
-and keep a few short real samples as test fixtures.
+All thresholds are provisional. They give a frame-exact result on both edits above, but need
+more real edits: raw camera footage (no cuts at all), night footage, strobes and whip-pans. The
+owner's `ending.mp4` stays outside the repository; keep its cut list as a known-answer test that
+runs when the file is present.
 
 ### 3. Shots as output
 
@@ -157,8 +190,12 @@ then:
    them (the sum of `d`), with extra frames spread within those shots;
 3. shots that look the same as an earlier shot share a frame. Use the 8×8 fingerprint distance
    that grouping already uses (`group_clips`), so three takes of the same Earth cost one frame;
-4. with more shots than budget, keep the longest and most different shots, and say so in the
-   result (`Description` notes "N short shots not sampled").
+4. with more shots than budget, raise the budget to one frame per shot, up to `MAX_FRAMES`. Today
+   the budget follows duration only: 9 frames for the owner's 16 s edit, which has 10 shots. One
+   more frame costs a fraction of a cent, while a missing shot is a part of the edit the model
+   never sees. Over `MAX_FRAMES`, keep the longest and most different shots, and say so in the
+   result (`Description` notes "N short shots not sampled"). `estimate_usage` must then count
+   shots, or price the cap, so the estimate stays an upper bound.
 
 The frames sent are labelled with their shot (`shot 3 of 11, 0:07.3–0:09.8`) in the request, so
 the model's moments can follow real shot boundaries. `important`-mode moments and the main range
