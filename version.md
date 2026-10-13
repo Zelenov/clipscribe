@@ -1,3 +1,10 @@
+# 0.14.0
+## Added
+- Command line: `clipscribe edit.mp4 --shots` lists the shots of an edited video (where the picture
+  cuts, dissolves or fades), or with `--json` prints `shots` and `transitions` for each video.
+  It runs on this computer: nothing is sent, no API key is needed. Frames chosen by shot come in a
+  later release.
+
 # 0.13.0
 ## Added
 - Library: `detect_shots(video, cancel)` finds the shots of an edited video: cuts to the frame,
