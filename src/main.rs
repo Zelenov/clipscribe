@@ -156,13 +156,14 @@ struct Cli {
 
     /// Find the shots of an edited video instead of describing it: where the picture cuts,
     /// dissolves or fades. Reads each video once on this computer; sends nothing, needs no API
-    /// key, costs nothing. With --json, an array with `shots` and `transitions` per video.
+    /// key, costs nothing. With --json, an array with `shots` and `transitions` per video. A video that cannot be read is named on
+    /// stderr and the exit code is 1; the others are still listed.
     #[arg(long, conflicts_with_all = SHOTS_CONFLICTS)]
     shots: bool,
 }
 
 /// The options that describe or price a video, which `--shots` (local, nothing sent) does not take.
-const SHOTS_CONFLICTS: [&str; 19] = [
+const SHOTS_CONFLICTS: [&str; 18] = [
     "provider",
     "api_key",
     "model",
@@ -171,7 +172,6 @@ const SHOTS_CONFLICTS: [&str; 19] = [
     "tags",
     "moments",
     "no_subtitles",
-    "quiet",
     "estimate",
     "resume",
     "force",
@@ -664,19 +664,17 @@ fn run_shots(videos: &[PathBuf], json: bool) -> ExitCode {
     }
 }
 
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
 fn print_shots(video: &Path, shots: &clipscribe::shots::Shots) {
     let name = video.file_name().unwrap_or(video.as_os_str());
     println!(
-        "{}  {} shot{} · {} transition{}",
+        "{}  {} · {}",
         name.to_string_lossy(),
-        shots.shots.len(),
-        if shots.shots.len() == 1 { "" } else { "s" },
-        shots.transitions.len(),
-        if shots.transitions.len() == 1 {
-            ""
-        } else {
-            "s"
-        },
+        plural(shots.shots.len(), "shot"),
+        plural(shots.transitions.len(), "transition"),
     );
     for (n, shot) in shots.shots.iter().enumerate() {
         let enters = shot.enters_by.map_or("start", |kind| kind.name());
@@ -1363,6 +1361,12 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use clipscribe::{
+        CacheKey, DescribedClip, Description, FileIdentity, FrameFingerprint, Segment, TagRange,
+        TagSuggestion, TagSuggestions,
+    };
+
     fn sample_shots() -> clipscribe::shots::Shots {
         use clipscribe::shots::{Shot, Shots, Transition, TransitionKind};
         Shots {
@@ -1421,12 +1425,6 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["clipscribe", "a.mp4", "--shots", "--estimate"]).is_err());
     }
-
-    use super::*;
-    use clipscribe::{
-        CacheKey, DescribedClip, Description, FileIdentity, FrameFingerprint, Segment, TagRange,
-        TagSuggestion, TagSuggestions,
-    };
 
     fn sample() -> ClipRecord {
         ClipRecord {
