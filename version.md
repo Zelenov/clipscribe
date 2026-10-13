@@ -1,3 +1,17 @@
+# 0.15.0
+## Added
+- Library: `FrameSampling::Shots` takes one frame from the middle of every shot of an edited video
+  instead of one per time window, so no shot of a montage goes unseen and none is wasted on a
+  dissolve; the frame budget is at least the number of shots (up to 60) and the rest goes to the
+  longest shots. It reads the clip once more to find the shots and is experimental: it is never
+  the default, and look-alike shots still get a frame each. `frame_budget`, `shot_times` and
+  `estimate_usage_sampled` price and plan it (a cost estimate assumes the most, 60 frames).
+- Command line: `--frames shots`; `--estimate` assumes 60 frames for it.
+
+## Changed
+- `FrameSampling` has a new variant, `Shots`: a `match` on it without a wildcard arm must handle
+  it (frename does not match on it).
+
 # 0.14.0
 ## Added
 - Command line: `clipscribe edit.mp4 --shots` lists the shots of an edited video (where the picture

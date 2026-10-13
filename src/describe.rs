@@ -137,6 +137,13 @@ pub enum FrameSampling {
     /// One frame every 2 s, at most [`MAX_FRAMES`] spread evenly over a longer clip — today's
     /// behaviour before key frames, kept for anyone who wants the old, predictable spacing.
     Interval,
+    /// One frame from the middle of every shot of an edited video (see
+    /// [`crate::shots`]), never from a cut, dissolve or fade; the budget is at least one frame per
+    /// shot (up to [`MAX_FRAMES`]) and what is left over goes to the longest shots. Costs one
+    /// extra pass over the clip ([`crate::detect_shots`], `frames` feature) and falls back to
+    /// `KeyFrames` when no shots are found. A cost estimate must assume [`MAX_FRAMES`] frames
+    /// ([`frame_budget`]), since the number of shots is known only after reading the clip.
+    Shots,
 }
 
 /// How many moments (segments) a description gets.
@@ -281,6 +288,57 @@ pub fn frame_count(duration_s: f64) -> usize {
     count_with(duration_s, FRAME_INTERVAL_S, MAX_FRAMES)
 }
 
+/// The most frames `sampling` can send from a clip `duration_s` long: [`frame_count`], or
+/// [`MAX_FRAMES`] for [`FrameSampling::Shots`] (an edit can have a shot every few frames).
+pub fn frame_budget(duration_s: f64, sampling: FrameSampling) -> usize {
+    match sampling {
+        FrameSampling::Shots => MAX_FRAMES,
+        _ => frame_count(duration_s),
+    }
+}
+
+/// Where to take the frames of an edit with `shots`, in time order: the middle of every shot, or
+/// of the longest [`MAX_FRAMES`] when there are more; with room left in the budget
+/// (`max(frame_count, shots)`, at most [`MAX_FRAMES`]), more frames go into the longest shots, at
+/// most one per [`FRAME_INTERVAL_S`] of shot. Empty when there are no shots.
+pub fn shot_times(shots: &crate::shots::Shots, duration_s: f64) -> Vec<f64> {
+    let mut spans: Vec<(f64, f64)> = shots
+        .shots
+        .iter()
+        .map(|s| (s.start_s, s.end_s.min(duration_s.max(s.end_s))))
+        .filter(|(a, b)| b > a)
+        .collect();
+    if spans.len() > MAX_FRAMES {
+        let mut by_length: Vec<usize> = (0..spans.len()).collect();
+        by_length.sort_by(|a, b| {
+            let (la, lb) = (spans[*a].1 - spans[*a].0, spans[*b].1 - spans[*b].0);
+            lb.total_cmp(&la).then(a.cmp(b))
+        });
+        by_length.truncate(MAX_FRAMES);
+        by_length.sort_unstable();
+        spans = by_length.into_iter().map(|i| spans[i]).collect();
+    }
+    let budget = frame_count(duration_s).max(spans.len()).min(MAX_FRAMES);
+    let mut counts = vec![1usize; spans.len()];
+    for _ in spans.len()..budget {
+        let best = (0..spans.len())
+            .filter(|i| (spans[*i].1 - spans[*i].0) / (counts[*i] + 1) as f64 >= FRAME_INTERVAL_S)
+            .max_by(|a, b| {
+                let rate = |i: usize| (spans[i].1 - spans[i].0) / counts[i] as f64;
+                rate(*a).total_cmp(&rate(*b)).then(b.cmp(a))
+            });
+        match best {
+            Some(i) => counts[i] += 1,
+            None => break,
+        }
+    }
+    spans
+        .iter()
+        .zip(&counts)
+        .flat_map(|((a, b), c)| (0..*c).map(move |k| a + (b - a) * (k as f64 + 0.5) / *c as f64))
+        .collect()
+}
+
 /// Candidates for `select_key_frames` to choose from: `CANDIDATE_OVERSAMPLE` times denser than
 /// [`sample_times`] and capped at that many times more of them, so every window
 /// `select_key_frames` picks one frame from has real choices in it. Below two frames' worth of
@@ -418,6 +476,21 @@ pub fn estimate_usage(model: Model, duration_s: f64, subtitle_bytes: usize) -> A
             + INSTRUCTION_TOKENS,
         output_tokens: model.answer_tokens,
     }
+}
+
+/// [`estimate_usage`] for a clip sampled with `sampling`: the upper bound of its frames
+/// ([`frame_budget`]).
+pub fn estimate_usage_sampled(
+    model: Model,
+    duration_s: f64,
+    subtitle_bytes: usize,
+    sampling: FrameSampling,
+) -> AiUsage {
+    let mut usage = estimate_usage(model, duration_s, subtitle_bytes);
+    let (w, h) = frame_size(1920, 1080);
+    let extra = frame_budget(duration_s, sampling).saturating_sub(frame_count(duration_s)) as u64;
+    usage.input_tokens += extra * frame_tokens(w, h);
+    usage
 }
 
 /// One sampled frame: where it is in the clip and its JPEG bytes.
@@ -1441,6 +1514,90 @@ mod tests {
         eprintln!(
             "--- tiled answer, important mode: repeated segments merged ---\nsegments: {:?}",
             d.segments
+        );
+    }
+
+    fn shots_of(spans: &[(f64, f64)]) -> crate::shots::Shots {
+        crate::shots::Shots {
+            shots: spans
+                .iter()
+                .map(|(a, b)| crate::shots::Shot {
+                    start_s: *a,
+                    end_s: *b,
+                    enters_by: None,
+                })
+                .collect(),
+            transitions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shot_times_take_the_middle_of_every_shot() {
+        let shots = shots_of(&[(0.0, 2.0), (2.0, 3.0), (4.0, 6.0)]);
+        assert_eq!(shot_times(&shots, 6.0), vec![1.0, 2.5, 5.0]);
+    }
+
+    #[test]
+    fn shot_times_give_one_frame_per_shot_even_over_the_duration_budget() {
+        // 5 s of footage would get 3 frames; 10 shots of 0.5 s each get 10.
+        let spans: Vec<(f64, f64)> = (0..10)
+            .map(|i| (i as f64 * 0.5, (i + 1) as f64 * 0.5))
+            .collect();
+        let times = shot_times(&shots_of(&spans), 5.0);
+        assert_eq!(times.len(), 10);
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn shot_times_spend_the_rest_of_the_budget_on_the_longest_shots() {
+        // 30 s: budget 15 frames for 2 shots. The 20 s shot gets what the 10 s one cannot use.
+        let shots = shots_of(&[(0.0, 20.0), (20.0, 30.0)]);
+        let times = shot_times(&shots, 30.0);
+        assert_eq!(times.len(), 15);
+        let in_long = times.iter().filter(|t| **t < 20.0).count();
+        assert!(in_long > times.len() - in_long, "{times:?}");
+        // At least FRAME_INTERVAL_S apart inside a shot, and inside the shot.
+        assert!(
+            times
+                .windows(2)
+                .all(|w| w[1] - w[0] >= FRAME_INTERVAL_S - 1e-9 || w[0] < 20.0 && w[1] >= 20.0),
+            "{times:?}"
+        );
+        assert!(times.iter().all(|t| *t > 0.0 && *t < 30.0));
+    }
+
+    #[test]
+    fn shot_times_keep_the_longest_shots_over_the_cap() {
+        let spans: Vec<(f64, f64)> = (0..70)
+            .map(|i| (i as f64, i as f64 + if i < 10 { 0.6 } else { 1.0 }))
+            .collect();
+        let times = shot_times(&shots_of(&spans), 70.0);
+        assert_eq!(times.len(), MAX_FRAMES);
+        // The ten shortest (0.6 s) are the ones dropped.
+        assert!(times.iter().all(|t| *t >= 10.0), "{times:?}");
+    }
+
+    #[test]
+    fn shot_times_are_empty_without_shots() {
+        assert!(shot_times(&crate::shots::Shots::default(), 10.0).is_empty());
+    }
+
+    #[test]
+    fn the_shots_estimate_assumes_the_most_frames() {
+        let model = MODELS[0];
+        let plain = estimate_usage(model, 20.0, 0);
+        let keyed = estimate_usage_sampled(model, 20.0, 0, FrameSampling::KeyFrames);
+        let shots = estimate_usage_sampled(model, 20.0, 0, FrameSampling::Shots);
+        assert_eq!(plain, keyed);
+        let (w, h) = frame_size(1920, 1080);
+        assert_eq!(
+            shots.input_tokens - plain.input_tokens,
+            (MAX_FRAMES - frame_count(20.0)) as u64 * frame_tokens(w, h)
+        );
+        assert_eq!(frame_budget(20.0, FrameSampling::Shots), MAX_FRAMES);
+        assert_eq!(
+            frame_budget(20.0, FrameSampling::Interval),
+            frame_count(20.0)
         );
     }
 

@@ -194,7 +194,9 @@ fn provider_for(
 /// fall back to an interval when the budget is one frame or none.
 #[cfg(feature = "frames")]
 fn picked(duration_s: f64, sampling: FrameSampling) -> &'static str {
-    if sampling == FrameSampling::KeyFrames && frame_count(duration_s) > 1 {
+    if sampling == FrameSampling::Shots {
+        "shot"
+    } else if sampling == FrameSampling::KeyFrames && frame_count(duration_s) > 1 {
         "key_frame"
     } else {
         "interval"
@@ -219,7 +221,8 @@ pub fn dump_clip_frames(
     if duration_s > MAX_DURATION_S {
         return Err(Error::TooLong(duration_s));
     }
-    let frames = match clip.sample(duration_s, sampling, cancel, |_, _| {}) {
+    let sampled = frames::sample_clip(video, &clip, duration_s, sampling, cancel, |_, _| {});
+    let frames = match sampled.map(|s| s.map(|s| s.frames)) {
         Ok(Some(frames)) if !frames.is_empty() => frames,
         Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
         Ok(None) => return Err(Error::Cancelled),
