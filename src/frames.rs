@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::describe::{
-    candidate_times, frame_count, frame_size, sample_times, select_key_frames, Frame,
+    candidate_times, frame_count, frame_size, sample_times, select_key_frames, shot_times, Frame,
     FrameSampling, FRAME_LONG_SIDE, MAX_DURATION_S,
 };
 use crate::shots::{find_shots, Shots, FRAME_HEIGHT, FRAME_WIDTH};
@@ -37,6 +37,38 @@ const JPEG_QUALITY: u8 = 80;
 pub(crate) struct Sampled {
     pub(crate) frames: Vec<Frame>,
     pub(crate) fingerprints: Vec<crate::FrameFingerprint>,
+}
+
+/// The frames of the clip at `video` (open as `clip`, `duration_s` long) for `sampling`. With
+/// [`FrameSampling::Shots`] this reads the clip once to find its shots ([`detect_shots`]) and
+/// takes a frame from the middle of each ([`shot_times`]); with no shots found it falls back to
+/// key frames.
+pub(crate) fn sample_clip(
+    video: &Path,
+    clip: &Clip,
+    duration_s: f64,
+    sampling: FrameSampling,
+    cancel: &AtomicBool,
+    mut on_frame: impl FnMut(usize, usize),
+) -> Result<Option<Sampled>, String> {
+    if sampling != FrameSampling::Shots {
+        return clip.sample_with_fingerprints(duration_s, sampling, cancel, on_frame);
+    }
+    let shots = match detect_shots(video, cancel) {
+        Ok(shots) => shots,
+        Err(Error::Cancelled) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let times = shot_times(&shots, duration_s);
+    if times.is_empty() {
+        return clip.sample_with_fingerprints(
+            duration_s,
+            FrameSampling::KeyFrames,
+            cancel,
+            on_frame,
+        );
+    }
+    clip.sample_at(&times, cancel, &mut on_frame)
 }
 
 /// A clip opened paused for sampling. Stopped when dropped.
@@ -300,6 +332,43 @@ impl Clip {
             });
             frames.push(Frame {
                 time_s,
+                jpeg: to_jpeg(upright)?,
+            });
+        }
+        Ok(Some(Sampled {
+            frames,
+            fingerprints,
+        }))
+    }
+
+    /// One frame at each of `times` (exact seeks, in order), for [`sample_clip`]. A time past the
+    /// end of the picture ends the list early; `Ok(None)` when `cancel` is set between two frames.
+    fn sample_at(
+        &self,
+        times: &[f64],
+        cancel: &AtomicBool,
+        on_frame: &mut impl FnMut(usize, usize),
+    ) -> Result<Option<Sampled>, String> {
+        let orientation = self.orientation();
+        let mut frames = Vec::with_capacity(times.len());
+        let mut fingerprints = Vec::with_capacity(times.len());
+        for (i, time_s) in times.iter().enumerate() {
+            on_frame(i, times.len());
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let (pts, image) = match self.frame_at(*time_s, gst::SeekFlags::ACCURATE) {
+                Ok(frame) => frame,
+                Err(_) if !frames.is_empty() => break,
+                Err(e) => return Err(e),
+            };
+            let upright = orient(image, orientation.as_deref());
+            fingerprints.push(crate::FrameFingerprint {
+                time_s: pts,
+                fingerprint: fingerprint(&upright),
+            });
+            frames.push(Frame {
+                time_s: pts,
                 jpeg: to_jpeg(upright)?,
             });
         }
@@ -1095,6 +1164,49 @@ mod tests {
                 assert_eq!(fp[gy * 8 + gx], 255);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shots_sampling_takes_one_frame_from_inside_every_shot() {
+        let path = repo().join("tests/clips/shots-edit.mp4");
+        let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+        let duration = clip.duration_s().expect("duration");
+        let cancel = AtomicBool::new(false);
+        let shots = detect_shots(&path, &cancel).expect("shots");
+        let sampled = sample_clip(
+            &path,
+            &clip,
+            duration,
+            FrameSampling::Shots,
+            &cancel,
+            |_, _| {},
+        )
+        .expect("frames")
+        .expect("not cancelled");
+        assert_eq!(sampled.frames.len(), shots.shots.len());
+        assert_eq!(sampled.fingerprints.len(), sampled.frames.len());
+        for (frame, shot) in sampled.frames.iter().zip(&shots.shots) {
+            assert!(
+                frame.time_s >= shot.start_s - 0.05 && frame.time_s <= shot.end_s + 0.05,
+                "frame at {:.2} outside shot {:.2}–{:.2}",
+                frame.time_s,
+                shot.start_s,
+                shot.end_s
+            );
+        }
+        // Cancelled before the first frame.
+        let stop = AtomicBool::new(true);
+        assert!(sample_clip(
+            &path,
+            &clip,
+            duration,
+            FrameSampling::Shots,
+            &stop,
+            |_, _| {}
+        )
+        .expect("no error")
+        .is_none());
     }
 
     /// `tests/clips/shots-edit.mp4`: 3 s of test pattern dissolving into a fractal from 2 to 3 s,

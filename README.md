@@ -18,7 +18,11 @@ out, even for clips with no speech.
   equal windows as the frame budget, and the one frame kept from each is wherever the picture
   changes the most in it, so a static shot spends no more of the budget than a clip that keeps
   cutting to something new. `FrameSampling::Interval` goes back to one frame every 2 s, spread
-  evenly on a longer clip.
+  evenly on a longer clip. `FrameSampling::Shots` (experimental, for edited videos) reads the clip
+  once to find its shots (see *Shots of an edit*) and takes one frame from the middle of every
+  shot, never from a cut or a dissolve, and spends what is left of the 60 on the longest shots.
+  Its cost is known only after that pass, so `estimate_usage_sampled(model, duration_s,
+  subtitle_bytes, sampling)` prices it at the most, 60 frames.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
   description knows what is said.
 - One request goes to Claude (Anthropic) or ChatGPT (OpenAI); the answer is structured JSON, and

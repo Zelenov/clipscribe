@@ -11,11 +11,12 @@ use std::sync::Mutex;
 
 use clap::{ArgGroup, Parser, ValueEnum};
 use clipscribe::{
-    cache_path, describe_folder, describe_moment, estimate_tags_usage, estimate_usage, find_videos,
-    format_time, frames, group_clips, parse_vocabulary, serve_after_stop, srt, AiUsage, Budget,
-    Cache, ClipGroups, ClipOutcome, ClipRecord, DescribedMoment, Error, FolderEvent, FrameSampling,
-    GroupOptions, Grouping, Model, MomentsMode, Options, Provider, RunOptions, Stop,
-    SummaryLanguage, Tag, DEFAULT_JOBS, MAX_DURATION_S, MODELS, MOMENT_WINDOW_S,
+    cache_path, describe_folder, describe_moment, estimate_tags_usage, estimate_usage,
+    estimate_usage_sampled, find_videos, format_time, frames, group_clips, parse_vocabulary,
+    serve_after_stop, srt, AiUsage, Budget, Cache, ClipGroups, ClipOutcome, ClipRecord,
+    DescribedMoment, Error, FolderEvent, FrameSampling, GroupOptions, Grouping, Model, MomentsMode,
+    Options, Provider, RunOptions, Stop, SummaryLanguage, Tag, DEFAULT_JOBS, MAX_DURATION_S,
+    MODELS, MOMENT_WINDOW_S,
 };
 use serde_json::json;
 
@@ -54,8 +55,10 @@ struct Cli {
     #[arg(long, default_value = "subtitles", value_parser = parse_language)]
     language: SummaryLanguage,
 
-    /// How frames are chosen: keyframes (where the picture changes the most, at most 60) or
-    /// interval (one every 2 s, at most 60, spread evenly over a longer clip).
+    /// How frames are chosen: keyframes (where the picture changes the most, at most 60),
+    /// interval (one every 2 s, at most 60, spread evenly over a longer clip) or shots (EXPERIMENTAL
+    /// — for an edited video: one frame from the middle of every shot, more for the longest, at
+    /// most 60; reads the clip one more time to find the shots; --estimate assumes 60 frames).
     #[arg(long, value_enum, default_value_t = FramesArg::Keyframes)]
     frames: FramesArg,
 
@@ -324,6 +327,7 @@ enum GroupsArg {
 enum FramesArg {
     Keyframes,
     Interval,
+    Shots,
 }
 
 impl FramesArg {
@@ -331,6 +335,7 @@ impl FramesArg {
         match self {
             Self::Keyframes => FrameSampling::KeyFrames,
             Self::Interval => FrameSampling::Interval,
+            Self::Shots => FrameSampling::Shots,
         }
     }
 }
@@ -425,6 +430,7 @@ fn main() -> ExitCode {
             model,
             cli.no_subtitles,
             vocabulary.as_deref(),
+            cli.frames.sampling(),
             dump,
         );
     }
@@ -478,7 +484,13 @@ fn main() -> ExitCode {
         };
         batches.push((cache, range));
     }
-    let run_plan = plan_run(&videos, model, cli.no_subtitles, vocabulary.as_deref());
+    let run_plan = plan_run(
+        &videos,
+        model,
+        cli.no_subtitles,
+        vocabulary.as_deref(),
+        cli.frames.sampling(),
+    );
     let batch = Batch::new(model, videos.len(), run_plan.plan.footage_s, cli.quiet);
     batch.plan(&run_plan.plan);
     let run = RunOptions {
@@ -937,6 +949,7 @@ fn estimate_clip(
     model: Model,
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
+    sampling: FrameSampling,
 ) -> Estimated {
     let Some(duration_s) = frames::clip_duration_s(video) else {
         return Estimated::Unreadable;
@@ -949,12 +962,15 @@ fn estimate_clip(
     } else {
         std::fs::metadata(srt::subtitle_path(video)).map_or(0, |m| m.len() as usize)
     };
-    let usage = match vocabulary {
+    let mut usage = match vocabulary {
         Some(vocabulary) => {
             estimate_tags_usage(model, duration_s, subtitle_bytes, vocabulary, None)
         }
         None => estimate_usage(model, duration_s, subtitle_bytes),
     };
+    // Frames beyond the usual budget (`--frames shots` assumes the most it can send).
+    usage.input_tokens += estimate_usage_sampled(model, duration_s, 0, sampling).input_tokens
+        - estimate_usage(model, duration_s, 0).input_tokens;
     Estimated::Ready { duration_s, usage }
 }
 
@@ -975,6 +991,7 @@ fn plan_run(
     model: Model,
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
+    sampling: FrameSampling,
 ) -> RunPlan {
     let mut plan = Plan {
         videos: videos.len(),
@@ -988,7 +1005,7 @@ fn plan_run(
     let mut clips = Vec::new();
     for video in videos {
         clips.push(
-            match estimate_clip(video, model, no_subtitles, vocabulary) {
+            match estimate_clip(video, model, no_subtitles, vocabulary, sampling) {
                 Estimated::Unreadable => {
                     plan.unreadable += 1;
                     Clip { duration_s: 0.0 }
@@ -1015,28 +1032,30 @@ fn estimate(
     model: Model,
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
+    sampling: FrameSampling,
     dump: Option<(&Path, FrameSampling)>,
 ) -> ExitCode {
     let mut total = AiUsage::default();
     let mut unreadable = 0;
     for video in videos {
-        let (duration_s, usage) = match estimate_clip(video, model, no_subtitles, vocabulary) {
-            Estimated::Unreadable => {
-                println!("{}: could not be read", video.display());
-                unreadable += 1;
-                continue;
-            }
-            Estimated::TooLong(duration_s) => {
-                println!(
-                    "{}: {}, over the {} limit",
-                    video.display(),
-                    format_time(duration_s),
-                    format_time(MAX_DURATION_S)
-                );
-                continue;
-            }
-            Estimated::Ready { duration_s, usage } => (duration_s, usage),
-        };
+        let (duration_s, usage) =
+            match estimate_clip(video, model, no_subtitles, vocabulary, sampling) {
+                Estimated::Unreadable => {
+                    println!("{}: could not be read", video.display());
+                    unreadable += 1;
+                    continue;
+                }
+                Estimated::TooLong(duration_s) => {
+                    println!(
+                        "{}: {}, over the {} limit",
+                        video.display(),
+                        format_time(duration_s),
+                        format_time(MAX_DURATION_S)
+                    );
+                    continue;
+                }
+                Estimated::Ready { duration_s, usage } => (duration_s, usage),
+            };
         total += usage;
         println!(
             "{}: {}, about ${:.4}",

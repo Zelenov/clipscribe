@@ -138,6 +138,7 @@ impl CacheKey {
         let frames = match options.frame_sampling {
             FrameSampling::KeyFrames => "keyframes",
             FrameSampling::Interval => "interval",
+            FrameSampling::Shots => "shots",
         };
         let moments = match options.moments {
             MomentsMode::Important => "important",
@@ -608,7 +609,12 @@ mod tests {
             model: Model::from_id("claude-sonnet-5"),
             ..options()
         };
+        let by_shots = Options {
+            frame_sampling: FrameSampling::Shots,
+            ..options()
+        };
         let variants = [
+            CacheKey::new(&video, &by_shots, None, true),
             CacheKey::new(&video, &other_model, None, true),
             CacheKey::new(&video, &options(), None, false),
             CacheKey::new(

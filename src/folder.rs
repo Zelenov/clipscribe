@@ -631,7 +631,7 @@ mod run {
         if duration_s > MAX_DURATION_S {
             return Err(Error::TooLong(duration_s));
         }
-        match clip.sample_with_fingerprints(duration_s, sampling, cancel, |done, total| {
+        match frames::sample_clip(video, &clip, duration_s, sampling, cancel, |done, total| {
             on_stage(Stage::Frame { done, total })
         }) {
             Ok(Some(sampled)) if !sampled.frames.is_empty() => {
