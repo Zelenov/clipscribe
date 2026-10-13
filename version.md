@@ -1,4 +1,4 @@
-# NEXT
+# 0.15.0
 ## Added
 - Library: `FrameSampling::Shots` takes one frame from the middle of every shot of an edited video
   instead of one per time window, so no shot of a montage goes unseen and none is wasted on a
