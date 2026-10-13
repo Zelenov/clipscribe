@@ -1,4 +1,4 @@
-# NEXT
+# 0.14.0
 ## Added
 - Command line: `clipscribe edit.mp4 --shots` lists the shots of an edited video (where the picture
   cuts, dissolves or fades), or with `--json` prints `shots` and `transitions` for each video.
