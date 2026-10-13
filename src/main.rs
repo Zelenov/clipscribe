@@ -153,7 +153,36 @@ struct Cli {
     /// far enough to show which way it is moving.
     #[arg(long, requires = "at")]
     window: Option<f64>,
+
+    /// Find the shots of an edited video instead of describing it: where the picture cuts,
+    /// dissolves or fades. Reads each video once on this computer; sends nothing, needs no API
+    /// key, costs nothing. With --json, an array with `shots` and `transitions` per video.
+    #[arg(long, conflicts_with_all = SHOTS_CONFLICTS)]
+    shots: bool,
 }
+
+/// The options that describe or price a video, which `--shots` (local, nothing sent) does not take.
+const SHOTS_CONFLICTS: [&str; 19] = [
+    "provider",
+    "api_key",
+    "model",
+    "language",
+    "frames",
+    "tags",
+    "moments",
+    "no_subtitles",
+    "quiet",
+    "estimate",
+    "resume",
+    "force",
+    "cache_dir",
+    "groups",
+    "jobs",
+    "max_cost",
+    "dump_frames",
+    "at",
+    "window",
+];
 
 /// The options of a run over whole clips, which neither --at nor --estimate takes.
 const FOLDER_RUN_ARGS: [&str; 6] = ["resume", "force", "cache_dir", "groups", "jobs", "max_cost"];
@@ -362,6 +391,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if cli.shots {
+        return run_shots(&videos, cli.json);
+    }
     let model = match resolve_model(cli.model, cli.provider) {
         Ok(model) => model,
         Err(e) => {
@@ -597,6 +629,80 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `--shots`: the shots of each video, as text or as a JSON array. A video that cannot be read
+/// is reported on stderr and the exit code is a failure, but the others are still done.
+fn run_shots(videos: &[PathBuf], json: bool) -> ExitCode {
+    let _ = ctrlc::set_handler(|| CANCEL.store(true, Ordering::Relaxed));
+    let mut failed = false;
+    let mut results = Vec::new();
+    for video in videos {
+        if CANCEL.load(Ordering::Relaxed) {
+            failed = true;
+            break;
+        }
+        match clipscribe::detect_shots(video, &CANCEL) {
+            Ok(shots) if json => results.push(shots_to_json(video, &shots)),
+            Ok(shots) => print_shots(video, &shots),
+            Err(e) => {
+                eprintln!("error: {}: {e}", video.display());
+                failed = true;
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&results).unwrap_or_default()
+        );
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn print_shots(video: &Path, shots: &clipscribe::shots::Shots) {
+    let name = video.file_name().unwrap_or(video.as_os_str());
+    println!(
+        "{}  {} shot{} · {} transition{}",
+        name.to_string_lossy(),
+        shots.shots.len(),
+        if shots.shots.len() == 1 { "" } else { "s" },
+        shots.transitions.len(),
+        if shots.transitions.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+    );
+    for (n, shot) in shots.shots.iter().enumerate() {
+        let enters = shot.enters_by.map_or("start", |kind| kind.name());
+        println!(
+            "  {:>3}  {:>7.2} – {:>7.2} s  {enters}",
+            n + 1,
+            shot.start_s,
+            shot.end_s
+        );
+    }
+}
+
+fn shots_to_json(video: &Path, shots: &clipscribe::shots::Shots) -> serde_json::Value {
+    json!({
+        "video": video.to_string_lossy(),
+        "shots": shots.shots.iter().map(|s| json!({
+            "start_s": s.start_s,
+            "end_s": s.end_s,
+            "enters_by": s.enters_by.map(|kind| kind.name()),
+        })).collect::<Vec<_>>(),
+        "transitions": shots.transitions.iter().map(|t| json!({
+            "kind": t.kind.name(),
+            "start_s": t.start_s,
+            "end_s": t.end_s,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// What to say when a run stopped at `--max-cost`, and what to do next: `spent_usd` is what this
@@ -1257,6 +1363,65 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
+    fn sample_shots() -> clipscribe::shots::Shots {
+        use clipscribe::shots::{Shot, Shots, Transition, TransitionKind};
+        Shots {
+            shots: vec![
+                Shot {
+                    start_s: 0.0,
+                    end_s: 4.0,
+                    enters_by: None,
+                },
+                Shot {
+                    start_s: 4.0,
+                    end_s: 9.83,
+                    enters_by: Some(TransitionKind::Cut),
+                },
+                Shot {
+                    start_s: 10.83,
+                    end_s: 12.0,
+                    enters_by: Some(TransitionKind::Dissolve),
+                },
+            ],
+            transitions: vec![
+                Transition {
+                    kind: TransitionKind::Cut,
+                    start_s: 4.0,
+                    end_s: 4.0,
+                },
+                Transition {
+                    kind: TransitionKind::Dissolve,
+                    start_s: 9.83,
+                    end_s: 10.83,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn shots_to_json_lists_shots_and_transitions() {
+        let json = shots_to_json(Path::new("edit.mp4"), &sample_shots());
+        assert_eq!(json["video"], "edit.mp4");
+        assert_eq!(json["shots"].as_array().unwrap().len(), 3);
+        assert!(json["shots"][0]["enters_by"].is_null());
+        assert_eq!(json["shots"][1]["enters_by"], "cut");
+        assert_eq!(json["shots"][2]["start_s"], 10.83);
+        assert_eq!(json["transitions"][1]["kind"], "dissolve");
+        assert_eq!(json["transitions"][1]["end_s"], 10.83);
+    }
+
+    #[test]
+    fn shots_conflicts_name_real_arguments() {
+        // A mistyped id would make clap panic in debug builds when the command is built.
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        assert!(Cli::try_parse_from(["clipscribe", "a.mp4", "--shots", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["clipscribe", "a.mp4", "--shots", "--model", "haiku"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["clipscribe", "a.mp4", "--shots", "--estimate"]).is_err());
+    }
+
     use super::*;
     use clipscribe::{
         CacheKey, DescribedClip, Description, FileIdentity, FrameFingerprint, Segment, TagRange,

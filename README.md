@@ -124,6 +124,11 @@ without cuts is one shot. A clip over 30 minutes is refused, as for `describe`.
 `shots::find_shots` does the same on frames you decoded yourself, and works without the `frames`
 feature.
 
+On the command line, `clipscribe edit.mp4 --shots` prints the shots and how each begins; with
+`--json` it prints an array with `shots` and `transitions` for each video. It reads the video on
+this computer only: nothing is sent, so it needs no API key, and it takes none of the options that
+describe or price a video.
+
 ### Whole folders
 
 `describe_folder` describes many clips in one call, several at once, and can resume a stopped
