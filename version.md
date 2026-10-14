@@ -1,4 +1,4 @@
-# NEXT
+# 0.16.0
 ## Added
 - Library: `Options::instructions` takes your own notes about the footage (names to use, things to
   mark as moments, tags to suggest), up to 2000 characters. They are added to the request of
