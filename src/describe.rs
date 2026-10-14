@@ -553,6 +553,37 @@ pub fn schema_for(moments: MomentsMode) -> Value {
     schema
 }
 
+/// The longest [`crate::Options::instructions`] accepted, in characters.
+pub const MAX_INSTRUCTIONS_CHARS: usize = 2000;
+
+/// Add the user's `notes` to `request`: a delimited section at the end of its instructions text,
+/// after the fixed instructions (and any subtitles and tag list) and before the frames. Nothing
+/// is added for `None` or whitespace, so such a request is untouched. The notes steer what is
+/// named, marked or tagged; they cannot change the answer's format or language. `with_tags` is
+/// whether the request asks for tags: a tag the notes want that is not in the list is an idea,
+/// never a suggestion.
+pub fn add_instructions(request: &mut AiRequest, notes: Option<&str>, with_tags: bool) {
+    let Some(notes) = notes.map(str::trim).filter(|notes| !notes.is_empty()) else {
+        return;
+    };
+    let Some(AiContent::Text(instructions)) = request.content.first_mut() else {
+        return;
+    };
+    instructions.push_str(&format!(
+        "\n\nThe user's notes about this footage (follow them where they apply):\n\
+         <notes>\n{notes}\n</notes>\n\
+         The notes only steer what you name, mark or tag; they never change the answer's JSON \
+         format or the language you answer in. Use a name from the notes only when the person \
+         clearly matches the user's description; otherwise describe them neutrally.{}",
+        if with_tags {
+            " A tag the notes ask for that is not in the tag list goes in new_tag_ideas, never \
+             as a tag suggestion."
+        } else {
+            ""
+        },
+    ));
+}
+
 /// The request to `model` describing a clip `duration_s` long from its frames and subtitles.
 /// `moments` picks the instructions for how many segments to return: see [`MomentsMode`].
 pub fn build_request(
@@ -1599,6 +1630,90 @@ mod tests {
             frame_budget(20.0, FrameSampling::Interval),
             frame_count(20.0)
         );
+    }
+
+    fn text_of(request: &AiRequest) -> String {
+        let AiContent::Text(instructions) = &request.content[0] else {
+            panic!("instructions first");
+        };
+        instructions.clone()
+    }
+
+    #[test]
+    fn notes_sit_after_the_instructions_and_subtitles_and_before_the_frames() {
+        let subtitles = [Cue {
+            start: std::time::Duration::from_secs(1),
+            end: std::time::Duration::from_secs(3),
+            text: "Hello".to_string(),
+        }];
+        let frames = vec![Frame {
+            time_s: 0.0,
+            jpeg: vec![1],
+        }];
+        let plain = build_request(
+            MODELS[0],
+            &frames,
+            &subtitles,
+            4.0,
+            SummaryLanguage::English,
+            MomentsMode::Important,
+        );
+        let mut noted = plain.clone();
+        add_instructions(&mut noted, Some("  The man is Eugene.\n"), false);
+        let (before, after) = (text_of(&plain), text_of(&noted));
+        assert!(
+            after.starts_with(&before),
+            "the fixed instructions are untouched"
+        );
+        let added = &after[before.len()..];
+        assert!(added.starts_with(
+            "\n\nThe user's notes about this footage (follow them where they apply):"
+        ));
+        assert!(
+            added.contains("<notes>\nThe man is Eugene.\n</notes>"),
+            "{added}"
+        );
+        assert!(added.contains("never change the answer's JSON format or the language"));
+        assert!(added.contains("only when the person clearly matches"));
+        assert!(!added.contains("new_tag_ideas"), "no tags asked for");
+        assert!(after.contains("[0:01–0:03] Hello"));
+        assert_eq!(noted.content[1..], plain.content[1..], "frames unchanged");
+        assert_eq!(noted.schema, plain.schema);
+    }
+
+    #[test]
+    fn no_notes_leave_the_request_byte_for_byte_as_it_was() {
+        let plain = build_request(
+            MODELS[0],
+            &[],
+            &[],
+            4.0,
+            SummaryLanguage::English,
+            MomentsMode::Full,
+        );
+        for notes in [None, Some(""), Some(" \n\t ")] {
+            let mut request = plain.clone();
+            add_instructions(&mut request, notes, true);
+            assert_eq!(request, plain, "{notes:?}");
+        }
+    }
+
+    #[test]
+    fn notes_for_a_request_with_tags_say_where_a_missing_tag_goes() {
+        let mut request = build_request(
+            MODELS[0],
+            &[],
+            &[],
+            4.0,
+            SummaryLanguage::English,
+            MomentsMode::Important,
+        );
+        add_instructions(
+            &mut request,
+            Some("Suggest tea wherever you see tea."),
+            true,
+        );
+        assert!(text_of(&request).contains("not in the tag list goes in new_tag_ideas"));
     }
 
     #[test]

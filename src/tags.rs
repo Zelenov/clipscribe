@@ -480,6 +480,42 @@ mod tests {
     }
 
     #[test]
+    fn a_mock_answer_that_follows_a_note_names_marks_and_suggests() {
+        // Notes: "the man is Eugene", "mark the moon", "suggest tea wherever you see tea" (tea is
+        // not in the vocabulary, so it comes back as an idea, never as a suggestion).
+        let response = AiResponse {
+            json: json!({
+                "summary": "Eugene pours a drink.",
+                "segments": [{"start_s": 4.0, "end_s": 6.0, "description": "The moon rises."}],
+                "tags": [
+                    {"name": "Indoor", "confidence": 0.9, "ranges": []},
+                    {"name": "Tea", "confidence": 0.8, "ranges": []}
+                ],
+                "new_tag_ideas": ["tea"]
+            }),
+            stop_reason: "end_turn".to_string(),
+            usage: AiUsage::default(),
+        };
+        let (description, tags) = parse_combined_answer(
+            &response,
+            10.0,
+            &vocabulary(),
+            describe::MomentsMode::Important,
+        )
+        .expect("parses");
+        assert!(description.summary.contains("Eugene"));
+        assert_eq!(description.segments.len(), 1);
+        assert_eq!(
+            tags.tags
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Indoor"]
+        );
+        assert_eq!(tags.new_tag_ideas, ["tea"]);
+    }
+
+    #[test]
     fn the_tags_only_request_carries_the_description_and_no_images() {
         let description = Description {
             summary: "A walk in the park.".to_string(),

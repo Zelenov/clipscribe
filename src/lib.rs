@@ -17,6 +17,7 @@
 //!     language: SummaryLanguage::English,
 //!     frame_sampling: FrameSampling::KeyFrames,
 //!     moments: MomentsMode::Important,
+//!     instructions: None,
 //! };
 //! let described = describe("clip.mp4".as_ref(), &[], &options, &AtomicBool::new(false), |_| {})
 //!     .expect("described");
@@ -89,6 +90,30 @@ pub struct Options {
     pub frame_sampling: FrameSampling,
     /// How many moments (segments) a description gets; see [`MomentsMode`].
     pub moments: MomentsMode,
+    /// The user's own notes about the footage, added to the request of [`describe`],
+    /// [`describe_with_tags`], [`suggest_tags`] and [`describe_moment`]: names to use, things
+    /// to mark as moments, tags to suggest. `None` (or only whitespace) leaves every request
+    /// exactly as it is without them. At most [`MAX_INSTRUCTIONS_CHARS`] characters, otherwise
+    /// those functions return [`Error::InstructionsTooLong`] before anything is sent. They count
+    /// in the price of a request: add their length to `subtitle_bytes` of [`estimate_usage`].
+    pub instructions: Option<String>,
+}
+
+impl Options {
+    /// `Ok` when [`Options::instructions`] fits [`MAX_INSTRUCTIONS_CHARS`].
+    pub fn check_instructions(&self) -> Result<(), Error> {
+        match self
+            .instructions
+            .as_deref()
+            .map(|notes| notes.trim().chars().count())
+        {
+            Some(chars) if chars > MAX_INSTRUCTIONS_CHARS => Err(Error::InstructionsTooLong {
+                chars,
+                max: MAX_INSTRUCTIONS_CHARS,
+            }),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Options {
@@ -100,6 +125,14 @@ impl std::fmt::Debug for Options {
             .field("language", &self.language)
             .field("frame_sampling", &self.frame_sampling)
             .field("moments", &self.moments)
+            // The notes are the user's own: only their length goes to a log.
+            .field(
+                "instructions_chars",
+                &self
+                    .instructions
+                    .as_ref()
+                    .map(|notes| notes.chars().count()),
+            )
             .finish()
     }
 }
@@ -148,6 +181,8 @@ pub enum Error {
     Ai(AiError),
     /// An answer came (and was billed) but could not be used.
     BadAnswer { reason: String, usage: AiUsage },
+    /// [`Options::instructions`] is longer than `max` characters; nothing was sent.
+    InstructionsTooLong { chars: usize, max: usize },
 }
 
 impl std::fmt::Display for Error {
@@ -163,6 +198,10 @@ impl std::fmt::Display for Error {
             ),
             Self::Ai(error) => f.write_str(&error.reason()),
             Self::BadAnswer { reason, .. } => f.write_str(reason),
+            Self::InstructionsTooLong { chars, max } => write!(
+                f,
+                "the instructions are {chars} characters, longer than the {max} limit"
+            ),
         }
     }
 }
@@ -175,6 +214,7 @@ fn provider_for(
     options: &Options,
     gate: Option<std::sync::Arc<provider::RateGate>>,
 ) -> Result<Box<dyn provider::AiProvider>, Error> {
+    options.check_instructions()?;
     let key = options.api_key.clone();
     match options.model.provider {
         Provider::Anthropic => Ok(Box::new(
@@ -329,14 +369,15 @@ pub fn suggest_tags(
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<TagSuggestions, Error> {
-    let request = build_tags_only_request(
+    let provider = provider_for(options, None)?;
+    let mut request = build_tags_only_request(
         options.model,
         description,
         subtitles,
         vocabulary,
         duration_s,
     );
-    let provider = provider_for(options, None)?;
+    add_instructions(&mut request, options.instructions.as_deref(), true);
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
@@ -413,6 +454,7 @@ fn describe_moment_with<'p>(
     mut on_stage: impl FnMut(Stage),
     provider: impl FnOnce() -> Result<Box<dyn provider::AiProvider + 'p>, Error>,
 ) -> Result<DescribedMoment, Error> {
+    options.check_instructions()?;
     let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
     let frames = match clip.sample_moment(at_s, window_s, cancel) {
         Ok(Some(frames)) if !frames.is_empty() => frames,
@@ -427,7 +469,7 @@ fn describe_moment_with<'p>(
         &frames,
         "moment",
     );
-    let request = build_moment_request(
+    let mut request = build_moment_request(
         options.model,
         &frames,
         subtitles,
@@ -435,6 +477,7 @@ fn describe_moment_with<'p>(
         window_s,
         options.language,
     );
+    add_instructions(&mut request, options.instructions.as_deref(), false);
     let provider = provider()?;
     on_stage(Stage::Asking {
         provider: options.model.provider,
@@ -475,6 +518,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let result = describe(&fake, &[], &options, &AtomicBool::new(false), |_| {});
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
@@ -494,6 +538,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let vocabulary = vec![Tag {
             name: "Goat".to_string(),
@@ -554,6 +599,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         }
     }
 
@@ -604,6 +650,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn instructions_up_to_the_cap_are_fine_and_longer_ones_are_an_error() {
+        let options = |chars: usize| Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: Some("é".repeat(chars)),
+        };
+        assert_eq!(options(MAX_INSTRUCTIONS_CHARS).check_instructions(), Ok(()));
+        let too_long = options(MAX_INSTRUCTIONS_CHARS + 1);
+        assert_eq!(
+            too_long.check_instructions(),
+            Err(Error::InstructionsTooLong {
+                chars: MAX_INSTRUCTIONS_CHARS + 1,
+                max: MAX_INSTRUCTIONS_CHARS
+            })
+        );
+        // Before any provider is made, so before any request.
+        assert!(matches!(
+            provider_for(&too_long, None),
+            Err(Error::InstructionsTooLong { .. })
+        ));
+        let message = Error::InstructionsTooLong {
+            chars: 2001,
+            max: 2000,
+        }
+        .to_string();
+        assert!(
+            message.contains("2001") && message.contains("2000"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_debug_output_keeps_the_key_and_the_notes_out() {
+        let options = Options {
+            api_key: "sk-secret".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: Some("The man is Eugene.".to_string()),
+        };
+        let shown = format!("{options:?}");
+        assert!(
+            !shown.contains("sk-secret") && !shown.contains("Eugene"),
+            "{shown}"
+        );
+    }
+
     /// A clip that cannot be read never reaches the request, so it is never "released".
     #[cfg(feature = "frames")]
     #[test]
@@ -619,6 +717,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let mut stages = Vec::new();
         let result = describe_moment_notifying(
@@ -672,6 +771,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let debug = format!("{options:?}");
         assert!(!debug.contains("secret"));
@@ -699,6 +799,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
             Ok(described) => described,
@@ -749,6 +850,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
             Ok(described) => described,
