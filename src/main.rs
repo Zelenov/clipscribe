@@ -932,12 +932,15 @@ fn load_instructions(text: Option<&str>, file: Option<&Path>) -> Result<Option<S
             .map_err(|e| format!("cannot read --instructions-file {}: {e}", path.display()))?,
         (None, None) => return Ok(None),
     };
-    let text = text.trim();
+    // A file saved with a byte order mark (Notepad does) must not send it to the model.
+    let text = text.trim_start_matches('\u{feff}').trim();
     let chars = text.chars().count();
     if chars > MAX_INSTRUCTIONS_CHARS {
-        return Err(format!(
-            "the instructions are {chars} characters, longer than the {MAX_INSTRUCTIONS_CHARS} limit"
-        ));
+        return Err(Error::InstructionsTooLong {
+            chars,
+            max: MAX_INSTRUCTIONS_CHARS,
+        }
+        .to_string());
     }
     Ok((!text.is_empty()).then(|| text.to_string()))
 }

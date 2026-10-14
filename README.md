@@ -79,8 +79,8 @@ println!("${:.4}", options.model.cost_usd(described.usage));
 
 Everything blocks: call it from a worker thread. `describe` fails with `Error::Cancelled`,
 `Unreadable`, `TooLong`, `InstructionsTooLong`, `Ai(AiError)` (rejected key, no credit, limits,
-network, timeout) or `BadAnswer` (billed, but not usable). `estimate_usage` and `Model::cost_usd` price a clip
-before sending it; `frames::clip_duration_s` reads its length.
+network, timeout) or `BadAnswer` (billed, but not usable). `estimate_usage` and
+`Model::cost_usd` price a clip before sending it; `frames::clip_duration_s` reads its length.
 
 Every entry of `MODELS` carries its `Provider` (`Anthropic` or `OpenAi`); `options.api_key` is
 read against whichever provider `options.model` belongs to, so switching to a GPT model is just

@@ -200,7 +200,7 @@ impl std::fmt::Display for Error {
             Self::BadAnswer { reason, .. } => f.write_str(reason),
             Self::InstructionsTooLong { chars, max } => write!(
                 f,
-                "the instructions are {chars} characters, longer than the {max} limit"
+                "the instructions are {chars} characters, longer than the {max} limit; shorten them"
             ),
         }
     }
@@ -702,6 +702,83 @@ mod tests {
         );
     }
 
+    /// Keeps the first text of the request it is asked, answers a moment.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    struct Capture<'a>(&'a std::cell::RefCell<String>);
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    impl provider::AiProvider for Capture<'_> {
+        fn complete(
+            &self,
+            request: &provider::AiRequest,
+            _: &AtomicBool,
+        ) -> Result<provider::AiResponse, AiError> {
+            if let provider::AiContent::Text(text) = &request.content[0] {
+                *self.0.borrow_mut() = text.clone();
+            }
+            Ok(provider::AiResponse {
+                json: serde_json::json!({"name": "Moon", "description": "The moon."}),
+                stop_reason: "end_turn".to_string(),
+                usage: AiUsage::default(),
+            })
+        }
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn describe_moment_sends_the_notes() {
+        let (dir, video) = private_clip("moment-notes");
+        let text = std::cell::RefCell::new(String::new());
+        let options = Options {
+            instructions: Some("Mark the moon separately.".to_string()),
+            ..moment_options()
+        };
+        describe_moment_with(
+            &video,
+            1.0,
+            MOMENT_WINDOW_S,
+            &[],
+            &options,
+            &AtomicBool::new(false),
+            |_| {},
+            || Ok(Box::new(Capture(&text))),
+        )
+        .expect("described");
+        assert!(text
+            .borrow()
+            .contains("<notes>\nMark the moon separately.\n</notes>"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suggest_tags_refuses_notes_over_the_cap_before_any_request() {
+        let options = Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1)),
+        };
+        let description = Description {
+            summary: "s".to_string(),
+            segments: vec![],
+            main: None,
+        };
+        let result = suggest_tags(
+            &description,
+            10.0,
+            &[],
+            &[],
+            &options,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            matches!(result, Err(Error::InstructionsTooLong { .. })),
+            "{result:?}"
+        );
+    }
+
     /// A clip that cannot be read never reaches the request, so it is never "released".
     #[cfg(feature = "frames")]
     #[test]
@@ -826,6 +903,49 @@ mod tests {
             .segments
             .iter()
             .all(|s| s.start_s >= 0.0 && s.end_s <= described.duration_s));
+    }
+
+    /// [`live_description_of_a_test_clip`] with a note, only when `CLIPSCRIBE_LIVE_API_KEY` is set:
+    /// the model is asked to call what it sees by a name only the note gives, and the name must
+    /// come back in the description.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn live_description_follows_the_users_notes() {
+        let Some(api_key) = std::env::var("CLIPSCRIBE_LIVE_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+        else {
+            eprintln!("CLIPSCRIBE_LIVE_API_KEY not set: live test skipped");
+            return;
+        };
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/clips/file_example_MP4_480_1_5MG.mp4");
+        let options = Options {
+            api_key: api_key.trim().to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: Some(
+                "Call the main animal or object of this clip Zorblax, never anything else. \
+                 Always use that name in the summary."
+                    .to_string(),
+            ),
+        };
+        let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
+            Ok(described) => described,
+            Err(Error::Ai(e @ (AiError::OutOfCredit(_) | AiError::LimitReached(_)))) => {
+                eprintln!("live test skipped: {}", e.reason());
+                return;
+            }
+            Err(e) => panic!("answer: {e:?}"),
+        };
+        eprintln!("live: {:#?}", described.description);
+        assert!(
+            described.description.summary.contains("Zorblax"),
+            "the note was not followed: {:?}",
+            described.description.summary
+        );
     }
 
     /// The same request as [`live_description_of_a_test_clip`], through OpenAI instead: only

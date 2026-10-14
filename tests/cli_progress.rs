@@ -112,3 +112,36 @@ fn the_two_ways_to_give_instructions_exclude_each_other() {
     assert_eq!(out.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_instructions_file_that_is_missing_is_an_error() {
+    let (dir, file) = not_a_video("notes-missing");
+    let out = run(&[
+        "--api-key",
+        "unused",
+        "--instructions-file",
+        dir.join("nope.txt").to_str().expect("utf8"),
+        file.to_str().expect("utf8"),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).contains("cannot read --instructions-file"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_instructions_file_with_a_byte_order_mark_and_notes_is_read() {
+    let (dir, file) = not_a_video("notes-file");
+    let notes = dir.join("notes.txt");
+    // Over the limit only if the BOM and the surrounding blanks were counted.
+    std::fs::write(&notes, format!("\u{feff}  {}\n\n", "x".repeat(2000))).expect("notes");
+    let out = run(&[
+        "--api-key",
+        "unused",
+        "--instructions-file",
+        notes.to_str().expect("utf8"),
+        file.to_str().expect("utf8"),
+    ]);
+    let stderr = text(&out.stderr);
+    assert!(!stderr.contains("longer than"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
