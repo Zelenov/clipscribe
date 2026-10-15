@@ -526,7 +526,7 @@ mod run {
         FolderRun, FrameFingerprint, Reserved, RunOptions, Stop,
     };
     use crate::cache::{Cache, CacheKey, ClipRecord};
-    use crate::describe::{build_request, parse_answer, FrameSampling};
+    use crate::describe::{add_instructions, build_request, parse_answer, FrameSampling};
     use crate::frames::{self, Sampled};
     use crate::provider::{AiError, AiProvider, AiRequest, AiUsage, RateGate};
     use crate::tags::{build_combined_request, parse_combined_answer, Tag};
@@ -590,7 +590,7 @@ mod run {
                 fingerprints,
             },
         ) = read_frames(video, options.frame_sampling, cancel, on_stage)?;
-        let request = match vocabulary {
+        let mut request = match vocabulary {
             Some(vocabulary) => build_combined_request(
                 options.model,
                 &frames,
@@ -609,6 +609,11 @@ mod run {
                 options.moments,
             ),
         };
+        add_instructions(
+            &mut request,
+            options.instructions.as_deref(),
+            vocabulary.is_some(),
+        );
         Ok(Prepared {
             duration_s,
             fingerprints,
@@ -1091,6 +1096,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: crate::FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let finished = Mutex::new(Vec::new());
         let on_event = |event: FolderEvent<'_>| {
@@ -1353,6 +1359,7 @@ mod tests {
                 language: SummaryLanguage::English,
                 frame_sampling: FrameSampling::KeyFrames,
                 moments: MomentsMode::Important,
+                instructions: None,
             }
         }
 
@@ -1549,6 +1556,47 @@ mod tests {
             )
             .expect("prepared");
             request_cost_bound(options.model, &prepared.request)
+        }
+
+        /// The user's notes reach a whole-clip request (with and without tags), after the
+        /// instructions and before the frames; without notes the request is as it was.
+        #[test]
+        fn the_notes_are_in_the_whole_clip_request() {
+            let video = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/clips/file_example_MOV_480_700kB.mov");
+            let vocabulary = [Tag {
+                name: "Goat".to_string(),
+                hint: None,
+            }];
+            let first_text = |notes: Option<&str>, vocabulary: Option<&[Tag]>| {
+                let options = Options {
+                    instructions: notes.map(str::to_string),
+                    ..options()
+                };
+                let prepared = prepare(
+                    &video,
+                    &[],
+                    vocabulary,
+                    &options,
+                    &AtomicBool::new(false),
+                    &mut |_| {},
+                )
+                .expect("prepared");
+                match &prepared.request.content[0] {
+                    crate::provider::AiContent::Text(text) => text.clone(),
+                    _ => panic!("instructions first"),
+                }
+            };
+            let plain = first_text(None, None);
+            assert!(!plain.contains("notes about this footage"));
+            let noted = first_text(Some("Mark the moon separately."), None);
+            assert!(noted.starts_with(&plain));
+            assert!(noted.contains("<notes>\nMark the moon separately.\n</notes>"));
+            assert!(!noted.contains("new_tag_ideas"));
+            let tagged = first_text(Some("Mark the moon separately."), Some(&vocabulary));
+            assert!(tagged.contains("<notes>") && tagged.contains("not in the tag list"));
+            // The tag list comes before the notes, which come last.
+            assert!(tagged.find("Tags:").expect("tags") < tagged.find("<notes>").expect("notes"));
         }
 
         /// What the mock server's answer costs (its 3,000 in / 40 out tokens).

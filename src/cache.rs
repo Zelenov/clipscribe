@@ -144,11 +144,18 @@ impl CacheKey {
             MomentsMode::Important => "important",
             MomentsMode::Full => "full",
         };
+        // Only when there are notes, so a key without them is what it always was.
+        let notes = match options.instructions.as_deref().map(str::trim) {
+            Some(notes) if !notes.is_empty() => {
+                format!(" instructions={:016x}", fnv1a(FNV_OFFSET, notes.as_bytes()))
+            }
+            _ => String::new(),
+        };
         Ok(Self {
             identity,
             settings: format!(
                 "model={} language={} frames={frames} moments={moments} tags={tags} \
-                 subtitles={subtitles}",
+                 subtitles={subtitles}{notes}",
                 options.model.id,
                 options.language.as_str(),
             ),
@@ -472,6 +479,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         }
     }
 
@@ -642,6 +650,30 @@ mod tests {
             with_srt.settings, base.settings,
             "the subtitles are part of it"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changing_the_notes_changes_the_key_but_no_notes_keep_it() {
+        let dir = temp_dir("notes");
+        let video = dir.join("clip.mp4");
+        std::fs::write(&video, b"video").expect("write");
+        let key = |notes: Option<&str>| {
+            let options = Options {
+                instructions: notes.map(str::to_string),
+                ..options()
+            };
+            CacheKey::new(&video, &options, None, false)
+                .expect("key")
+                .settings
+        };
+        let none = key(None);
+        assert_eq!(key(Some("  \n")), none, "whitespace is no notes");
+        let eugene = key(Some("The man is Eugene."));
+        assert_ne!(eugene, none);
+        assert_eq!(key(Some(" The man is Eugene.\n")), eugene, "trimmed");
+        assert_ne!(key(Some("The man is Ivan.")), eugene);
+        assert!(!none.contains("instructions="), "{none}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

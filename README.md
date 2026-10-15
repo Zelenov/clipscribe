@@ -37,6 +37,12 @@ out, even for clips with no speech.
 - A clip with a lead-in or lead-out gets a **main range** (`Description::main`, `"main"` in
   `--json`, `Main:` in the text output): the part an editor would keep, as a suggested In/Out.
   It is absent when the whole clip is usable, and never set in `full` mode.
+- **Your own notes** (`Options::instructions`, at most 2000 characters) go into every request of
+  `describe`, `describe_with_tags`, `suggest_tags` and `describe_moment`: names to use ("the man
+  who appears most often is Eugene"), things to mark as moments ("the moon"), tags to suggest. They
+  steer what is named, marked or tagged; they cannot change the answer's format or language. A
+  tag they ask for that is not in your vocabulary comes back as a tag idea. `None` leaves every
+  request as it was. Add their length to `subtitle_bytes` when you price a clip.
 
 ## As a library
 
@@ -56,6 +62,7 @@ let options = Options {
     language: SummaryLanguage::English,
     frame_sampling: FrameSampling::KeyFrames,
     moments: MomentsMode::Important,
+    instructions: None,
 };
 let subtitles = srt::load_for(video)?;
 let described = describe(video, &subtitles, &options, &AtomicBool::new(false), |stage| {
@@ -71,9 +78,9 @@ println!("${:.4}", options.model.cost_usd(described.usage));
 `ass::load_for(video)` reads a `.ass` / `.ssa` next to the video the same way, as plain text.
 
 Everything blocks: call it from a worker thread. `describe` fails with `Error::Cancelled`,
-`Unreadable`, `TooLong`, `Ai(AiError)` (rejected key, no credit, limits, network, timeout) or
-`BadAnswer` (billed, but not usable). `estimate_usage` and `Model::cost_usd` price a clip
-before sending it; `frames::clip_duration_s` reads its length.
+`Unreadable`, `TooLong`, `InstructionsTooLong`, `Ai(AiError)` (rejected key, no credit, limits,
+network, timeout) or `BadAnswer` (billed, but not usable). `estimate_usage` and
+`Model::cost_usd` price a clip before sending it; `frames::clip_duration_s` reads its length.
 
 Every entry of `MODELS` carries its `Provider` (`Anthropic` or `OpenAi`); `options.api_key` is
 read against whichever provider `options.model` belongs to, so switching to a GPT model is just

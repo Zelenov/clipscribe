@@ -16,7 +16,7 @@ use clipscribe::{
     serve_after_stop, srt, AiUsage, Budget, Cache, ClipGroups, ClipOutcome, ClipRecord,
     DescribedMoment, Error, FolderEvent, FrameSampling, GroupOptions, Grouping, Model, MomentsMode,
     Options, Provider, RunOptions, Stop, SummaryLanguage, Tag, DEFAULT_JOBS, MAX_DURATION_S,
-    MODELS, MOMENT_WINDOW_S,
+    MAX_INSTRUCTIONS_CHARS, MODELS, MOMENT_WINDOW_S,
 };
 use serde_json::json;
 
@@ -66,6 +66,16 @@ struct Cli {
     /// the same request as the description.
     #[arg(long)]
     tags: Option<PathBuf>,
+
+    /// Your own notes about the footage, added to every request: names to use, things to mark as
+    /// moments, tags to suggest ("the man who appears most often is Eugene", "mark the moon").
+    /// At most 2000 characters. Changing them describes cached videos again.
+    #[arg(long, conflicts_with = "instructions_file")]
+    instructions: Option<String>,
+
+    /// Like --instructions, read from this text file.
+    #[arg(long, value_name = "PATH")]
+    instructions_file: Option<PathBuf>,
 
     /// How many moments (segments) a description gets: important (only what stands out, possibly
     /// none) or full (the whole clip in consecutive stretches, today's old behaviour).
@@ -420,6 +430,17 @@ fn main() -> ExitCode {
         },
         None => None,
     };
+    let instructions = match load_instructions(
+        cli.instructions.as_deref(),
+        cli.instructions_file.as_deref(),
+    ) {
+        Ok(instructions) => instructions,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let notes_bytes = instructions.as_deref().map_or(0, str::len);
     if cli.estimate {
         let dump = cli
             .dump_frames
@@ -431,6 +452,7 @@ fn main() -> ExitCode {
             cli.no_subtitles,
             vocabulary.as_deref(),
             cli.frames.sampling(),
+            notes_bytes,
             dump,
         );
     }
@@ -456,6 +478,7 @@ fn main() -> ExitCode {
         language: cli.language,
         frame_sampling: cli.frames.sampling(),
         moments: cli.moments.mode(),
+        instructions,
     };
 
     if let Some(at_s) = cli.at {
@@ -490,6 +513,7 @@ fn main() -> ExitCode {
         cli.no_subtitles,
         vocabulary.as_deref(),
         cli.frames.sampling(),
+        notes_bytes,
     );
     let batch = Batch::new(model, videos.len(), run_plan.plan.footage_s, cli.quiet);
     batch.plan(&run_plan.plan);
@@ -899,6 +923,28 @@ fn moment_to_json(
     })
 }
 
+/// The notes from `--instructions` or `--instructions-file`; `None` when there are none (or only
+/// whitespace). Longer than the limit is an error before anything is read or sent.
+fn load_instructions(text: Option<&str>, file: Option<&Path>) -> Result<Option<String>, String> {
+    let text = match (text, file) {
+        (Some(text), _) => text.to_string(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read --instructions-file {}: {e}", path.display()))?,
+        (None, None) => return Ok(None),
+    };
+    // A file saved with a byte order mark (Notepad does) must not send it to the model.
+    let text = text.trim_start_matches('\u{feff}').trim();
+    let chars = text.chars().count();
+    if chars > MAX_INSTRUCTIONS_CHARS {
+        return Err(Error::InstructionsTooLong {
+            chars,
+            max: MAX_INSTRUCTIONS_CHARS,
+        }
+        .to_string());
+    }
+    Ok((!text.is_empty()).then(|| text.to_string()))
+}
+
 /// Read a `--tags` vocabulary file: one tag per line, `name — hint`.
 fn load_vocabulary(path: &Path) -> Result<Vec<Tag>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -950,6 +996,7 @@ fn estimate_clip(
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
     sampling: FrameSampling,
+    notes_bytes: usize,
 ) -> Estimated {
     let Some(duration_s) = frames::clip_duration_s(video) else {
         return Estimated::Unreadable;
@@ -961,7 +1008,7 @@ fn estimate_clip(
         0
     } else {
         std::fs::metadata(srt::subtitle_path(video)).map_or(0, |m| m.len() as usize)
-    };
+    } + notes_bytes;
     let mut usage = match vocabulary {
         Some(vocabulary) => {
             estimate_tags_usage(model, duration_s, subtitle_bytes, vocabulary, None)
@@ -992,6 +1039,7 @@ fn plan_run(
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
     sampling: FrameSampling,
+    notes_bytes: usize,
 ) -> RunPlan {
     let mut plan = Plan {
         videos: videos.len(),
@@ -1005,7 +1053,14 @@ fn plan_run(
     let mut clips = Vec::new();
     for video in videos {
         clips.push(
-            match estimate_clip(video, model, no_subtitles, vocabulary, sampling) {
+            match estimate_clip(
+                video,
+                model,
+                no_subtitles,
+                vocabulary,
+                sampling,
+                notes_bytes,
+            ) {
                 Estimated::Unreadable => {
                     plan.unreadable += 1;
                     Clip { duration_s: 0.0 }
@@ -1033,29 +1088,36 @@ fn estimate(
     no_subtitles: bool,
     vocabulary: Option<&[Tag]>,
     sampling: FrameSampling,
+    notes_bytes: usize,
     dump: Option<(&Path, FrameSampling)>,
 ) -> ExitCode {
     let mut total = AiUsage::default();
     let mut unreadable = 0;
     for video in videos {
-        let (duration_s, usage) =
-            match estimate_clip(video, model, no_subtitles, vocabulary, sampling) {
-                Estimated::Unreadable => {
-                    println!("{}: could not be read", video.display());
-                    unreadable += 1;
-                    continue;
-                }
-                Estimated::TooLong(duration_s) => {
-                    println!(
-                        "{}: {}, over the {} limit",
-                        video.display(),
-                        format_time(duration_s),
-                        format_time(MAX_DURATION_S)
-                    );
-                    continue;
-                }
-                Estimated::Ready { duration_s, usage } => (duration_s, usage),
-            };
+        let (duration_s, usage) = match estimate_clip(
+            video,
+            model,
+            no_subtitles,
+            vocabulary,
+            sampling,
+            notes_bytes,
+        ) {
+            Estimated::Unreadable => {
+                println!("{}: could not be read", video.display());
+                unreadable += 1;
+                continue;
+            }
+            Estimated::TooLong(duration_s) => {
+                println!(
+                    "{}: {}, over the {} limit",
+                    video.display(),
+                    format_time(duration_s),
+                    format_time(MAX_DURATION_S)
+                );
+                continue;
+            }
+            Estimated::Ready { duration_s, usage } => (duration_s, usage),
+        };
         total += usage;
         println!(
             "{}: {}, about ${:.4}",

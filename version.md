@@ -1,3 +1,20 @@
+# 0.16.0
+## Added
+- Library: `Options::instructions` takes your own notes about the footage (names to use, things to
+  mark as moments, tags to suggest), up to 2000 characters. They are added to the request of
+  `describe`, `describe_with_tags`, `suggest_tags` and `describe_moment`, and cannot change the
+  answer's format or language. A tag a note asks for that is not in the vocabulary comes back as
+  a tag idea. `None` keeps every request exactly as it was. `add_instructions` adds notes to a
+  request you build yourself; add the notes' length to `subtitle_bytes` of `estimate_usage`.
+- Command line: `--instructions "<text>"` and `--instructions-file <path>`. Changing the notes
+  describes cached videos again.
+
+## Changed
+- `Options` has a new field, `instructions`: set `instructions: None` where you build it (frename
+  does exactly that, nothing else changes).
+- `Error` has a new variant, `InstructionsTooLong { chars, max }`, returned before anything is
+  sent when the notes are over the limit: a `match` on it without a wildcard arm must handle it.
+
 # 0.15.0
 ## Added
 - Library: `FrameSampling::Shots` takes one frame from the middle of every shot of an edited video
