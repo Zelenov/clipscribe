@@ -1,4 +1,4 @@
-# NEXT
+# 0.16.1
 ## Fixed
 - Shot detection on fast montages: a jump of 10 percent or more between two frames is a cut even
   when the cuts next to it are as strong (cuts 0.8 s apart used to hide each other, so half of
