@@ -1,3 +1,11 @@
+# NEXT
+## Fixed
+- Shot detection on fast montages: a jump of 10 percent or more between two frames is a cut even
+  when the cuts next to it are as strong (cuts 0.8 s apart used to hide each other, so half of
+  them were lost). A slow camera move that speeds up is no longer taken for a dissolve, and a
+  dissolve no longer runs over the cut that follows it. On a 16 s travel montage with 10 cuts,
+  `--shots` now finds 9 cuts plus one under the half-second minimum (it found 4 before).
+
 # 0.16.0
 ## Added
 - Library: `Options::instructions` takes your own notes about the footage (names to use, things to
