@@ -10,10 +10,12 @@
 //! - a **cut** is an isolated spike of that score: at least [`CUT_SCORE`] and
 //!   [`CUT_ISOLATION`] times the highest other score within a second, not counting the frames
 //!   next to it;
+//! - a score of [`STRONG_CUT`] or more is a cut whatever its neighbours score (fast montages);
 //! - a spike whose picture comes back within four frames is a **flash** and is ignored;
 //! - a **gradual transition** is a half second over which the picture changes by at least
 //!   [`GRADUAL_SPAN`] while every single step stays small and the middle frame is close to a mix
 //!   of the two ends (this separates a dissolve from a pan); a **fade** is one with a black end;
+//! - its steps are even: the largest is under [`GRADUAL_EVEN`] times the average;
 //! - a shot is at least half a second; a cut inside a transition belongs to it.
 //!
 //! All thresholds are provisional until tuned on real edits.
@@ -25,6 +27,9 @@ pub const FRAME_HEIGHT: usize = 36;
 
 /// The least score (percent of full scale) of a cut.
 const CUT_SCORE: f32 = 0.5;
+/// A score (percent) from which a spike is a cut however busy its neighbourhood: in a fast
+/// montage neighbouring cuts hide each other, and nothing but a cut or a flash scores this high.
+const STRONG_CUT: f32 = 10.0;
 /// How many times higher than every other score within a second a cut's score must be.
 const CUT_ISOLATION: f32 = 4.0;
 /// A floor for "every other score", so a perfectly still shot does not make noise a cut.
@@ -35,6 +40,9 @@ const FLASH_RETURN: f32 = 0.35;
 const GRADUAL_SPAN: f32 = 5.0;
 /// A step of a gradual transition is under this share of its whole change.
 const GRADUAL_STEP: f32 = 0.35;
+/// The largest step of a gradual transition is under this many times its average step: a mix
+/// moves evenly, a camera that speeds up does not.
+const GRADUAL_EVEN: f32 = 2.5;
 /// The middle of a gradual transition is within this share of its change from the best mix.
 const BLEND_ERROR: f32 = 0.25;
 /// Mean brightness (percent) under which a picture counts as black.
@@ -241,7 +249,7 @@ fn cuts(f: &[&[u8]], d: &[f32], score: &[f32], n: usize, second: usize) -> Vec<u
             .filter(|j| j.abs_diff(i) > 1 && !skip[*j])
             .map(|j| score[j])
             .fold(0.0, f32::max);
-        if score[i] < CUT_ISOLATION * others.max(QUIET_FLOOR) {
+        if score[i] < STRONG_CUT && score[i] < CUT_ISOLATION * others.max(QUIET_FLOOR) {
             continue;
         }
         let back = (i + 1..(i + 5).min(n))
@@ -267,11 +275,12 @@ fn gradual(f: &[&[u8]], d: &[f32], cuts: &[usize], n: usize, half_second: usize)
         let steps = d[a + 1..=b].iter().copied().fold(0.0, f32::max);
         if span >= GRADUAL_SPAN
             && steps < GRADUAL_STEP * span
+            && steps * ((b - a) as f32) < GRADUAL_EVEN * span
             && !cuts.iter().any(|c| (a..=b).contains(c))
             && blend_error(f[a], f[a.midpoint(b)], f[b]) < BLEND_ERROR * span
         {
             // Extend while the picture keeps moving away from where it began.
-            while b + 1 < n {
+            while b + 1 < n && !cuts.contains(&(b + 1)) {
                 let next = mad(f[a], f[b + 1]);
                 if next > mad(f[a], f[b]) + 0.2 && d[b + 1] < GRADUAL_STEP * next {
                     b += 1;
@@ -442,6 +451,39 @@ mod tests {
     fn a_cut_too_close_to_the_start_does_not_make_a_shot() {
         let mut frames = hold(&picture(1), 10, 0);
         frames.extend(hold(&picture(2), 80, 0));
+        let shots = run(frames);
+        assert_eq!(shots.shots.len(), 1, "{shots:?}");
+    }
+
+    #[test]
+    fn a_fast_montage_has_every_cut() {
+        // Ten shots of 0.8 s: neighbouring cuts must not hide each other.
+        let frames: Vec<Vec<u8>> = (1..=10)
+            .flat_map(|seed| hold(&picture(seed), 24, 0))
+            .collect();
+        let shots = run(frames);
+        assert_eq!(shots.shots.len(), 10, "{shots:?}");
+        assert!(shots
+            .transitions
+            .iter()
+            .all(|t| t.kind == TransitionKind::Cut));
+    }
+
+    #[test]
+    fn a_camera_that_speeds_up_is_not_a_dissolve() {
+        // A picture scrolling faster and faster: steps grow, and no frame mixes two pictures.
+        let wide = picture(5);
+        let frames: Vec<Vec<u8>> = (0..90usize)
+            .map(|i| {
+                let shift = i * i / 20;
+                (0..PIXELS)
+                    .map(|p| {
+                        wide[(p / FRAME_WIDTH) * FRAME_WIDTH
+                            + (p % FRAME_WIDTH + shift) % FRAME_WIDTH]
+                    })
+                    .collect()
+            })
+            .collect();
         let shots = run(frames);
         assert_eq!(shots.shots.len(), 1, "{shots:?}");
     }
