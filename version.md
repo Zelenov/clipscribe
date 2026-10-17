@@ -1,4 +1,4 @@
-# NEXT
+# 0.16.2
 ## Changed
 - `FrameSampling::Shots` (`--frames shots`, experimental): in a clip with more than one shot, each
   frame is sent with its shot (`shot 3 of 10, 3.6–9.7 s`) and the instructions say what it means,
