@@ -588,6 +588,55 @@ pub fn add_instructions(request: &mut AiRequest, notes: Option<&str>, with_tags:
     ));
 }
 
+/// For a clip sampled by [`FrameSampling::Shots`]: adds the shot each frame is from to the `t=`
+/// line before it (`t=0:07 (shot 3 of 10, 3.6–9.7 s)`) and one paragraph to the instructions that
+/// says what it means, so the model can put a segment's start or end on a cut. `frames` are the
+/// frames the request was built from, in order. A clip of one shot (raw footage, no cuts) is left
+/// as it is: there is nothing to say about its only shot. The request's first content item must
+/// be its instructions text, as in [`add_instructions`].
+#[cfg(feature = "frames")]
+pub(crate) fn label_shots(request: &mut AiRequest, frames: &[Frame], shots: &crate::shots::Shots) {
+    let count = shots.shots.len();
+    if count < 2 {
+        return;
+    }
+    let mut times = request.content.iter_mut().filter_map(|item| match item {
+        AiContent::Text(text) if text.starts_with("t=") => Some(text),
+        _ => None,
+    });
+    for frame in frames {
+        let Some(text) = times.next() else { return };
+        let nearest = (0..count)
+            .min_by(|a, b| {
+                let gap = |i: usize| {
+                    let shot = &shots.shots[i];
+                    (shot.start_s - frame.time_s)
+                        .max(frame.time_s - shot.end_s)
+                        .max(0.0)
+                };
+                gap(*a).total_cmp(&gap(*b))
+            })
+            .unwrap_or(0);
+        let shot = &shots.shots[nearest];
+        text.push_str(&format!(
+            " (shot {} of {count}, {:.1}–{:.1} s)",
+            nearest + 1,
+            shot.start_s,
+            shot.end_s
+        ));
+    }
+    let Some(AiContent::Text(instructions)) = request.content.first_mut() else {
+        return;
+    };
+    instructions.push_str(&format!(
+        "\n\nThis clip is an edit of {count} shots: a shot runs from one cut to the next, and \
+         a dissolve or fade between two shots belongs to neither. Each frame says which shot it \
+         is from, with that shot's start and end in seconds. Where a segment starts or ends at a \
+         cut, use that shot's own start or end instead of a rounded time. A shot without a frame \
+         is not shown to you."
+    ));
+}
+
 /// The request to `model` describing a clip `duration_s` long from its frames and subtitles.
 /// `moments` picks the instructions for how many segments to return: see [`MomentsMode`].
 pub fn build_request(
@@ -1610,6 +1659,89 @@ mod tests {
         assert_eq!(times.len(), MAX_FRAMES);
         // The ten shortest (0.6 s) are the ones dropped.
         assert!(times.iter().all(|t| *t >= 10.0), "{times:?}");
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn shot_labels_name_the_shot_of_every_frame_and_explain_themselves() {
+        let frames = vec![
+            Frame {
+                time_s: 1.0,
+                jpeg: vec![1],
+            },
+            Frame {
+                time_s: 4.5,
+                jpeg: vec![2],
+            },
+        ];
+        let mut request = build_request(
+            Model::from_id("claude-haiku-4-5"),
+            &frames,
+            &[],
+            6.0,
+            SummaryLanguage::English,
+            MomentsMode::Full,
+        );
+        label_shots(
+            &mut request,
+            &frames,
+            &shots_of(&[(0.0, 2.0), (2.0, 3.0), (4.0, 6.0)]),
+        );
+        let texts: Vec<&str> = request
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                AiContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts[1], "t=0:01 (shot 1 of 3, 0.0–2.0 s)");
+        assert_eq!(texts[2], "t=0:04 (shot 3 of 3, 4.0–6.0 s)");
+        assert!(texts[0].contains("an edit of 3 shots"));
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn shot_labels_leave_a_clip_of_one_shot_alone() {
+        let frames = vec![Frame {
+            time_s: 1.0,
+            jpeg: vec![1],
+        }];
+        let build = || {
+            build_request(
+                Model::from_id("claude-haiku-4-5"),
+                &frames,
+                &[],
+                6.0,
+                SummaryLanguage::English,
+                MomentsMode::Full,
+            )
+        };
+        let mut request = build();
+        label_shots(&mut request, &frames, &shots_of(&[(0.0, 6.0)]));
+        assert_eq!(request.content, build().content);
+        label_shots(&mut request, &frames, &shots_of(&[]));
+        assert_eq!(request.content, build().content);
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn shot_labels_put_a_frame_in_the_nearest_shot_when_it_lands_in_a_transition() {
+        let frames = vec![Frame {
+            time_s: 3.8,
+            jpeg: vec![1],
+        }];
+        let mut request = build_request(
+            Model::from_id("claude-haiku-4-5"),
+            &frames,
+            &[],
+            6.0,
+            SummaryLanguage::English,
+            MomentsMode::Full,
+        );
+        label_shots(&mut request, &frames, &shots_of(&[(0.0, 3.0), (4.0, 6.0)]));
+        assert!(matches!(&request.content[1],
+            AiContent::Text(t) if t == "t=0:03 (shot 2 of 2, 4.0–6.0 s)"));
     }
 
     #[test]

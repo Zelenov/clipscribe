@@ -37,6 +37,8 @@ const JPEG_QUALITY: u8 = 80;
 pub(crate) struct Sampled {
     pub(crate) frames: Vec<Frame>,
     pub(crate) fingerprints: Vec<crate::FrameFingerprint>,
+    /// The shots the frames were chosen by ([`FrameSampling::Shots`] with at least one found).
+    pub(crate) shots: Option<Shots>,
 }
 
 /// The frames of the clip at `video` (open as `clip`, `duration_s` long) for `sampling`. With
@@ -68,7 +70,12 @@ pub(crate) fn sample_clip(
             on_frame,
         );
     }
-    clip.sample_at(&times, cancel, &mut on_frame)
+    Ok(clip
+        .sample_at(&times, cancel, &mut on_frame)?
+        .map(|sampled| Sampled {
+            shots: Some(shots),
+            ..sampled
+        }))
 }
 
 /// A clip opened paused for sampling. Stopped when dropped.
@@ -338,6 +345,7 @@ impl Clip {
         Ok(Some(Sampled {
             frames,
             fingerprints,
+            shots: None,
         }))
     }
 
@@ -375,6 +383,7 @@ impl Clip {
         Ok(Some(Sampled {
             frames,
             fingerprints,
+            shots: None,
         }))
     }
 
