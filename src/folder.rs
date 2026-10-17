@@ -588,6 +588,7 @@ mod run {
             Sampled {
                 frames,
                 fingerprints,
+                shots,
             },
         ) = read_frames(video, options.frame_sampling, cancel, on_stage)?;
         let mut request = match vocabulary {
@@ -609,6 +610,9 @@ mod run {
                 options.moments,
             ),
         };
+        if let Some(shots) = &shots {
+            crate::describe::label_shots(&mut request, &frames, shots);
+        }
         add_instructions(
             &mut request,
             options.instructions.as_deref(),
@@ -1556,6 +1560,52 @@ mod tests {
             )
             .expect("prepared");
             request_cost_bound(options.model, &prepared.request)
+        }
+
+        /// An edit sampled by shots says which shot each frame is from; the same clip sampled by
+        /// key frames, and so every other request, has no shot labels.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn shot_labels_reach_the_whole_clip_request_of_an_edit() {
+            let video =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/clips/shots-edit.mp4");
+            let texts = |frame_sampling| {
+                let options = Options {
+                    frame_sampling,
+                    ..options()
+                };
+                let prepared = prepare(
+                    &video,
+                    &[],
+                    None,
+                    &options,
+                    &AtomicBool::new(false),
+                    &mut |_| {},
+                )
+                .expect("prepared");
+                prepared
+                    .request
+                    .content
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        crate::provider::AiContent::Text(text) => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let shots = texts(FrameSampling::Shots);
+            assert!(shots[0].contains("an edit of 4 shots"), "{}", shots[0]);
+            let labels: Vec<_> = shots[1..].iter().map(|t| t.as_str()).collect();
+            assert_eq!(labels.len(), 4);
+            for (i, label) in labels.iter().enumerate() {
+                assert!(label.contains(&format!("(shot {} of 4,", i + 1)), "{label}");
+            }
+            for text in texts(FrameSampling::KeyFrames) {
+                assert!(
+                    !text.contains("(shot ") && !text.contains("an edit of"),
+                    "{text}"
+                );
+            }
         }
 
         /// The user's notes reach a whole-clip request (with and without tags), after the

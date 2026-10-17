@@ -23,6 +23,8 @@ out, even for clips with no speech.
   shot, never from a cut or a dissolve, and spends what is left of the 60 on the longest shots.
   Its cost is known only after that pass, so `estimate_usage_sampled(model, duration_s,
   subtitle_bytes, sampling)` prices it at the most, 60 frames.
+  Each frame is sent with the shot it is from (`shot 3 of 10, 3.6–9.7 s`), so the model can put
+  the start or end of a moment on a cut; a clip of one shot is sent as before.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
   description knows what is said.
 - One request goes to Claude (Anthropic) or ChatGPT (OpenAI); the answer is structured JSON, and

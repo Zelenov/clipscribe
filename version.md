@@ -1,3 +1,10 @@
+# NEXT
+## Changed
+- `FrameSampling::Shots` (`--frames shots`, experimental): in a clip with more than one shot, each
+  frame is sent with its shot (`shot 3 of 10, 3.6–9.7 s`) and the instructions say what it means,
+  so a moment can start or end on a cut. A clip of one shot, and every other way of sampling,
+  sends the request it always did.
+
 # 0.16.1
 ## Fixed
 - Shot detection on fast montages: a jump of 10 percent or more between two frames is a cut even
