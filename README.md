@@ -2,7 +2,7 @@
 
 <img src="https://raw.githubusercontent.com/Zelenov/clipscribe/main/docs/icon/clipscribe-256.png" align="left" width="128" height="128" alt="clipscribe icon">
 
-Describe what happens in video clips, and when, with Claude or ChatGPT — a Rust crate
+Describe what happens in video clips, and when, with Claude, ChatGPT or Gemini — a Rust crate
 ([frename](https://github.com/Zelenov/frename) uses it).
 
 A video file and its subtitles go in; a one-sentence summary and time-ranged key moments come
@@ -27,8 +27,8 @@ out, even for clips with no speech.
   the start or end of a moment on a cut; a clip of one shot is sent as before.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
   description knows what is said.
-- One request goes to Claude (Anthropic), ChatGPT (OpenAI) or Gemini (Google); the answer is structured JSON, and
-  moments outside the clip are dropped. Clips over 30 minutes are refused.
+- One request goes to Claude (Anthropic), ChatGPT (OpenAI) or Gemini (Google); the answer is
+  structured JSON, and moments outside the clip are dropped. Clips over 30 minutes are refused.
 - Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a
   static or uniform clip (the summary already covers it), one per clearly different or standout
   part otherwise — never a moment that just tiles the timeline. `MomentsMode::Full` goes back to
@@ -84,9 +84,9 @@ Everything blocks: call it from a worker thread. `describe` fails with `Error::C
 network, timeout) or `BadAnswer` (billed, but not usable). `estimate_usage` and
 `Model::cost_usd` price a clip before sending it; `frames::clip_duration_s` reads its length.
 
-Every entry of `MODELS` carries its `Provider` (`Anthropic`, `OpenAi` or `Gemini`); `options.api_key` is
-read against whichever provider `options.model` belongs to, so switching to a GPT model is just
-picking a different `MODELS` entry and that provider's key — nothing else about the call changes.
+Every entry of `MODELS` carries its `Provider` (`Anthropic`, `OpenAi` or `Gemini`);
+`options.api_key` is read against whichever provider `options.model` belongs to, so switching to
+a GPT or Gemini model is just picking a different `MODELS` entry and that provider's key — nothing else about the call changes.
 
 ### Tag suggestions
 
@@ -223,7 +223,7 @@ without sending anything.
 |---|---|
 | `cli` (default) | The `clipscribe` binary (clap, ctrlc). Implies `frames`. |
 | `frames` (default) | GStreamer frame reading, `describe` and `describe_folder`. |
-| none | Models, languages, request and answer types, the estimate, `srt`, `ass`, both providers' clients, the cache and `group_clips`, with no GStreamer. |
+| none | Models, languages, request and answer types, the estimate, `srt`, `ass`, the three providers' clients, the cache and `group_clips`, with no GStreamer. |
 
 ## Building
 

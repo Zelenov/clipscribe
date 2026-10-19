@@ -8,7 +8,10 @@
 
 ## Changed
 - `Provider` has a new variant, `Gemini`: a `match` on it that has no `_` arm needs one more arm
-  (frename: `ai::key::ApiKey::of_provider`). Nothing else in the library changes.
+  (frename: `ai::key::ApiKey::of_provider`).
+- `estimate_usage` and `estimate_usage_sampled` count a frame the way its model's provider bills
+  it (OpenAI: 255 tokens, was 209; Gemini 280), so `--estimate` for the OpenAI models rises about
+  20 %.
 
 # 0.16.2
 ## Changed

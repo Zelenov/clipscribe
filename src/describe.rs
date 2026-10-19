@@ -86,10 +86,14 @@ pub const MODELS: [Model; 7] = [
     },
 ];
 
-/// When the prices in [`MODELS`] were checked. The two Gemini models are priced from Google's
-/// Vertex AI pricing page (`docs/design/gemini-provider.md`); `ai.google.dev` is blocked from the
-/// environment this crate is developed in, so the AI Studio prices are assumed the same. The two OpenAI models were priced from training
-/// data, not a live quote: `api.openai.com` and OpenAI's own docs are both blocked from the
+/// When the prices in [`MODELS`] were checked.
+///
+/// The two Gemini models are priced from Google's Vertex AI pricing page
+/// (`docs/design/gemini-provider.md`); `ai.google.dev` is blocked from the environment this crate
+/// is developed in, so the AI Studio prices are assumed the same. Confirm them before relying on
+/// `--estimate` for `--provider gemini`.
+///
+/// The two OpenAI models were priced from training data, not a live quote: `api.openai.com` and OpenAI's own docs are both blocked from the
 /// environment this crate is developed in (see `docs/design/openai-provider.md`). Confirm them
 /// against OpenAI's current pricing before relying on `--estimate` for `--provider openai`.
 pub const PRICES_CHECKED: &str = "2026-10-19";
@@ -910,6 +914,9 @@ pub fn format_time(seconds: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    use super::*;
+
     #[test]
     fn the_estimate_counts_a_frame_the_way_its_provider_bills_it() {
         let input = |id: &str| {
@@ -919,10 +926,8 @@ mod tests {
         let frames = frame_count(30.0) as u64;
         let gemini = input("gemini-3.1-flash-lite");
         let claude = input("claude-haiku-4-5");
-        assert_eq!(gemini - claude, frames * (280 - 209));
+        assert_eq!(gemini - claude, frames * (280 - frame_tokens(512, 288)));
     }
-
-    use super::*;
 
     fn response(json: Value, stop_reason: &str) -> AiResponse {
         AiResponse {
