@@ -43,6 +43,7 @@ mod describe;
 mod folder;
 #[cfg(feature = "frames")]
 pub mod frames;
+pub mod gemini;
 mod groups;
 mod moment;
 pub mod openai;
@@ -224,6 +225,11 @@ fn provider_for(
         )),
         Provider::OpenAi => Ok(Box::new(
             openai::OpenAi::new(key)
+                .map_err(Error::Ai)?
+                .with_rate_gate(gate),
+        )),
+        Provider::Gemini => Ok(Box::new(
+            gemini::Gemini::new(key)
                 .map_err(Error::Ai)?
                 .with_rate_gate(gate),
         )),

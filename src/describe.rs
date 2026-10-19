@@ -13,7 +13,7 @@ use crate::Cue;
 /// choice from picking a model. Sonnet and Opus think before answering: at low effort, since
 /// describing frames needs little reasoning, with room for the thinking in their answer budget;
 /// neither GPT-4.1 model has a reasoning setting, so their `effort` stays `None`, like Haiku's.
-pub const MODELS: [Model; 5] = [
+pub const MODELS: [Model; 7] = [
     Model {
         provider: Provider::Anthropic,
         id: "claude-haiku-4-5",
@@ -64,13 +64,39 @@ pub const MODELS: [Model; 5] = [
         max_answer_tokens: 4000,
         answer_tokens: 600,
     },
+    Model {
+        provider: Provider::Gemini,
+        id: "gemini-3.1-flash-lite",
+        label: "Gemini 3.1 Flash-Lite",
+        input_usd_per_mtok: 0.25,
+        output_usd_per_mtok: 1.50,
+        effort: None,
+        max_answer_tokens: 4000,
+        answer_tokens: 600,
+    },
+    Model {
+        provider: Provider::Gemini,
+        id: "gemini-3.5-flash",
+        label: "Gemini 3.5 Flash",
+        input_usd_per_mtok: 1.50,
+        output_usd_per_mtok: 9.0,
+        effort: Some("low"),
+        max_answer_tokens: 16000,
+        answer_tokens: 1500,
+    },
 ];
 
-/// When the prices in [`MODELS`] were checked. The two OpenAI models were priced from training
-/// data, not a live quote: `api.openai.com` and OpenAI's own docs are both blocked from the
+/// When the prices in [`MODELS`] were checked.
+///
+/// The two Gemini models are priced from Google's Vertex AI pricing page
+/// (`docs/design/gemini-provider.md`); `ai.google.dev` is blocked from the environment this crate
+/// is developed in, so the AI Studio prices are assumed the same. Confirm them before relying on
+/// `--estimate` for `--provider gemini`.
+///
+/// The two OpenAI models were priced from training data, not a live quote: `api.openai.com` and OpenAI's own docs are both blocked from the
 /// environment this crate is developed in (see `docs/design/openai-provider.md`). Confirm them
 /// against OpenAI's current pricing before relying on `--estimate` for `--provider openai`.
-pub const PRICES_CHECKED: &str = "2026-09-26";
+pub const PRICES_CHECKED: &str = "2026-10-19";
 
 /// Clips longer than this are skipped.
 pub const MAX_DURATION_S: f64 = 30.0 * 60.0;
@@ -472,7 +498,7 @@ pub fn estimate_usage(model: Model, duration_s: f64, subtitle_bytes: usize) -> A
     let (w, h) = frame_size(1920, 1080);
     let frames = frame_count(duration_s) as u64;
     AiUsage {
-        input_tokens: frames * frame_tokens(w, h)
+        input_tokens: frames * crate::folder::image_tokens_bound(model.provider, w, h)
             + (subtitle_bytes as f64 / CHARS_PER_TOKEN) as u64
             + INSTRUCTION_TOKENS,
         output_tokens: model.answer_tokens,
@@ -490,7 +516,7 @@ pub fn estimate_usage_sampled(
     let mut usage = estimate_usage(model, duration_s, subtitle_bytes);
     let (w, h) = frame_size(1920, 1080);
     let extra = frame_budget(duration_s, sampling).saturating_sub(frame_count(duration_s)) as u64;
-    usage.input_tokens += extra * frame_tokens(w, h);
+    usage.input_tokens += extra * crate::folder::image_tokens_bound(model.provider, w, h);
     usage
 }
 
@@ -888,7 +914,20 @@ pub fn format_time(seconds: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    #[test]
+    fn the_estimate_counts_a_frame_the_way_its_provider_bills_it() {
+        let input = |id: &str| {
+            let model = MODELS.into_iter().find(|m| m.id == id).expect("model");
+            estimate_usage(model, 30.0, 0).input_tokens
+        };
+        let frames = frame_count(30.0) as u64;
+        let gemini = input("gemini-3.1-flash-lite");
+        let claude = input("claude-haiku-4-5");
+        assert_eq!(gemini - claude, frames * (280 - frame_tokens(512, 288)));
+    }
 
     fn response(json: Value, stop_reason: &str) -> AiResponse {
         AiResponse {

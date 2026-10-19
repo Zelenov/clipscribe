@@ -12,6 +12,7 @@ pub enum Provider {
     #[default]
     Anthropic,
     OpenAi,
+    Gemini,
 }
 
 impl Provider {
@@ -22,6 +23,7 @@ impl Provider {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::Gemini => "Gemini",
         }
     }
 }

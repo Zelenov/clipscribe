@@ -290,10 +290,14 @@ pub fn request_cost_bound(model: Model, request: &AiRequest) -> f64 {
 /// Input tokens a `width`×`height` image can be billed for by `provider`. Anthropic: one per 28×28
 /// tile ([`frame_tokens`]). OpenAI bills images differently depending on the model, so the larger
 /// of its two published schemes: 85 plus 170 per 512×512 tile (GPT-4.1), or one per 32×32 patch
-/// times 1.62 (GPT-4.1 mini) — a 512×288 frame is 255 tokens there, 209 with Anthropic.
-fn image_tokens_bound(provider: Provider, width: u32, height: u32) -> u64 {
+/// times 1.62 (GPT-4.1 mini) — a 512×288 frame is 255 tokens there, 209 with Anthropic. Gemini
+/// frames are sent at `MEDIA_RESOLUTION_LOW`: a flat 280. Also what `estimate_usage` counts a
+/// frame as.
+pub(crate) fn image_tokens_bound(provider: Provider, width: u32, height: u32) -> u64 {
     match provider {
         Provider::Anthropic => frame_tokens(width, height),
+        // Sent at `MEDIA_RESOLUTION_LOW`: a flat 280 tokens a frame (measured: 3 frames, 798 tokens).
+        Provider::Gemini => 280,
         Provider::OpenAi => {
             let tiles = u64::from(width.div_ceil(512)) * u64::from(height.div_ceil(512));
             let patches = u64::from(width.div_ceil(32)) * u64::from(height.div_ceil(32));
@@ -1237,6 +1241,7 @@ mod tests {
     #[test]
     fn the_image_bound_follows_each_providers_billing() {
         assert_eq!(image_tokens_bound(Provider::Anthropic, 512, 288), 209);
+        assert_eq!(image_tokens_bound(Provider::Gemini, 512, 288), 280);
         assert_eq!(image_tokens_bound(Provider::OpenAi, 512, 288), 255);
         assert_eq!(image_tokens_bound(Provider::OpenAi, 288, 512), 255);
         // Two 512 tiles (425) against 16×32 patches × 1.62 (830): the larger.
