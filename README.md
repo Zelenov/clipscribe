@@ -27,7 +27,7 @@ out, even for clips with no speech.
   the start or end of a moment on a cut; a clip of one shot is sent as before.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
   description knows what is said.
-- One request goes to Claude (Anthropic) or ChatGPT (OpenAI); the answer is structured JSON, and
+- One request goes to Claude (Anthropic), ChatGPT (OpenAI) or Gemini (Google); the answer is structured JSON, and
   moments outside the clip are dropped. Clips over 30 minutes are refused.
 - Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a
   static or uniform clip (the summary already covers it), one per clearly different or standout
@@ -84,9 +84,9 @@ Everything blocks: call it from a worker thread. `describe` fails with `Error::C
 network, timeout) or `BadAnswer` (billed, but not usable). `estimate_usage` and
 `Model::cost_usd` price a clip before sending it; `frames::clip_duration_s` reads its length.
 
-Every entry of `MODELS` carries its `Provider` (`Anthropic` or `OpenAi`); `options.api_key` is
+Every entry of `MODELS` carries its `Provider` (`Anthropic`, `OpenAi` or `Gemini`); `options.api_key` is
 read against whichever provider `options.model` belongs to, so switching to a GPT model is just
-picking a different `MODELS` entry and an OpenAI key — nothing else about the call changes.
+picking a different `MODELS` entry and that provider's key — nothing else about the call changes.
 
 ### Tag suggestions
 

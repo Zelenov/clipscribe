@@ -40,13 +40,15 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ProviderArg::Anthropic)]
     provider: ProviderArg,
 
-    /// The API key for --provider, or ANTHROPIC_API_KEY / OPENAI_API_KEY.
+    /// The API key for --provider, or ANTHROPIC_API_KEY / OPENAI_API_KEY /
+    /// GEMINI_API_KEY.
     #[arg(long)]
     api_key: Option<String>,
 
     /// The model: with anthropic (default), haiku is the cheapest and fine for most clips,
     /// sonnet and opus notice more; with openai, gpt-4.1-mini is the cheapest, gpt-4.1 notices
-    /// more. Defaults to the chosen provider's cheapest model.
+    /// more; with gemini, gemini-3.1-flash-lite is the cheapest, gemini-3.5-flash notices more.
+    /// Defaults to the chosen provider's cheapest model.
     #[arg(long, value_enum)]
     model: Option<ModelArg>,
 
@@ -236,6 +238,7 @@ enum ProviderArg {
     Anthropic,
     #[value(name = "openai")]
     OpenAi,
+    Gemini,
 }
 
 impl ProviderArg {
@@ -243,6 +246,7 @@ impl ProviderArg {
         match self {
             Self::Anthropic => Provider::Anthropic,
             Self::OpenAi => Provider::OpenAi,
+            Self::Gemini => Provider::Gemini,
         }
     }
 
@@ -251,6 +255,7 @@ impl ProviderArg {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
+            Self::Gemini => "GEMINI_API_KEY",
         }
     }
 
@@ -259,6 +264,7 @@ impl ProviderArg {
         match self {
             Self::Anthropic => ModelArg::Haiku,
             Self::OpenAi => ModelArg::Gpt41Mini,
+            Self::Gemini => ModelArg::Gemini31FlashLite,
         }
     }
 
@@ -290,6 +296,10 @@ enum ModelArg {
     Gpt41Mini,
     #[value(name = "gpt-4.1")]
     Gpt41,
+    #[value(name = "gemini-3.1-flash-lite")]
+    Gemini31FlashLite,
+    #[value(name = "gemini-3.5-flash")]
+    Gemini35Flash,
 }
 
 impl ModelArg {
@@ -300,6 +310,8 @@ impl ModelArg {
             Self::Opus => "claude-opus-5",
             Self::Gpt41Mini => "gpt-4.1-mini",
             Self::Gpt41 => "gpt-4.1",
+            Self::Gemini31FlashLite => "gemini-3.1-flash-lite",
+            Self::Gemini35Flash => "gemini-3.5-flash",
         }
     }
 
@@ -1861,6 +1873,9 @@ mod tests {
     fn resolve_model_picks_each_providers_own_default_when_none_is_given() {
         let anthropic = resolve_model(None, ProviderArg::Anthropic).expect("default");
         assert_eq!(anthropic.id, "claude-haiku-4-5");
+        let gemini = resolve_model(None, ProviderArg::Gemini).expect("default");
+        assert_eq!(gemini.id, "gemini-3.1-flash-lite");
+        assert_eq!(ProviderArg::Gemini.env_var(), "GEMINI_API_KEY");
         let openai = resolve_model(None, ProviderArg::OpenAi).expect("default");
         assert_eq!(openai.id, "gpt-4.1-mini");
     }

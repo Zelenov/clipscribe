@@ -1,3 +1,15 @@
+# 0.17.0
+## Added
+- Google Gemini as a third provider: `Provider::Gemini`, the models `gemini-3.1-flash-lite` (the
+  cheap one) and `gemini-3.5-flash` in `MODELS`, `--provider gemini` with `GEMINI_API_KEY`. Frames
+  go as images at Gemini's low media resolution (280 tokens a frame, about as many as Claude's).
+  A wrong key (Google answers 400, not 401) and used-up prepaid credit are told apart from a rate
+  limit, like the other providers.
+
+## Changed
+- `Provider` has a new variant, `Gemini`: a `match` on it that has no `_` arm needs one more arm
+  (frename: `ai::key::ApiKey::of_provider`). Nothing else in the library changes.
+
 # 0.16.2
 ## Changed
 - `FrameSampling::Shots` (`--frames shots`, experimental): in a clip with more than one shot, each
