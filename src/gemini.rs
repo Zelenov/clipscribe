@@ -168,13 +168,24 @@ fn key_is_bad(json: &Value) -> bool {
             .is_some_and(|m| m.contains("API key not valid") || m.contains("API key expired"))
 }
 
-/// Whether a 429 says the prepaid credit or the billing account is used up, not that requests
-/// came too fast.
+/// Whether a 429 says the prepaid credit is used up, not that requests came too fast. Not
+/// "billing": Google's ordinary rate-limit message ("exceeded your current quota, please check
+/// your plan and billing details") has the word too.
 fn credit_is_gone(message: &str) -> bool {
     let message = message.to_lowercase();
-    message.contains("prepayment")
-        || message.contains("credits are depleted")
-        || message.contains("billing")
+    message.contains("prepayment") || message.contains("credits are depleted")
+}
+
+/// The wait Google asks for in a 429: `error.details[].retryDelay`, such as `"27s"` or `"0.5s"`.
+fn retry_delay(json: &Value) -> Option<Duration> {
+    json["error"]["details"]
+        .as_array()?
+        .iter()
+        .filter_map(|d| d["retryDelay"].as_str())
+        .find_map(|text| {
+            let seconds: f64 = text.strip_suffix('s')?.parse().ok()?;
+            (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds.ceil()))
+        })
 }
 
 /// Turn one HTTP answer into the next step.
@@ -200,7 +211,11 @@ fn classify(
         429 if credit_is_gone(&message) => Attempt::Done(Err(AiError::OutOfCredit(
             Provider::Gemini.label().to_string(),
         ))),
-        429 => Attempt::RateLimited(retry_after.unwrap_or(rate_limit_wait)),
+        429 => Attempt::RateLimited(
+            retry_delay(&json)
+                .or(retry_after)
+                .unwrap_or(rate_limit_wait),
+        ),
         500 | 502 | 503 | 504 => Attempt::Retry(format!("HTTP {status}: {message}")),
         _ => Attempt::Done(Err(AiError::Rejected(message))),
     }
@@ -464,6 +479,17 @@ mod tests {
         };
         assert_eq!(wait(Some(Duration::from_secs(5))), Duration::from_secs(5));
         assert_eq!(wait(None), Duration::from_secs(30));
+    }
+
+    /// Google's usual rate-limit text names billing too; it is not an empty account, and it
+    /// says how long to wait in `retryDelay`, not in a header.
+    #[test]
+    fn the_usual_quota_message_is_a_rate_limit_that_waits_as_long_as_google_says() {
+        let body = r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"27s"}]}}"#;
+        match classify(429, None, body, Duration::from_secs(30)) {
+            Attempt::RateLimited(wait) => assert_eq!(wait, Duration::from_secs(27)),
+            _ => panic!("a quota message without the credit wording waits"),
+        }
     }
 
     #[test]

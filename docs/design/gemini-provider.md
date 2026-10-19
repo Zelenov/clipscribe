@@ -41,6 +41,9 @@ real 4754, so still an upper bound).
 
 ## Models
 
+The id `gemini-3.5-flash` is an alias: a request for it came back with `modelVersion:
+"gemini-3.6-flash"`. What it is billed at is unverified (the price is the 3.5 one from Vertex).
+
 `gemini-3.1-flash-lite` (the cheap default, like Haiku) and `gemini-3.5-flash` (stronger). Both
 are in `GET /v1beta/models` for the key used. Per clip of 30 s (16 frames): about $0.0013 and
 $0.0076 (measured).
@@ -49,8 +52,10 @@ $0.0076 (measured).
 
 - A wrong key is **HTTP 400** with `error.details[].reason == "API_KEY_INVALID"` (or the message
   "API key not valid"), not 401: `KeyRejected("Gemini")`. 401/403 are rejected too.
-- 429 whose message says prepayment credits are depleted (or names billing) → `OutOfCredit`;
-  any other 429 is a rate limit and waits (`retry-after`, else the policy's wait).
+- 429 whose message says prepayment credits are depleted → `OutOfCredit`. Any other 429 is a rate
+  limit and waits: `error.details[].retryDelay` (Google sends no `retry-after`), else the header,
+  else the policy's wait. Not matched on "billing": the usual rate-limit text ("exceeded your
+  current quota, please check your plan and billing details") has it too.
 - 500/502/503/504 retry (a real 503 "high demand" was seen during the measurements).
 
 ## Breaking
