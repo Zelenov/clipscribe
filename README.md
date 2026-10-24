@@ -2,7 +2,7 @@
 
 <img src="https://raw.githubusercontent.com/Zelenov/clipscribe/main/docs/icon/clipscribe-256.png" align="left" width="128" height="128" alt="clipscribe icon">
 
-Describe what happens in video clips, and when, with Claude or ChatGPT — a Rust crate
+Describe what happens in video clips, and when, with Claude, ChatGPT or Gemini — a Rust crate
 ([frename](https://github.com/Zelenov/frename) uses it).
 
 A video file and its subtitles go in; a one-sentence summary and time-ranged key moments come
@@ -18,11 +18,17 @@ out, even for clips with no speech.
   equal windows as the frame budget, and the one frame kept from each is wherever the picture
   changes the most in it, so a static shot spends no more of the budget than a clip that keeps
   cutting to something new. `FrameSampling::Interval` goes back to one frame every 2 s, spread
-  evenly on a longer clip.
+  evenly on a longer clip. `FrameSampling::Shots` (experimental, for edited videos) reads the clip
+  once to find its shots (see *Shots of an edit*) and takes one frame from the middle of every
+  shot, never from a cut or a dissolve, and spends what is left of the 60 on the longest shots.
+  Its cost is known only after that pass, so `estimate_usage_sampled(model, duration_s,
+  subtitle_bytes, sampling)` prices it at the most, 60 frames.
+  Each frame is sent with the shot it is from (`shot 3 of 10, 3.6–9.7 s`), so the model can put
+  the start or end of a moment on a cut; a clip of one shot is sent as before.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
   description knows what is said.
-- One request goes to Claude (Anthropic) or ChatGPT (OpenAI); the answer is structured JSON, and
-  moments outside the clip are dropped. Clips over 30 minutes are refused.
+- One request goes to Claude (Anthropic), ChatGPT (OpenAI) or Gemini (Google); the answer is
+  structured JSON, and moments outside the clip are dropped. Clips over 30 minutes are refused.
 - Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a
   static or uniform clip (the summary already covers it), one per clearly different or standout
   part otherwise — never a moment that just tiles the timeline. `MomentsMode::Full` goes back to
@@ -33,6 +39,12 @@ out, even for clips with no speech.
 - A clip with a lead-in or lead-out gets a **main range** (`Description::main`, `"main"` in
   `--json`, `Main:` in the text output): the part an editor would keep, as a suggested In/Out.
   It is absent when the whole clip is usable, and never set in `full` mode.
+- **Your own notes** (`Options::instructions`, at most 2000 characters) go into every request of
+  `describe`, `describe_with_tags`, `suggest_tags` and `describe_moment`: names to use ("the man
+  who appears most often is Eugene"), things to mark as moments ("the moon"), tags to suggest. They
+  steer what is named, marked or tagged; they cannot change the answer's format or language. A
+  tag they ask for that is not in your vocabulary comes back as a tag idea. `None` leaves every
+  request as it was. Add their length to `subtitle_bytes` when you price a clip.
 
 ## As a library
 
@@ -52,6 +64,7 @@ let options = Options {
     language: SummaryLanguage::English,
     frame_sampling: FrameSampling::KeyFrames,
     moments: MomentsMode::Important,
+    instructions: None,
 };
 let subtitles = srt::load_for(video)?;
 let described = describe(video, &subtitles, &options, &AtomicBool::new(false), |stage| {
@@ -64,14 +77,16 @@ for moment in &described.description.segments {
 println!("${:.4}", options.model.cost_usd(described.usage));
 ```
 
-Everything blocks: call it from a worker thread. `describe` fails with `Error::Cancelled`,
-`Unreadable`, `TooLong`, `Ai(AiError)` (rejected key, no credit, limits, network, timeout) or
-`BadAnswer` (billed, but not usable). `estimate_usage` and `Model::cost_usd` price a clip
-before sending it; `frames::clip_duration_s` reads its length.
+`ass::load_for(video)` reads a `.ass` / `.ssa` next to the video the same way, as plain text.
 
-Every entry of `MODELS` carries its `Provider` (`Anthropic` or `OpenAi`); `options.api_key` is
-read against whichever provider `options.model` belongs to, so switching to a GPT model is just
-picking a different `MODELS` entry and an OpenAI key — nothing else about the call changes.
+Everything blocks: call it from a worker thread. `describe` fails with `Error::Cancelled`,
+`Unreadable`, `TooLong`, `InstructionsTooLong`, `Ai(AiError)` (rejected key, no credit, limits,
+network, timeout) or `BadAnswer` (billed, but not usable). `estimate_usage` and
+`Model::cost_usd` price a clip before sending it; `frames::clip_duration_s` reads its length.
+
+Every entry of `MODELS` carries its `Provider` (`Anthropic`, `OpenAi` or `Gemini`);
+`options.api_key` is read against whichever provider `options.model` belongs to, so switching to
+a GPT or Gemini model is just picking a different `MODELS` entry and that provider's key — nothing else about the call changes.
 
 ### Tag suggestions
 
@@ -96,7 +111,102 @@ reading only the frame plus `window_s` on each side of it and any subtitle lines
 same window. `MOMENT_WINDOW_S` (1 s) is a reasonable default for `window_s`. Returns a
 `DescribedMoment { moment: Moment { name, description }, usage }` — `moment.name` is a few words,
 fit for a marker label; `usage` prices with `Model::cost_usd` like any other call.
+`describe_moment_notifying(…, on_stage)` does the same and calls `on_stage` with `Stage::Released`
+once the frames are read and the video file is closed (before the request, which can take a
+while), then `Stage::Asking` and `Stage::Retrying`.
 
+### Shots of an edit
+
+`detect_shots(video, cancel)` finds where an edited video changes picture: one pass over the clip
+(it blocks while it decodes; `cancel` stops it), no request and no cost.
+
+```rust
+let shots = clipscribe::detect_shots("edit.mp4".as_ref(), &AtomicBool::new(false))?;
+for shot in &shots.shots {
+    println!("{:.2}–{:.2} s", shot.start_s, shot.end_s);
+}
+```
+
+Each `Shot` has `start_s`, `end_s` and `enters_by` (`None` for the first, then `Cut`, `Dissolve`
+or `Fade`); each `Transition` in `shots.transitions` has its `kind` and start and end (the same
+for a cut). A dissolve or fade belongs to no shot: it is the gap between one shot's `end_s` and
+the next one's `start_s`. Cuts are found to the frame; the start of a dissolve can come up to a
+third of a second late, because the thresholds are first values, not yet tuned on many real
+edits. A camera flash, a pan or a zoom is not a cut, and a shot is at least half a second. A clip
+without cuts is one shot. A clip over 30 minutes is refused, as for `describe`.
+`shots::find_shots` does the same on frames you decoded yourself, and works without the `frames`
+feature.
+
+### Whole folders
+
+`describe_folder` describes many clips in one call, several at once, and can resume a stopped
+run and stop at a budget:
+
+```rust
+use clipscribe::{
+    cache_path, describe_folder, find_videos, group_clips, Budget, Cache, DescribedClip,
+    GroupOptions, RunOptions,
+};
+
+let videos = find_videos(&["footage".into()])?; // the videos in the folder, sorted
+let cache = Cache::open(&cache_path("footage".as_ref(), None))?;
+let budget = Budget::new(Some(5.0)); // US dollars
+let run = describe_folder(&videos, Some(&cache), &RunOptions::default(), &options, &budget,
+    &AtomicBool::new(false), |event| eprintln!("{event:?}"));
+// Only the described (or cached) clips can be grouped: keep each one's index into `videos`.
+let described: Vec<(usize, &DescribedClip)> = run.clips.iter().enumerate()
+    .filter_map(|(i, c)| c.record().map(|r| (i, &r.clip)))
+    .collect();
+let grouping = group_clips(
+    &described.iter().map(|(_, clip)| *clip).collect::<Vec<_>>(),
+    &GroupOptions::default(), // pictures only; `words: true` is experimental
+);
+for ((i, _), groups) in described.iter().zip(&grouping.clips) {
+    println!("{}: group {}", videos[*i].display(), groups.group);
+}
+```
+
+`grouping.clips[n]` belongs to the `n`th clip passed to `group_clips`, which is not `videos[n]`
+as soon as one video failed or was not started: keep the index, as above.
+
+- **Resume.** The `Cache` is a `.clipscribe-cache.jsonl` file next to the videos (or in a
+  directory you pass to `cache_path`). A clip is found by its `FileIdentity` (size, modification
+  time and a hash of its first, middle and last 64 KiB) and the settings it was described with,
+  so a renamed clip is still found and a different model or `.srt` describes it again. Each clip
+  is written as soon as it is done: a crash or a cancel loses only the clips in work.
+  `RunOptions::force` describes everything again.
+- **Several at once.** `RunOptions::jobs` clips (default 4) are in flight; a rate limit on one
+  pauses all of them.
+- **Budget.** Before each request, `Budget` sets aside the most it can cost (the answer counted at
+  its longest, so several times what it usually costs). A request that does not fit only because
+  of the others in flight waits for them to settle; one that could pass the cap even alone is not
+  sent, the clip comes back `ClipOutcome::OverBudget`, and no new clip is described — the clips
+  left are still served from the cache when it has them (`serve_after_stop`, also for a loop over
+  several folders), and `Budget::refused_usd` says what the refused clip could have cost. A
+  timeout or an unreadable answer counts as its whole bound, since it may have been billed. The
+  cap holds as long as each request is billed at most once and within its bound; OpenAI's image
+  billing is taken from its published formulas, and a request retried after a lost connection
+  may, rarely, have been billed twice.
+- **Outcomes.** `FolderRun::clips` has a `ClipOutcome` per video, in order (`Described`, `Cached`,
+  `Failed`, `OverBudget`, `NotStarted`), with `usage` (what this run spent) and `stopped` (why it
+  stopped early, if it did). `FolderEvent`s arrive from the worker threads, for a progress display.
+  A `Cached` clip's `usage` is what it cost when it was first described, not part of this run's.
+- **Grouping.** `group_clips(clips, &GroupOptions::default())` puts clips, and stretches within
+  them, in one `Group` when they look like the same shot, with a label taken from the
+  descriptions. The pictures (8×8 brightness grids of the frames already sent, whatever the
+  exposure, turned sideways too) find duplicates, re-exports, a clip stored sideways and a camera
+  that did not move. It costs nothing, runs offline and gives the same groups every time; the
+  threshold is provisional, measured on near-duplicates and synthetic patterns, not yet on real
+  retakes. `GroupOptions { words: true }` is **experimental** and off by default: it also joins
+  clips whose descriptions share many words, which finds the same subject filmed again from
+  elsewhere, but can join unrelated clips described in similar everyday words ("a woman in a
+  bright kitchen", "a woman in a bright office"), miss the same subject reworded, and chain
+  groups together on a large folder. Its threshold was tuned on descriptions written for the
+  tests, not on real ones: check the groups before relying on them.
+
+To build your own loop instead, the parts are public: `CacheKey`, `Cache::get`/`put`,
+`cached_clip`, `describe_clip` (one clip, within a `Budget`), `Budget::reserve_or_wait` and
+`request_cost_bound`.
 ### Seeing the frames
 
 To check which images the model got, call `set_debug_frames_dir(Some(dir))` (or set
@@ -112,8 +222,8 @@ without sending anything.
 | Feature | |
 |---|---|
 | `cli` (default) | The `clipscribe` binary (clap, ctrlc). Implies `frames`. |
-| `frames` (default) | GStreamer frame reading and `describe`. |
-| none | Models, languages, request and answer types, the estimate, `srt` and both providers' clients, with no GStreamer. |
+| `frames` (default) | GStreamer frame reading, `describe` and `describe_folder`. |
+| none | Models, languages, request and answer types, the estimate, `srt`, `ass`, the three providers' clients, the cache and `group_clips`, with no GStreamer. |
 
 ## Building
 

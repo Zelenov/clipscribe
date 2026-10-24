@@ -1,3 +1,126 @@
+# 0.17.0
+## Added
+- Google Gemini as a third provider: `Provider::Gemini`, the models `gemini-3.1-flash-lite` (the
+  cheap one) and `gemini-3.5-flash` in `MODELS`, `--provider gemini` with `GEMINI_API_KEY`. Frames
+  go as images at Gemini's low media resolution (280 tokens a frame, about as many as Claude's).
+  A wrong key (Google answers 400, not 401) and used-up prepaid credit are told apart from a rate
+  limit, like the other providers.
+
+## Changed
+- `Provider` has a new variant, `Gemini`: a `match` on it that has no `_` arm needs one more arm
+  (frename: `ai::key::ApiKey::of_provider`).
+- `estimate_usage` and `estimate_usage_sampled` count a frame the way its model's provider bills
+  it (OpenAI: 255 tokens, was 209; Gemini 280), so `--estimate` for the OpenAI models rises about
+  20 %.
+
+# 0.16.2
+## Changed
+- `FrameSampling::Shots` (`--frames shots`, experimental): in a clip with more than one shot, each
+  frame is sent with its shot (`shot 3 of 10, 3.6–9.7 s`) and the instructions say what it means,
+  so a moment can start or end on a cut. A clip of one shot, and every other way of sampling,
+  sends the request it always did.
+
+# 0.16.1
+## Fixed
+- Shot detection on fast montages: a jump of 10 percent or more between two frames is a cut even
+  when the cuts next to it are as strong (cuts 0.8 s apart used to hide each other, so half of
+  them were lost). A slow camera move that speeds up is no longer taken for a dissolve, and a
+  dissolve no longer runs over the cut that follows it. On a 16 s travel montage with 10 cuts,
+  `--shots` now finds 9 cuts plus one under the half-second minimum (it found 4 before).
+
+# 0.16.0
+## Added
+- Library: `Options::instructions` takes your own notes about the footage (names to use, things to
+  mark as moments, tags to suggest), up to 2000 characters. They are added to the request of
+  `describe`, `describe_with_tags`, `suggest_tags` and `describe_moment`, and cannot change the
+  answer's format or language. A tag a note asks for that is not in the vocabulary comes back as
+  a tag idea. `None` keeps every request exactly as it was. `add_instructions` adds notes to a
+  request you build yourself; add the notes' length to `subtitle_bytes` of `estimate_usage`.
+- Command line: `--instructions "<text>"` and `--instructions-file <path>`. Changing the notes
+  describes cached videos again.
+
+## Changed
+- `Options` has a new field, `instructions`: set `instructions: None` where you build it (frename
+  does exactly that, nothing else changes).
+- `Error` has a new variant, `InstructionsTooLong { chars, max }`, returned before anything is
+  sent when the notes are over the limit: a `match` on it without a wildcard arm must handle it.
+
+# 0.15.0
+## Added
+- Library: `FrameSampling::Shots` takes one frame from the middle of every shot of an edited video
+  instead of one per time window, so no shot of a montage goes unseen and none is wasted on a
+  dissolve; the frame budget is at least the number of shots (up to 60) and the rest goes to the
+  longest shots. It reads the clip once more to find the shots and is experimental: it is never
+  the default, and look-alike shots still get a frame each. `frame_budget`, `shot_times` and
+  `estimate_usage_sampled` price and plan it (a cost estimate assumes the most, 60 frames).
+- Command line: `--frames shots`; `--estimate` assumes 60 frames for it.
+
+## Changed
+- `FrameSampling` has a new variant, `Shots`: a `match` on it without a wildcard arm must handle
+  it (frename does not match on it).
+
+# 0.14.0
+## Added
+- Command line: `clipscribe edit.mp4 --shots` lists the shots of an edited video (where the picture
+  cuts, dissolves or fades), or with `--json` prints `shots` and `transitions` for each video.
+  It runs on this computer: nothing is sent, no API key is needed. Frames chosen by shot come in a
+  later release.
+
+# 0.13.0
+## Added
+- Library: `detect_shots(video, cancel)` finds the shots of an edited video: cuts to the frame,
+  and dissolves and fades as ranges that belong to no shot (their start can be found up to a
+  third of a second late; the thresholds are still first values). It reads the clip once at
+  64×36 grey and sends nothing to Claude. Returns `Shots`, `Shot`, `Transition`,
+  `TransitionKind`. A clip over 30 minutes is refused (`Error::TooLong`), a file with no video is
+  `Error::Unreadable`. The frame-by-shot sampling and the command line (`--shots`) come in later
+  releases. `shots::find_shots` is the same on frames you decoded yourself.
+
+# 0.12.0
+## Added
+- Library: `describe_moment_notifying(…, on_stage)` is `describe_moment` with a progress callback,
+  like `describe`'s. The new `Stage::Released` comes as soon as the frames are read and the video
+  file is closed, before the request (which can take up to two minutes): the file can be moved or
+  deleted meanwhile. `Stage::Asking` and `Stage::Retrying` follow. `describe_moment` is unchanged.
+
+# 0.11.0
+## Added
+- Whole folders: `clipscribe footage/ --resume --groups --json`. `--resume` skips videos already
+  described (a `.clipscribe-cache.jsonl` next to them, or in `--cache-dir`) and saves each new one
+  as soon as it is done, so a stopped run picks up where it left off; `--force` describes
+  everything again and refreshes the cache. Library: `Cache`, `CacheKey`, `FileIdentity`.
+- Several videos in work at once: `--jobs N` (default 4); a rate limit on one pauses them all.
+  Results still print in input order.
+- `--max-cost USD`: a budget cap. Before each request the most it can cost is set aside; a video
+  that does not fit only because of others in flight waits for them, and one that could take the
+  run past the cap even alone is not sent, and no new video is described (videos already in the
+  cache are still shown). The message says the cap, what was spent, what the next video could
+  have cost and what to do next. Library: `Budget` (`reserve_or_wait`, `Reserved`,
+  `refused_usd`), `request_cost_bound`, `cached_clip`, `serve_after_stop`.
+- `--groups`: groups similar footage — videos, and stretches within them, that look like the same
+  shot (duplicates, re-exports, a clip stored sideways, a camera that did not move) — each group
+  with a label from the descriptions, at no extra cost. Text ends with a `Groups:` section; JSON
+  clip objects gain `group`, `group_label`, `stretches`, and each moment a `group`. Library:
+  `group_clips(clips, &GroupOptions)`.
+- `--groups=words` (**experimental**): also joins videos whose descriptions share many words (the
+  same subject, even after the camera moved). Its threshold was tuned on descriptions written for
+  the tests, not on real ones: it can join unrelated videos described in similar everyday words,
+  miss the same subject reworded, and chain groups together on a large folder — check them.
+  Library: `GroupOptions { words: true }`, off by default.
+- Library: `describe_folder` runs a whole folder with `FolderEvent`s for a progress display;
+  `describe_clip` describes one clip within a `Budget`; `find_videos` lists a folder's videos.
+
+## Changed
+- Every run over whole clips goes through the folder run, several videos at once; `--jobs 1`
+  works one video at a time as before. With `--json`, a clip from the cache carries
+  `"cached": true`, and its `usage` and `cost_usd` are what it cost when it was described, not
+  what this run spent (the usage line on stderr counts only this run). The status line shows how
+  many videos are done and in work.
+
+# 0.10.0
+## Added
+- Library: `clipscribe::ass` reads `.ass` / `.ssa` subtitles as plain text cues: `ass::parse` (the `[Events]` section by its `Format:` line, `Dialogue:` lines only; override tags and drawings dropped, `\N` and `\n` as line breaks), `ass::existing_path(video)` (`clip.ass`, else `clip.ssa`) and `ass::load_for(video)`. Nothing else changes: `srt` and the command line still read `.srt` only, and no caller has to change.
+
 # 0.9.0
 ## Added
 - Command line: a batch shows a plan line (`24 videos: 41:12 of footage, ≈ $0.38 with …`), one bar for the whole run weighted by footage with cost so far and an ETA, the stage of the video in work (frames, asking the provider, retrying in 8 s), one result line per video and a summary.

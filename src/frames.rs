@@ -15,9 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::describe::{
-    candidate_times, frame_count, frame_size, sample_times, select_key_frames, Frame,
-    FrameSampling, FRAME_LONG_SIDE,
+    candidate_times, frame_count, frame_size, sample_times, select_key_frames, shot_times, Frame,
+    FrameSampling, FRAME_LONG_SIDE, MAX_DURATION_S,
 };
+use crate::shots::{find_shots, Shots, FRAME_HEIGHT, FRAME_WIDTH};
+use crate::Error;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -30,36 +32,96 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const JPEG_QUALITY: u8 = 80;
 
+/// The frames [`Clip::sample_with_fingerprints`] read: what is sent to the model, and each one's
+/// fingerprint (same order, same times), made from the same decoded picture.
+pub(crate) struct Sampled {
+    pub(crate) frames: Vec<Frame>,
+    pub(crate) fingerprints: Vec<crate::FrameFingerprint>,
+    /// The shots the frames were chosen by ([`FrameSampling::Shots`] with at least one found).
+    pub(crate) shots: Option<Shots>,
+}
+
+/// The frames of the clip at `video` (open as `clip`, `duration_s` long) for `sampling`. With
+/// [`FrameSampling::Shots`] this reads the clip once to find its shots ([`detect_shots`]) and
+/// takes a frame from the middle of each ([`shot_times`]); with no shots found it falls back to
+/// key frames.
+pub(crate) fn sample_clip(
+    video: &Path,
+    clip: &Clip,
+    duration_s: f64,
+    sampling: FrameSampling,
+    cancel: &AtomicBool,
+    mut on_frame: impl FnMut(usize, usize),
+) -> Result<Option<Sampled>, String> {
+    if sampling != FrameSampling::Shots {
+        return clip.sample_with_fingerprints(duration_s, sampling, cancel, on_frame);
+    }
+    let shots = match detect_shots(video, cancel) {
+        Ok(shots) => shots,
+        Err(Error::Cancelled) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let times = shot_times(&shots, duration_s);
+    if times.is_empty() {
+        return clip.sample_with_fingerprints(
+            duration_s,
+            FrameSampling::KeyFrames,
+            cancel,
+            on_frame,
+        );
+    }
+    Ok(clip
+        .sample_at(&times, cancel, &mut on_frame)?
+        .map(|sampled| Sampled {
+            shots: Some(shots),
+            ..sampled
+        }))
+}
+
 /// A clip opened paused for sampling. Stopped when dropped.
 pub struct Clip {
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
+    _stop: StopOnDrop,
 }
 
-impl Drop for Clip {
+/// Stops a pipeline when dropped.
+struct StopOnDrop(gst::Pipeline);
+
+impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let _ = self.0.set_state(gst::State::Null);
     }
+}
+
+/// The `file://` URI of the video at `path`.
+fn file_uri(path: &Path) -> Result<url::Url, String> {
+    let absolute = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    url::Url::from_file_path(&absolute)
+        .map_err(|()| format!("not a file path: {}", absolute.display()))
+}
+
+fn make_element(factory: &str) -> Result<gst::Element, String> {
+    gst::ElementFactory::make(factory)
+        .build()
+        .map_err(|e| format!("{factory}: {e}"))
+}
+
+/// A `uridecodebin` for the video at `path`.
+fn decoder(path: &Path) -> Result<gst::Element, String> {
+    gst::ElementFactory::make("uridecodebin")
+        .property("uri", file_uri(path)?.as_str())
+        .build()
+        .map_err(|e| format!("uridecodebin: {e}"))
 }
 
 impl Clip {
     /// Open the clip at `path` and wait up to `timeout` for its first frame.
     pub fn open(path: &Path, timeout: Duration) -> Result<Self, String> {
         gst::init().map_err(|e| e.to_string())?;
-        let absolute = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-        let uri = url::Url::from_file_path(&absolute)
-            .map_err(|()| format!("not a file path: {}", absolute.display()))?;
-
-        let make = |factory: &str| {
-            gst::ElementFactory::make(factory)
-                .build()
-                .map_err(|e| format!("{factory}: {e}"))
-        };
+        let make = make_element;
         let pipeline = gst::Pipeline::new();
-        let decode = gst::ElementFactory::make("uridecodebin")
-            .property("uri", uri.as_str())
-            .build()
-            .map_err(|e| format!("uridecodebin: {e}"))?;
+        let decode = decoder(path)?;
         let scale = make("videoscale")?;
         // At most 512 px on each side with square pixels; videoscale keeps the aspect ratio
         // within that, so the long side becomes 512.
@@ -90,40 +152,16 @@ impl Clip {
         gst::Element::link_many([&scale, &scaled, &convert, sink.upcast_ref()])
             .map_err(|e| e.to_string())?;
 
-        // The first video stream goes to the scaler; everything else (sound, a second video
-        // stream) to a sink of its own that drops it, so no stream stalls the others.
         let video_in = scale
             .static_pad("sink")
             .ok_or("videoscale has no sink pad")?;
-        // Weak: the pipeline owns the decoder that owns this closure.
-        let bin = pipeline.downgrade();
-        decode.connect_pad_added(move |_, pad| {
-            let is_video = pad
-                .current_caps()
-                .or_else(|| Some(pad.query_caps(None)))
-                .and_then(|caps| caps.structure(0).map(|s| s.name().starts_with("video/")))
-                .unwrap_or(false);
-            if is_video && !video_in.is_linked() && pad.link(&video_in).is_ok() {
-                return;
-            }
-            let Ok(drop) = gst::ElementFactory::make("fakesink")
-                .property("sync", false)
-                .build()
-            else {
-                return;
-            };
-            let Some(bin) = bin.upgrade() else {
-                return;
-            };
-            if bin.add(&drop).is_ok() {
-                let _ = drop.sync_state_with_parent();
-                if let Some(sink_pad) = drop.static_pad("sink") {
-                    let _ = pad.link(&sink_pad);
-                }
-            }
-        });
+        route_streams(&pipeline, &decode, video_in);
 
-        let clip = Self { pipeline, sink };
+        let clip = Self {
+            _stop: StopOnDrop(pipeline.clone()),
+            pipeline,
+            sink,
+        };
         clip.pipeline.set_state(gst::State::Paused).map_err(|_| {
             clip.bus_error()
                 .unwrap_or_else(|| "cannot open".to_string())
@@ -217,8 +255,22 @@ impl Clip {
         duration_s: f64,
         sampling: FrameSampling,
         cancel: &AtomicBool,
-        mut on_frame: impl FnMut(usize, usize),
+        on_frame: impl FnMut(usize, usize),
     ) -> Result<Option<Vec<Frame>>, String> {
+        Ok(self
+            .sample_with_fingerprints(duration_s, sampling, cancel, on_frame)?
+            .map(|sampled| sampled.frames))
+    }
+
+    /// [`Self::sample`], with each frame's fingerprint (an 8×8 grid of average luma of the upright
+    /// frame, see [`crate::FrameFingerprint`]) for grouping similar footage.
+    pub(crate) fn sample_with_fingerprints(
+        &self,
+        duration_s: f64,
+        sampling: FrameSampling,
+        cancel: &AtomicBool,
+        mut on_frame: impl FnMut(usize, usize),
+    ) -> Result<Option<Sampled>, String> {
         // Below two frames' worth of budget there is no window to choose a frame within, so
         // `KeyFrames` has nothing to add over `Interval`.
         let key_frames = sampling == FrameSampling::KeyFrames && frame_count(duration_s) > 1;
@@ -276,17 +328,63 @@ impl Clip {
         } else {
             (0..candidates.len()).collect()
         };
-        chosen
-            .into_iter()
-            .map(|i| {
-                let (time_s, image) = candidates[i].clone();
-                Ok(Frame {
-                    time_s,
-                    jpeg: to_jpeg(orient(image, orientation.as_deref()))?,
-                })
-            })
-            .collect::<Result<Vec<Frame>, String>>()
-            .map(Some)
+        let mut frames = Vec::with_capacity(chosen.len());
+        let mut fingerprints = Vec::with_capacity(chosen.len());
+        for i in chosen {
+            let (time_s, image) = candidates[i].clone();
+            let upright = orient(image, orientation.as_deref());
+            fingerprints.push(crate::FrameFingerprint {
+                time_s,
+                fingerprint: fingerprint(&upright),
+            });
+            frames.push(Frame {
+                time_s,
+                jpeg: to_jpeg(upright)?,
+            });
+        }
+        Ok(Some(Sampled {
+            frames,
+            fingerprints,
+            shots: None,
+        }))
+    }
+
+    /// One frame at each of `times` (exact seeks, in order), for [`sample_clip`]. A time past the
+    /// end of the picture ends the list early; `Ok(None)` when `cancel` is set between two frames.
+    fn sample_at(
+        &self,
+        times: &[f64],
+        cancel: &AtomicBool,
+        on_frame: &mut impl FnMut(usize, usize),
+    ) -> Result<Option<Sampled>, String> {
+        let orientation = self.orientation();
+        let mut frames = Vec::with_capacity(times.len());
+        let mut fingerprints = Vec::with_capacity(times.len());
+        for (i, time_s) in times.iter().enumerate() {
+            on_frame(i, times.len());
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let (pts, image) = match self.frame_at(*time_s, gst::SeekFlags::ACCURATE) {
+                Ok(frame) => frame,
+                Err(_) if !frames.is_empty() => break,
+                Err(e) => return Err(e),
+            };
+            let upright = orient(image, orientation.as_deref());
+            fingerprints.push(crate::FrameFingerprint {
+                time_s: pts,
+                fingerprint: fingerprint(&upright),
+            });
+            frames.push(Frame {
+                time_s: pts,
+                jpeg: to_jpeg(upright)?,
+            });
+        }
+        Ok(Some(Sampled {
+            frames,
+            fingerprints,
+            shots: None,
+        }))
     }
 
     /// The frame at `at_s`, plus one on each side `window_s` away — for [`describe_moment`],
@@ -427,6 +525,132 @@ fn to_jpeg(image: image::RgbImage) -> Result<Vec<u8>, String> {
         .encode_image(&image)
         .map_err(|e| e.to_string())?;
     Ok(jpeg)
+}
+
+/// Send the first video stream of `decode` to `video_in`; everything else (sound, a second video
+/// stream) to a sink of its own that drops it, so no stream stalls the others.
+fn route_streams(pipeline: &gst::Pipeline, decode: &gst::Element, video_in: gst::Pad) {
+    // Weak: the pipeline owns the decoder that owns this closure.
+    let bin = pipeline.downgrade();
+    decode.connect_pad_added(move |_, pad| {
+        let is_video = pad
+            .current_caps()
+            .or_else(|| Some(pad.query_caps(None)))
+            .and_then(|caps| caps.structure(0).map(|s| s.name().starts_with("video/")))
+            .unwrap_or(false);
+        if is_video && !video_in.is_linked() && pad.link(&video_in).is_ok() {
+            return;
+        }
+        let Ok(drop) = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+        else {
+            return;
+        };
+        let Some(bin) = bin.upgrade() else {
+            return;
+        };
+        if bin.add(&drop).is_ok() {
+            let _ = drop.sync_state_with_parent();
+            if let Some(sink_pad) = drop.static_pad("sink") {
+                let _ = pad.link(&sink_pad);
+            }
+        }
+    });
+}
+
+/// The shots of the clip at `video`: one continuous decode to 64×36 grey frames, then
+/// [`find_shots`]. Blocks for about as long as decoding the clip takes; `cancel` stops it. Every
+/// frame is kept in memory (2.3 KB), so a clip over [`MAX_DURATION_S`] is refused with
+/// [`Error::TooLong`]. Frames are not rotated (cuts do not depend on it); times are the clip's.
+pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
+    if let Some(duration_s) = clip_duration_s(video).filter(|d| *d > MAX_DURATION_S) {
+        return Err(Error::TooLong(duration_s));
+    }
+    let unreadable = Error::Unreadable;
+    gst::init().map_err(|e| unreadable(e.to_string()))?;
+    let pipeline = gst::Pipeline::new();
+    let decode = decoder(video).map_err(unreadable)?;
+    let scale = make_element("videoscale").map_err(unreadable)?;
+    let convert = make_element("videoconvert").map_err(unreadable)?;
+    let sink = gst_app::AppSink::builder()
+        .caps(
+            &gst::Caps::builder("video/x-raw")
+                .field("format", "GRAY8")
+                .field("width", FRAME_WIDTH as i32)
+                .field("height", FRAME_HEIGHT as i32)
+                .build(),
+        )
+        .sync(false)
+        .max_buffers(16)
+        .build();
+    pipeline
+        .add_many([&decode, &scale, &convert, sink.upcast_ref()])
+        .map_err(|e| unreadable(e.to_string()))?;
+    gst::Element::link_many([&scale, &convert, sink.upcast_ref()])
+        .map_err(|e| unreadable(e.to_string()))?;
+    let video_in = scale
+        .static_pad("sink")
+        .ok_or_else(|| unreadable("videoscale has no sink pad".to_string()))?;
+    route_streams(&pipeline, &decode, video_in);
+    let _stop = StopOnDrop(pipeline.clone());
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|_| unreadable("cannot open".to_string()))?;
+
+    let bus = pipeline
+        .bus()
+        .ok_or_else(|| unreadable("no bus".to_string()))?;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut times = Vec::new();
+    let mut last_end = 0.0f64;
+    // A file with no video stream never posts EOS (the sink is never fed), so a silent pipeline
+    // is an error after a while, like `Clip::open`'s timeout.
+    let mut quiet_since = std::time::Instant::now();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+            quiet_since = std::time::Instant::now();
+            let buffer = sample
+                .buffer()
+                .ok_or_else(|| unreadable("frame without data".to_string()))?;
+            let map = buffer
+                .map_readable()
+                .map_err(|_| unreadable("unreadable frame".to_string()))?;
+            if map.len() < FRAME_WIDTH * FRAME_HEIGHT {
+                return Err(unreadable("short frame".to_string()));
+            }
+            let pts = buffer.pts().map_or(last_end, |t| t.nseconds() as f64 / 1e9);
+            last_end = pts + buffer.duration().map_or(0.0, |t| t.nseconds() as f64 / 1e9);
+            frames.push(map[..FRAME_WIDTH * FRAME_HEIGHT].to_vec());
+            times.push(pts);
+        } else if sink.is_eos() {
+            break;
+        } else if quiet_since.elapsed()
+            > if frames.is_empty() {
+                OPEN_TIMEOUT
+            } else {
+                FRAME_TIMEOUT
+            }
+        {
+            return Err(unreadable(if frames.is_empty() {
+                "no video stream".to_string()
+            } else {
+                "no frame in time".to_string()
+            }));
+        }
+        while let Some(message) = bus.pop() {
+            if let gst::MessageView::Error(e) = message.view() {
+                return Err(unreadable(e.error().to_string()));
+            }
+        }
+    }
+    if frames.is_empty() {
+        return Err(unreadable("no video stream".to_string()));
+    }
+    Ok(find_shots(&frames, &times, last_end))
 }
 
 /// The length in seconds of the clip at `path`, for an estimate before describing it; `None`
@@ -949,5 +1173,151 @@ mod tests {
                 assert_eq!(fp[gy * 8 + gx], 255);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shots_sampling_takes_one_frame_from_inside_every_shot() {
+        let path = repo().join("tests/clips/shots-edit.mp4");
+        let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+        let duration = clip.duration_s().expect("duration");
+        let cancel = AtomicBool::new(false);
+        let shots = detect_shots(&path, &cancel).expect("shots");
+        let sampled = sample_clip(
+            &path,
+            &clip,
+            duration,
+            FrameSampling::Shots,
+            &cancel,
+            |_, _| {},
+        )
+        .expect("frames")
+        .expect("not cancelled");
+        assert_eq!(sampled.frames.len(), shots.shots.len());
+        assert_eq!(sampled.fingerprints.len(), sampled.frames.len());
+        for (frame, shot) in sampled.frames.iter().zip(&shots.shots) {
+            assert!(
+                frame.time_s >= shot.start_s - 0.05 && frame.time_s <= shot.end_s + 0.05,
+                "frame at {:.2} outside shot {:.2}–{:.2}",
+                frame.time_s,
+                shot.start_s,
+                shot.end_s
+            );
+        }
+        // Cancelled before the first frame.
+        let stop = AtomicBool::new(true);
+        assert!(sample_clip(
+            &path,
+            &clip,
+            duration,
+            FrameSampling::Shots,
+            &stop,
+            |_, _| {}
+        )
+        .expect("no error")
+        .is_none());
+    }
+
+    /// `tests/clips/shots-edit.mp4`: 3 s of test pattern dissolving into a fractal from 2 to 3 s,
+    /// cut to a green cell pattern at 5 s and to colour bars at 7 s, 10 s in all. Made with
+    /// FFmpeg: `testsrc2`, `mandelbrot`, `life`, `rgbtestsrc` joined by `xfade` and `concat`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_shots_finds_the_cuts_and_the_dissolve_of_an_edit() {
+        use crate::shots::TransitionKind;
+        let shots = detect_shots(
+            &repo().join("tests/clips/shots-edit.mp4"),
+            &AtomicBool::new(false),
+        )
+        .expect("shots");
+        let t0 = shots.shots[0].start_s;
+        let kinds: Vec<_> = shots.transitions.iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                TransitionKind::Dissolve,
+                TransitionKind::Cut,
+                TransitionKind::Cut
+            ],
+            "{shots:?}"
+        );
+        let [dissolve, first_cut, second_cut] = shots.transitions[..] else {
+            panic!("{shots:?}");
+        };
+        assert!(
+            (2.0..=2.5).contains(&(dissolve.start_s - t0)),
+            "{dissolve:?}"
+        );
+        assert!((2.9..=3.2).contains(&(dissolve.end_s - t0)), "{dissolve:?}");
+        assert!((first_cut.start_s - t0 - 5.0).abs() < 0.04, "{first_cut:?}");
+        assert!(
+            (second_cut.start_s - t0 - 7.0).abs() < 0.04,
+            "{second_cut:?}"
+        );
+        assert_eq!(shots.shots.len(), 4);
+        assert!((shots.shots[3].end_s - t0 - 10.0).abs() < 0.2, "{shots:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_shots_reads_the_ci_clips() {
+        for clip in ci_clips() {
+            let shots = detect_shots(&clip, &AtomicBool::new(false)).expect("shots");
+            assert!(!shots.shots.is_empty(), "{}", clip.display());
+            let duration = clip_duration_s(&clip).expect("duration");
+            let end = shots.shots.last().expect("a shot").end_s;
+            assert!(
+                (end - duration).abs() < 1.0,
+                "{}: {end} vs {duration}",
+                clip.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_shots_can_be_cancelled_and_reports_a_missing_file() {
+        let clip = repo().join("tests/clips/shots-edit.mp4");
+        assert_eq!(
+            detect_shots(&clip, &AtomicBool::new(true)),
+            Err(Error::Cancelled)
+        );
+        assert!(matches!(
+            detect_shots(
+                &repo().join("tests/clips/missing.mp4"),
+                &AtomicBool::new(false)
+            ),
+            Err(Error::Unreadable(_))
+        ));
+    }
+
+    /// A file with sound only never feeds the sink and so never ends: it must fail, not hang.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_shots_refuses_a_file_without_video() {
+        // One second of 8-bit silence at 8 kHz as a WAV file.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + 8000).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        for field in [1u16, 1] {
+            wav.extend_from_slice(&field.to_le_bytes());
+        }
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&[128u8; 8000]);
+        let path =
+            std::env::temp_dir().join(format!("clipscribe-silence-{}.wav", std::process::id()));
+        std::fs::write(&path, wav).expect("write");
+        let started = std::time::Instant::now();
+        let result = detect_shots(&path, &AtomicBool::new(false));
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

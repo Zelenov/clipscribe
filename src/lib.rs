@@ -17,6 +17,7 @@
 //!     language: SummaryLanguage::English,
 //!     frame_sampling: FrameSampling::KeyFrames,
 //!     moments: MomentsMode::Important,
+//!     instructions: None,
 //! };
 //! let described = describe("clip.mp4".as_ref(), &[], &options, &AtomicBool::new(false), |_| {})
 //!     .expect("described");
@@ -29,22 +30,43 @@
 //! Everything blocks: call it from a worker thread. Without the default `frames` feature the
 //! crate has no GStreamer dependency and no [`describe`]; the models, the request, the answer,
 //! the estimate and the Anthropic client remain.
+//!
+//! Whole folders: [`describe_folder`] describes many clips with several in flight, skipping those
+//! a [`Cache`] already has and stopping within a [`Budget`]; [`group_clips`] groups similar
+//! footage. See `docs/design/whole-folders.md`.
 
 pub mod anthropic;
+pub mod ass;
+mod cache;
 mod debug_frames;
 mod describe;
+mod folder;
 #[cfg(feature = "frames")]
 pub mod frames;
+pub mod gemini;
+mod groups;
 mod moment;
 pub mod openai;
 pub mod provider;
+pub mod shots;
 pub mod srt;
 mod tags;
 
 use std::time::Duration;
 
+pub use cache::{cache_path, Cache, CacheKey, ClipRecord, FileIdentity, CACHE_FILE_NAME};
 pub use debug_frames::{debug_frames_dir, dump_frames, set_debug_frames_dir, DEBUG_FRAMES_ENV};
 pub use describe::*;
+pub use folder::{
+    cached_clip, find_videos, request_cost_bound, serve_after_stop, Budget, ClipOutcome,
+    DescribedClip, FolderEvent, FolderRun, FrameFingerprint, Reservation, Reserved, RunOptions,
+    Stop, DEFAULT_JOBS, VIDEO_EXTENSIONS,
+};
+#[cfg(feature = "frames")]
+pub use folder::{describe_clip, describe_folder};
+#[cfg(feature = "frames")]
+pub use frames::detect_shots;
+pub use groups::{group_clips, ClipGroups, Group, GroupOptions, Grouping, Stretch};
 pub use moment::*;
 pub use provider::{AiError, AiProvider, AiUsage, Provider, RetryReason};
 pub use tags::*;
@@ -69,6 +91,30 @@ pub struct Options {
     pub frame_sampling: FrameSampling,
     /// How many moments (segments) a description gets; see [`MomentsMode`].
     pub moments: MomentsMode,
+    /// The user's own notes about the footage, added to the request of [`describe`],
+    /// [`describe_with_tags`], [`suggest_tags`] and [`describe_moment`]: names to use, things
+    /// to mark as moments, tags to suggest. `None` (or only whitespace) leaves every request
+    /// exactly as it is without them. At most [`MAX_INSTRUCTIONS_CHARS`] characters, otherwise
+    /// those functions return [`Error::InstructionsTooLong`] before anything is sent. They count
+    /// in the price of a request: add their length to `subtitle_bytes` of [`estimate_usage`].
+    pub instructions: Option<String>,
+}
+
+impl Options {
+    /// `Ok` when [`Options::instructions`] fits [`MAX_INSTRUCTIONS_CHARS`].
+    pub fn check_instructions(&self) -> Result<(), Error> {
+        match self
+            .instructions
+            .as_deref()
+            .map(|notes| notes.trim().chars().count())
+        {
+            Some(chars) if chars > MAX_INSTRUCTIONS_CHARS => Err(Error::InstructionsTooLong {
+                chars,
+                max: MAX_INSTRUCTIONS_CHARS,
+            }),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Options {
@@ -80,6 +126,14 @@ impl std::fmt::Debug for Options {
             .field("language", &self.language)
             .field("frame_sampling", &self.frame_sampling)
             .field("moments", &self.moments)
+            // The notes are the user's own: only their length goes to a log.
+            .field(
+                "instructions_chars",
+                &self
+                    .instructions
+                    .as_ref()
+                    .map(|notes| notes.chars().count()),
+            )
             .finish()
     }
 }
@@ -89,6 +143,10 @@ impl std::fmt::Debug for Options {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Stage {
+    /// Only [`describe_moment_notifying`]: the frames are read and the video file is closed, so
+    /// it can be moved or deleted while the request is in flight. Comes before
+    /// [`Stage::Asking`]; not reported when reading the video failed or `cancel` was set.
+    Released,
     /// Reading frame `done + 1` of `total`.
     Frame { done: usize, total: usize },
     /// The frames are sent to `provider`; waiting for the answer.
@@ -124,6 +182,8 @@ pub enum Error {
     Ai(AiError),
     /// An answer came (and was billed) but could not be used.
     BadAnswer { reason: String, usage: AiUsage },
+    /// [`Options::instructions`] is longer than `max` characters; nothing was sent.
+    InstructionsTooLong { chars: usize, max: usize },
 }
 
 impl std::fmt::Display for Error {
@@ -139,20 +199,39 @@ impl std::fmt::Display for Error {
             ),
             Self::Ai(error) => f.write_str(&error.reason()),
             Self::BadAnswer { reason, .. } => f.write_str(reason),
+            Self::InstructionsTooLong { chars, max } => write!(
+                f,
+                "the instructions are {chars} characters, longer than the {max} limit; shorten them"
+            ),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// The client for `options.model`'s provider.
-fn provider_for(options: &Options) -> Result<Box<dyn provider::AiProvider>, Error> {
+/// The client for `options.model`'s provider; with a `gate`, pausing together with every other
+/// client sharing it (the workers of one folder run).
+fn provider_for(
+    options: &Options,
+    gate: Option<std::sync::Arc<provider::RateGate>>,
+) -> Result<Box<dyn provider::AiProvider>, Error> {
+    options.check_instructions()?;
+    let key = options.api_key.clone();
     match options.model.provider {
         Provider::Anthropic => Ok(Box::new(
-            anthropic::Anthropic::new(options.api_key.clone()).map_err(Error::Ai)?,
+            anthropic::Anthropic::new(key)
+                .map_err(Error::Ai)?
+                .with_rate_gate(gate),
         )),
         Provider::OpenAi => Ok(Box::new(
-            openai::OpenAi::new(options.api_key.clone()).map_err(Error::Ai)?,
+            openai::OpenAi::new(key)
+                .map_err(Error::Ai)?
+                .with_rate_gate(gate),
+        )),
+        Provider::Gemini => Ok(Box::new(
+            gemini::Gemini::new(key)
+                .map_err(Error::Ai)?
+                .with_rate_gate(gate),
         )),
     }
 }
@@ -161,7 +240,9 @@ fn provider_for(options: &Options) -> Result<Box<dyn provider::AiProvider>, Erro
 /// fall back to an interval when the budget is one frame or none.
 #[cfg(feature = "frames")]
 fn picked(duration_s: f64, sampling: FrameSampling) -> &'static str {
-    if sampling == FrameSampling::KeyFrames && frame_count(duration_s) > 1 {
+    if sampling == FrameSampling::Shots {
+        "shot"
+    } else if sampling == FrameSampling::KeyFrames && frame_count(duration_s) > 1 {
         "key_frame"
     } else {
         "interval"
@@ -186,7 +267,8 @@ pub fn dump_clip_frames(
     if duration_s > MAX_DURATION_S {
         return Err(Error::TooLong(duration_s));
     }
-    let frames = match clip.sample(duration_s, sampling, cancel, |_, _| {}) {
+    let sampled = frames::sample_clip(video, &clip, duration_s, sampling, cancel, |_, _| {});
+    let frames = match sampled.map(|s| s.map(|s| s.frames)) {
         Ok(Some(frames)) if !frames.is_empty() => frames,
         Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
         Ok(None) => return Err(Error::Cancelled),
@@ -209,61 +291,32 @@ pub fn describe(
     subtitles: &[Cue],
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
-    mut on_stage: impl FnMut(Stage),
+    on_stage: impl FnMut(Stage),
 ) -> Result<Described, Error> {
-    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
-    let duration_s = clip
-        .duration_s()
-        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
-    if duration_s > MAX_DURATION_S {
-        return Err(Error::TooLong(duration_s));
-    }
-    let frames = match clip.sample(duration_s, options.frame_sampling, cancel, |done, total| {
-        on_stage(Stage::Frame { done, total })
-    }) {
-        Ok(Some(frames)) if !frames.is_empty() => frames,
-        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
-        Ok(None) => return Err(Error::Cancelled),
-        Err(e) => return Err(Error::Unreadable(e)),
-    };
-    drop(clip);
-    debug_frames::dump_if_on(
-        &debug_frames::name_of(video),
-        &frames,
-        picked(duration_s, options.frame_sampling),
-    );
-    let request = build_request(
-        options.model,
-        &frames,
+    let clip = uncapped(describe_clip(
+        video,
         subtitles,
-        duration_s,
-        options.language,
-        options.moments,
-    );
-    on_stage(Stage::Asking {
-        provider: options.model.provider,
-    });
-    let provider = provider_for(options)?;
-    let response = provider
-        .complete_notifying(&request, cancel, &mut |after, reason| {
-            on_stage(Stage::Retrying { after, reason })
-        })
-        .map_err(|e| match e {
-            AiError::Cancelled => Error::Cancelled,
-            e => Error::Ai(e),
-        })?;
-    let description = parse_answer(&response, duration_s, options.moments).map_err(|reason| {
-        Error::BadAnswer {
-            reason,
-            usage: response.usage,
-        }
-    })?;
+        None,
+        options,
+        &Budget::new(None),
+        cancel,
+        on_stage,
+    )?);
     Ok(Described {
-        description,
-        usage: response.usage,
-        duration_s,
-        frames: frames.len(),
+        frames: clip.frames.len(),
+        description: clip.description,
+        usage: clip.usage,
+        duration_s: clip.duration_s,
     })
+}
+
+/// What [`describe_clip`] gives with a budget without a cap, which always has room.
+#[cfg(feature = "frames")]
+fn uncapped(clip: Option<DescribedClip>) -> DescribedClip {
+    match clip {
+        Some(clip) => clip,
+        None => unreachable!("a budget without a cap never refuses a request"),
+    }
 }
 
 /// A clip described together with tag suggestions from a vocabulary, from one request: see
@@ -287,63 +340,24 @@ pub fn describe_with_tags(
     vocabulary: &[Tag],
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
-    mut on_stage: impl FnMut(Stage),
+    on_stage: impl FnMut(Stage),
 ) -> Result<DescribedWithTags, Error> {
-    let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
-    let duration_s = clip
-        .duration_s()
-        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
-    if duration_s > MAX_DURATION_S {
-        return Err(Error::TooLong(duration_s));
-    }
-    let frames = match clip.sample(duration_s, options.frame_sampling, cancel, |done, total| {
-        on_stage(Stage::Frame { done, total })
-    }) {
-        Ok(Some(frames)) if !frames.is_empty() => frames,
-        Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
-        Ok(None) => return Err(Error::Cancelled),
-        Err(e) => return Err(Error::Unreadable(e)),
-    };
-    drop(clip);
-    debug_frames::dump_if_on(
-        &debug_frames::name_of(video),
-        &frames,
-        picked(duration_s, options.frame_sampling),
-    );
-    let request = build_combined_request(
-        options.model,
-        &frames,
+    let clip = uncapped(describe_clip(
+        video,
         subtitles,
-        vocabulary,
-        duration_s,
-        options.language,
-        options.moments,
-    );
-    on_stage(Stage::Asking {
-        provider: options.model.provider,
-    });
-    let provider = provider_for(options)?;
-    let response = provider
-        .complete_notifying(&request, cancel, &mut |after, reason| {
-            on_stage(Stage::Retrying { after, reason })
-        })
-        .map_err(|e| match e {
-            AiError::Cancelled => Error::Cancelled,
-            e => Error::Ai(e),
-        })?;
-    let (description, tags) =
-        parse_combined_answer(&response, duration_s, vocabulary, options.moments).map_err(
-            |reason| Error::BadAnswer {
-                reason,
-                usage: response.usage,
-            },
-        )?;
+        Some(vocabulary),
+        options,
+        &Budget::new(None),
+        cancel,
+        on_stage,
+    )?);
     Ok(DescribedWithTags {
-        description,
-        tags,
-        usage: response.usage,
-        duration_s,
-        frames: frames.len(),
+        frames: clip.frames.len(),
+        description: clip.description,
+        // Always there when a vocabulary was given.
+        tags: clip.tags.unwrap_or_default(),
+        usage: clip.usage,
+        duration_s: clip.duration_s,
     })
 }
 
@@ -361,14 +375,15 @@ pub fn suggest_tags(
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<TagSuggestions, Error> {
-    let request = build_tags_only_request(
+    let provider = provider_for(options, None)?;
+    let mut request = build_tags_only_request(
         options.model,
         description,
         subtitles,
         vocabulary,
         duration_s,
     );
-    let provider = provider_for(options)?;
+    add_instructions(&mut request, options.instructions.as_deref(), true);
     let response = provider.complete(&request, cancel).map_err(|e| match e {
         AiError::Cancelled => Error::Cancelled,
         e => Error::Ai(e),
@@ -392,7 +407,8 @@ pub struct DescribedMoment {
 /// ([`frames::Clip::sample_moment`]) and any subtitle lines that overlap that same window, and
 /// asks for a short name and a one-to-two sentence description in one small, fast request.
 /// [`MOMENT_WINDOW_S`] is a reasonable default for `window_s`. `cancel` is checked between
-/// frames and while waiting for the answer.
+/// frames and while waiting for the answer. See [`describe_moment_notifying`] to learn when the
+/// video file is released.
 #[cfg(feature = "frames")]
 pub fn describe_moment(
     video: &std::path::Path,
@@ -402,6 +418,49 @@ pub fn describe_moment(
     options: &Options,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<DescribedMoment, Error> {
+    describe_moment_notifying(video, at_s, window_s, subtitles, options, cancel, |_| {})
+}
+
+/// [`describe_moment`], calling `on_stage` as it goes: [`Stage::Released`] once the frames are
+/// read and `video` is closed (before the request, which can take up to two minutes, so the file
+/// can be moved or deleted meanwhile), then [`Stage::Asking`], and [`Stage::Retrying`] before
+/// each wait between attempts. `on_stage` runs on the calling thread.
+#[cfg(feature = "frames")]
+pub fn describe_moment_notifying(
+    video: &std::path::Path,
+    at_s: f64,
+    window_s: f64,
+    subtitles: &[Cue],
+    options: &Options,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_stage: impl FnMut(Stage),
+) -> Result<DescribedMoment, Error> {
+    describe_moment_with(
+        video,
+        at_s,
+        window_s,
+        subtitles,
+        options,
+        cancel,
+        on_stage,
+        || provider_for(options, None),
+    )
+}
+
+/// [`describe_moment_notifying`] with the provider made by `provider`, which tests replace.
+#[cfg(feature = "frames")]
+#[allow(clippy::too_many_arguments)]
+fn describe_moment_with<'p>(
+    video: &std::path::Path,
+    at_s: f64,
+    window_s: f64,
+    subtitles: &[Cue],
+    options: &Options,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_stage: impl FnMut(Stage),
+    provider: impl FnOnce() -> Result<Box<dyn provider::AiProvider + 'p>, Error>,
+) -> Result<DescribedMoment, Error> {
+    options.check_instructions()?;
     let clip = frames::Clip::open(video, frames::OPEN_TIMEOUT).map_err(Error::Unreadable)?;
     let frames = match clip.sample_moment(at_s, window_s, cancel) {
         Ok(Some(frames)) if !frames.is_empty() => frames,
@@ -410,12 +469,13 @@ pub fn describe_moment(
         Err(e) => return Err(Error::Unreadable(e)),
     };
     drop(clip);
+    on_stage(Stage::Released);
     debug_frames::dump_if_on(
         &format!("{}-at-{at_s:.2}s", debug_frames::name_of(video)),
         &frames,
         "moment",
     );
-    let request = build_moment_request(
+    let mut request = build_moment_request(
         options.model,
         &frames,
         subtitles,
@@ -423,11 +483,19 @@ pub fn describe_moment(
         window_s,
         options.language,
     );
-    let provider = provider_for(options)?;
-    let response = provider.complete(&request, cancel).map_err(|e| match e {
-        AiError::Cancelled => Error::Cancelled,
-        e => Error::Ai(e),
-    })?;
+    add_instructions(&mut request, options.instructions.as_deref(), false);
+    let provider = provider()?;
+    on_stage(Stage::Asking {
+        provider: options.model.provider,
+    });
+    let response = provider
+        .complete_notifying(&request, cancel, &mut |after, reason| {
+            on_stage(Stage::Retrying { after, reason })
+        })
+        .map_err(|e| match e {
+            AiError::Cancelled => Error::Cancelled,
+            e => Error::Ai(e),
+        })?;
     let moment = parse_moment_answer(&response).map_err(|reason| Error::BadAnswer {
         reason,
         usage: response.usage,
@@ -456,6 +524,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let result = describe(&fake, &[], &options, &AtomicBool::new(false), |_| {});
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
@@ -475,6 +544,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let vocabulary = vec![Tag {
             name: "Goat".to_string(),
@@ -489,6 +559,261 @@ mod tests {
             |_| {},
         );
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether this process holds `path` open (Linux: its open file descriptors).
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    fn is_open(path: &std::path::Path) -> bool {
+        let path = path.canonicalize().expect("path");
+        std::fs::read_dir("/proc/self/fd")
+            .expect("fds")
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path))
+    }
+
+    /// Answers like the model would, noting what the notifications said when the request came.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    struct Stub<'a> {
+        seen: &'a std::cell::RefCell<Vec<String>>,
+        clip_open: &'a std::cell::Cell<Option<bool>>,
+        clip: std::path::PathBuf,
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    impl provider::AiProvider for Stub<'_> {
+        fn complete(
+            &self,
+            _: &provider::AiRequest,
+            _: &AtomicBool,
+        ) -> Result<provider::AiResponse, AiError> {
+            self.seen.borrow_mut().push("request".to_string());
+            self.clip_open.set(Some(is_open(&self.clip)));
+            Ok(provider::AiResponse {
+                json: serde_json::json!({"name": "Goat", "description": "A goat walks."}),
+                stop_reason: "end_turn".to_string(),
+                usage: AiUsage::default(),
+            })
+        }
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    fn moment_options() -> Options {
+        Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: None,
+        }
+    }
+
+    /// A private copy of a test clip, so no other test holds the same file open.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    fn private_clip(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("clipscribe-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let copy = dir.join("clip.mov");
+        std::fs::copy("tests/clips/file_example_MOV_480_700kB.mov", &copy).expect("copy");
+        (dir, copy)
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn describe_moment_reports_the_clip_released_before_the_request() {
+        let (dir, video) = private_clip("moment-released");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let clip_open = std::cell::Cell::new(None);
+        let stub = Stub {
+            seen: &seen,
+            clip_open: &clip_open,
+            clip: video.clone(),
+        };
+        let result = describe_moment_with(
+            &video,
+            1.0,
+            MOMENT_WINDOW_S,
+            &[],
+            &moment_options(),
+            &AtomicBool::new(false),
+            |stage| {
+                let name = match stage {
+                    Stage::Released => {
+                        assert!(!is_open(&video), "released while the file is still open");
+                        "released"
+                    }
+                    Stage::Asking { .. } => "asking",
+                    _ => "other",
+                };
+                seen.borrow_mut().push(name.to_string());
+            },
+            || Ok(Box::new(stub)),
+        );
+        assert_eq!(result.expect("described").moment.name, "Goat");
+        assert_eq!(*seen.borrow(), ["released", "asking", "request"]);
+        assert_eq!(clip_open.get(), Some(false), "clip open during the request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn instructions_up_to_the_cap_are_fine_and_longer_ones_are_an_error() {
+        let options = |chars: usize| Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: Some("é".repeat(chars)),
+        };
+        assert_eq!(options(MAX_INSTRUCTIONS_CHARS).check_instructions(), Ok(()));
+        let too_long = options(MAX_INSTRUCTIONS_CHARS + 1);
+        assert_eq!(
+            too_long.check_instructions(),
+            Err(Error::InstructionsTooLong {
+                chars: MAX_INSTRUCTIONS_CHARS + 1,
+                max: MAX_INSTRUCTIONS_CHARS
+            })
+        );
+        // Before any provider is made, so before any request.
+        assert!(matches!(
+            provider_for(&too_long, None),
+            Err(Error::InstructionsTooLong { .. })
+        ));
+        let message = Error::InstructionsTooLong {
+            chars: 2001,
+            max: 2000,
+        }
+        .to_string();
+        assert!(
+            message.contains("2001") && message.contains("2000"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_debug_output_keeps_the_key_and_the_notes_out() {
+        let options = Options {
+            api_key: "sk-secret".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: Some("The man is Eugene.".to_string()),
+        };
+        let shown = format!("{options:?}");
+        assert!(
+            !shown.contains("sk-secret") && !shown.contains("Eugene"),
+            "{shown}"
+        );
+    }
+
+    /// Keeps the first text of the request it is asked, answers a moment.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    struct Capture<'a>(&'a std::cell::RefCell<String>);
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    impl provider::AiProvider for Capture<'_> {
+        fn complete(
+            &self,
+            request: &provider::AiRequest,
+            _: &AtomicBool,
+        ) -> Result<provider::AiResponse, AiError> {
+            if let provider::AiContent::Text(text) = &request.content[0] {
+                *self.0.borrow_mut() = text.clone();
+            }
+            Ok(provider::AiResponse {
+                json: serde_json::json!({"name": "Moon", "description": "The moon."}),
+                stop_reason: "end_turn".to_string(),
+                usage: AiUsage::default(),
+            })
+        }
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn describe_moment_sends_the_notes() {
+        let (dir, video) = private_clip("moment-notes");
+        let text = std::cell::RefCell::new(String::new());
+        let options = Options {
+            instructions: Some("Mark the moon separately.".to_string()),
+            ..moment_options()
+        };
+        describe_moment_with(
+            &video,
+            1.0,
+            MOMENT_WINDOW_S,
+            &[],
+            &options,
+            &AtomicBool::new(false),
+            |_| {},
+            || Ok(Box::new(Capture(&text))),
+        )
+        .expect("described");
+        assert!(text
+            .borrow()
+            .contains("<notes>\nMark the moon separately.\n</notes>"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suggest_tags_refuses_notes_over_the_cap_before_any_request() {
+        let options = Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1)),
+        };
+        let description = Description {
+            summary: "s".to_string(),
+            segments: vec![],
+            main: None,
+        };
+        let result = suggest_tags(
+            &description,
+            10.0,
+            &[],
+            &[],
+            &options,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            matches!(result, Err(Error::InstructionsTooLong { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A clip that cannot be read never reaches the request, so it is never "released".
+    #[cfg(feature = "frames")]
+    #[test]
+    fn describe_moment_does_not_report_a_release_for_an_unreadable_clip() {
+        let dir =
+            std::env::temp_dir().join(format!("clipscribe-moment-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let fake = dir.join("fake.mp4");
+        std::fs::write(&fake, b"not a movie").expect("write");
+        let options = Options {
+            api_key: "k".to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: None,
+        };
+        let mut stages = Vec::new();
+        let result = describe_moment_notifying(
+            &fake,
+            1.0,
+            MOMENT_WINDOW_S,
+            &[],
+            &options,
+            &AtomicBool::new(false),
+            |stage| stages.push(stage),
+        );
+        assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
+        assert!(stages.is_empty(), "{stages:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -529,6 +854,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let debug = format!("{options:?}");
         assert!(!debug.contains("secret"));
@@ -556,6 +882,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
             Ok(described) => described,
@@ -584,6 +911,49 @@ mod tests {
             .all(|s| s.start_s >= 0.0 && s.end_s <= described.duration_s));
     }
 
+    /// [`live_description_of_a_test_clip`] with a note, only when `CLIPSCRIBE_LIVE_API_KEY` is set:
+    /// the model is asked to call what it sees by a name only the note gives, and the name must
+    /// come back in the description.
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn live_description_follows_the_users_notes() {
+        let Some(api_key) = std::env::var("CLIPSCRIBE_LIVE_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+        else {
+            eprintln!("CLIPSCRIBE_LIVE_API_KEY not set: live test skipped");
+            return;
+        };
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/clips/file_example_MP4_480_1_5MG.mp4");
+        let options = Options {
+            api_key: api_key.trim().to_string(),
+            model: Model::default(),
+            language: SummaryLanguage::English,
+            frame_sampling: FrameSampling::KeyFrames,
+            moments: MomentsMode::Important,
+            instructions: Some(
+                "Call the main animal or object of this clip Zorblax, never anything else. \
+                 Always use that name in the summary."
+                    .to_string(),
+            ),
+        };
+        let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
+            Ok(described) => described,
+            Err(Error::Ai(e @ (AiError::OutOfCredit(_) | AiError::LimitReached(_)))) => {
+                eprintln!("live test skipped: {}", e.reason());
+                return;
+            }
+            Err(e) => panic!("answer: {e:?}"),
+        };
+        eprintln!("live: {:#?}", described.description);
+        assert!(
+            described.description.summary.contains("Zorblax"),
+            "the note was not followed: {:?}",
+            described.description.summary
+        );
+    }
+
     /// The same request as [`live_description_of_a_test_clip`], through OpenAI instead: only
     /// when `OPENAI_API_KEY` is set (never in CI without that secret, and not reachable at all
     /// from this crate's own development environment — `api.openai.com` is blocked there; see
@@ -606,6 +976,7 @@ mod tests {
             language: SummaryLanguage::English,
             frame_sampling: FrameSampling::KeyFrames,
             moments: MomentsMode::Important,
+            instructions: None,
         };
         let described = match describe(&path, &[], &options, &AtomicBool::new(false), |_| {}) {
             Ok(described) => described,
