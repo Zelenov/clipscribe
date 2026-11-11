@@ -283,7 +283,7 @@ impl DescribeFile {
 
     /// Write the file to `path`, replacing it whole (through a temporary file next to it).
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        let tmp = path.with_extension(format!("{EXTENSION}.tmp"));
+        let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, self.to_json())?;
         std::fs::rename(&tmp, path)
     }
@@ -465,9 +465,7 @@ impl DescribeFile {
         if out.tags.is_none() {
             out.tags = self.tags.clone();
         }
-        if out.summary.is_none() {
-            out.summary = self.summary.clone();
-        }
+        let new_summary = out.summary.take();
 
         // People first: matching renames new people, which their text refers to. Mentions in
         // the new run's text that name no one in its own people are dropped first.
@@ -480,9 +478,11 @@ impl DescribeFile {
             .filter(|p| p.by == By::User || !new_people_given)
             .cloned()
             .collect();
+        people.sort_by_key(|p| p.by != By::User);
         if faces_redone {
-            // A kept person's old face ids are gone with the old run: give them the new faces
-            // that lie where theirs were, each new face to one person only.
+            // A kept person's old face ids are gone with the old run (ids are made again by every
+            // run): give them the new faces that lie where theirs were, each new face to one
+            // person only. User people go first.
             let old_faces: HashMap<&str, &Track> = self
                 .faces
                 .iter()
@@ -490,7 +490,7 @@ impl DescribeFile {
                 .map(|t| (t.id.as_str(), t))
                 .collect();
             let mut new_faces: Vec<&Track> = out.faces.iter().flatten().collect();
-            for person in people.iter_mut().filter(|p| p.by == By::User) {
+            for person in people.iter_mut() {
                 let theirs: Vec<&Track> = person
                     .faces
                     .iter()
@@ -515,7 +515,9 @@ impl DescribeFile {
                 .iter()
                 .enumerate()
                 .filter(|(_, kept)| {
-                    kept.by == By::User && person.faces.iter().any(|f| kept.faces.contains(f))
+                    kept.by == By::User
+                        && (person.faces.iter().any(|f| kept.faces.contains(f))
+                            || (person.speaker.is_some() && person.speaker == kept.speaker))
                 })
                 .map(|(n, _)| n)
                 .collect();
@@ -528,6 +530,9 @@ impl DescribeFile {
                         }
                     }
                     kept.faces.sort();
+                    if kept.speaker.is_none() {
+                        kept.speaker = person.speaker.clone();
+                    }
                     rename.insert(person.id.clone(), kept.id.clone());
                 }
                 _ => {
@@ -597,6 +602,13 @@ impl DescribeFile {
                     }
                 }
                 sort_markers(&mut all);
+                let old_ai: Vec<&Marker> = self
+                    .parts
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.by == By::Ai)
+                    .collect();
+                let all = cover(all, out.duration_s, &old_ai);
                 let mut parts = absorb_short_parts(all);
                 for part in parts.iter_mut().filter(|p| p.by == By::Ai) {
                     fresh_id(&mut part.id, &mut taken);
@@ -606,8 +618,28 @@ impl DescribeFile {
         }
 
         // New text may name a person by an id the merge changed.
-        if let Some(summary) = &out.summary {
-            out.summary = Some(rewrite_mentions(summary, &rename));
+        out.summary = match &new_summary {
+            Some(_) => renamed(&new_summary),
+            None => self.summary.clone(),
+        };
+        for (key, value) in &self.frame.extra {
+            out.frame
+                .extra
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+
+        // Text kept from the old file may name an AI person this run replaced: such mentions
+        // become "someone", as any mention of no one does.
+        let people = out.people.clone().unwrap_or_default();
+        let fix = |text: &mut Option<String>| {
+            if let Some(t) = text.as_mut() {
+                *t = drop_unknown_mentions(t, &people);
+            }
+        };
+        fix(&mut out.summary);
+        for marker in out.parts.iter_mut().chain(out.moments.iter_mut()).flatten() {
+            fix(&mut marker.description);
         }
         out
     }
@@ -776,6 +808,16 @@ impl DescribeFile {
         }
 
         let faces: HashSet<&str> = self.faces.iter().flatten().map(|f| f.id.as_str()).collect();
+        let mut speakers = HashSet::new();
+        for person in self.people.iter().flatten() {
+            if let Some(speaker) = &person.speaker {
+                if !speakers.insert(speaker.as_str()) {
+                    bad(format!(
+                        "two people are speaker {speaker}: they are one person"
+                    ));
+                }
+            }
+        }
         for person in self.people.iter().flatten() {
             if !is_numbered(&person.id, 'p') {
                 bad(format!("person id {} is not p and a number", person.id));
@@ -882,6 +924,66 @@ pub fn save_run(
     };
     file.write(&path).map_err(SaveError::Io)?;
     Ok(path)
+}
+
+/// `parts` (sorted) with every stretch of 0..`duration_s` they leave uncovered filled: by the
+/// old AI parts there (cut to the gap), else by one AI part named after the part before it.
+/// User parts are never moved.
+fn cover(parts: Vec<Marker>, duration_s: f64, old_ai: &[&Marker]) -> Vec<Marker> {
+    let mut covered = parts.clone();
+    let mut gaps = Vec::new();
+    let mut at = 0.0;
+    for p in &parts {
+        if p.start_s > at + 1e-6 {
+            gaps.push((at, p.start_s));
+        }
+        at = f64::max(at, p.end_or_start());
+    }
+    if at < duration_s - 1e-6 {
+        gaps.push((at, duration_s));
+    }
+    for (gap_start, gap_end) in gaps {
+        let mut filled_to = gap_start;
+        for old in old_ai {
+            let (s, e) = (old.start_s.max(filled_to), old.end_or_start().min(gap_end));
+            if e > s {
+                if s > filled_to + 1e-6 {
+                    covered.push(filler(filled_to, s, &covered));
+                }
+                let mut piece = (*old).clone();
+                piece.start_s = s;
+                piece.end_s = Some(e);
+                covered.push(piece);
+                filled_to = e;
+            }
+        }
+        if filled_to < gap_end - 1e-6 {
+            covered.push(filler(filled_to, gap_end, &covered));
+        }
+    }
+    sort_markers(&mut covered);
+    covered
+}
+
+/// An AI part over `start..end`, named like the part ending there (or "Part" when none).
+fn filler(start: f64, end: f64, parts: &[Marker]) -> Marker {
+    let before = parts
+        .iter()
+        .find(|p| (p.end_or_start() - start).abs() < 1e-6)
+        .and_then(|p| p.title.clone())
+        .map(|t| marker_title(&t, ""))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "Part".to_string());
+    Marker {
+        id: String::new(),
+        by: By::Ai,
+        start_s: start,
+        end_s: Some(end),
+        title: Some(before),
+        description: None,
+        color: None,
+        extra: Extra::new(),
+    }
 }
 
 /// `value` without object members that are `null`, at every depth.

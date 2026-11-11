@@ -732,3 +732,99 @@ fn a_short_first_ai_piece_never_moves_the_user_part_after_it() {
         [("All", 0.0, 0.5), ("Mine", 0.5, 30.0)]
     );
 }
+
+#[test]
+fn kept_text_never_names_people_the_run_replaced() {
+    let mut old = base(30.0);
+    old.people = Some(vec![
+        person("p1", By::User, "the guide", &[]),
+        person("p2", By::Ai, "a vendor", &[]),
+    ]);
+    old.summary = Some("@p2 sells to @p1.".to_string());
+    old.moments = Some(vec![Marker {
+        description: Some("@p2 waves.".to_string()),
+        ..marker("m00000", By::Ai, 5.0, None, "Wave")
+    }]);
+    // The run redoes people only: no summary, no moments.
+    let mut new = base(30.0);
+    new.people = Some(vec![
+        person("p1", By::Ai, "a dog", &[]),
+        person("p2", By::Ai, "a cat", &[]),
+    ]);
+    let merged = old.merge_run(new);
+    assert_eq!(merged.summary.as_deref(), Some("someone sells to @p1."));
+    let moment = &merged.moments.as_ref().unwrap()[0];
+    assert_eq!(moment.description.as_deref(), Some("someone waves."));
+    assert_eq!(merged.problems(), Vec::<String>::new());
+
+    // A new summary goes through the same renaming and dropping.
+    let mut new = base(30.0);
+    new.people = Some(vec![person("p1", By::Ai, "a dog", &[])]);
+    new.summary = Some("@p1 meets @p7.".to_string());
+    let merged = old.merge_run(new);
+    assert_eq!(merged.summary.as_deref(), Some("@p3 meets someone."));
+}
+
+#[test]
+fn kept_ai_people_follow_their_faces_into_the_new_run() {
+    let mut old = base(30.0);
+    old.faces = Some(vec![face("f2", 10.0, 20.0, [0.7, 0.1, 0.2, 0.2])]);
+    old.people = Some(vec![person("p1", By::Ai, "a vendor", &["f2"])]);
+    let mut new = base(30.0);
+    new.faces = Some(vec![
+        face("f1", 10.0, 20.0, [0.7, 0.1, 0.2, 0.2]),
+        face("f2", 0.0, 5.0, [0.1, 0.1, 0.2, 0.2]),
+    ]);
+    let merged = old.merge_run(new);
+    assert_eq!(merged.people.as_ref().unwrap()[0].faces, ["f1"]);
+}
+
+#[test]
+fn unknown_frame_fields_survive_a_new_run() {
+    let mut old = base(30.0);
+    old.frame.extra.insert("dar".to_string(), Value::from(1));
+    let merged = old.merge_run(base(30.0));
+    assert_eq!(merged.frame.extra["dar"], 1);
+}
+
+#[test]
+fn empty_or_late_new_parts_still_cover_the_clip() {
+    let mut old = base(30.0);
+    old.parts = Some(vec![
+        marker("u00000", By::User, 0.0, Some(10.0), "Mine"),
+        marker("a00000", By::Ai, 10.0, Some(30.0), "Old"),
+    ]);
+    let mut new = base(30.0);
+    new.parts = Some(vec![]);
+    let merged = old.merge_run(new);
+    assert_eq!(
+        spans(merged.parts.as_ref().unwrap()),
+        [("Mine", 0.0, 10.0), ("Old", 10.0, 30.0)]
+    );
+    assert_eq!(merged.problems(), Vec::<String>::new());
+
+    let mut new = base(30.0);
+    new.parts = Some(vec![marker("n00000", By::Ai, 20.0, Some(30.0), "End")]);
+    let merged = base(30.0).merge_run(new);
+    assert_eq!(
+        spans(merged.parts.as_ref().unwrap()),
+        [("Part", 0.0, 20.0), ("End", 20.0, 30.0)]
+    );
+    assert_eq!(merged.problems(), Vec::<String>::new());
+}
+
+#[test]
+fn a_new_person_with_a_kept_persons_speaker_is_that_person() {
+    let mut old = base(30.0);
+    let mut narrator = person("p1", By::User, "the narrator", &[]);
+    narrator.speaker = Some("3".to_string());
+    old.people = Some(vec![narrator]);
+    let mut new = base(30.0);
+    let mut voice = person("p1", By::Ai, "a voice", &[]);
+    voice.speaker = Some("3".to_string());
+    new.people = Some(vec![voice]);
+    let merged = old.merge_run(new);
+    let people = merged.people.as_ref().unwrap();
+    assert_eq!(people.len(), 1);
+    assert_eq!(people[0].label.as_deref(), Some("the narrator"));
+}
