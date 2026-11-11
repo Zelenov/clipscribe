@@ -1,4 +1,4 @@
-# NEXT
+# 0.18.0
 ## Added
 - The description file (`clip.describe.json`, docs/describe-format.md): `describe_file::DescribeFile`
   reads, writes and checks it, keeping fields it does not know; `save_run` writes it next to a
