@@ -1,3 +1,21 @@
+# NEXT
+## Added
+- The description file (`clip.describe.json`, docs/describe-format.md): `describe_file::DescribeFile`
+  reads, writes and checks it, keeping fields it does not know; `save_run` writes it next to a
+  described video, with the picture's size, frame rate and cuts read from the video, and merges
+  with a file already there so what a person made or changed stays; `merge_run`,
+  `render_mentions` and `new_id` follow the format's rules. `--describe-file` writes it from the
+  command line. `frames::probe_frame` gives a video's shown size and frame rate.
+- Every moment has a marker title (`Segment::title`: 1–5 words, at most 40 characters), shown in
+  the text output and in `--json`; the model also says which language it wrote in
+  (`Description::lang`). An answer without a title gets one made from its description.
+- `SummaryLanguage::code` gives the language's ISO 639-1 code.
+
+## Changed
+- `Segment` has a new field `title` and `Description` a new field `lang`: code that builds them
+  needs the fields (frename: tests that build a `Description`). Requests ask for both, a few
+  output tokens more per moment.
+
 # 0.17.0
 ## Added
 - Google Gemini as a third provider: `Provider::Gemini`, the models `gemini-3.1-flash-lite` (the

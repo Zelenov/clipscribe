@@ -38,6 +38,8 @@ required-features = ["cli"]
 [dependencies]
 log = "0.4"
 serde_json = "1"
+# The description file (`describe_file`): its types read and write themselves.
+serde = { version = "1", features = ["derive"] }
 # HTTP to the Anthropic API, trusting the OS certificate store (corporate TLS-inspecting
 # proxies need it).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }

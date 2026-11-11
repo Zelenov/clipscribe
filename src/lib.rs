@@ -40,6 +40,7 @@ pub mod ass;
 mod cache;
 mod debug_frames;
 mod describe;
+pub mod describe_file;
 mod folder;
 #[cfg(feature = "frames")]
 pub mod frames;
@@ -57,6 +58,7 @@ use std::time::Duration;
 pub use cache::{cache_path, Cache, CacheKey, ClipRecord, FileIdentity, CACHE_FILE_NAME};
 pub use debug_frames::{debug_frames_dir, dump_frames, set_debug_frames_dir, DEBUG_FRAMES_ENV};
 pub use describe::*;
+pub use describe_file::{describe_file_path, DescribeFile};
 pub use folder::{
     cached_clip, find_videos, request_cost_bound, serve_after_stop, Budget, ClipOutcome,
     DescribedClip, FolderEvent, FolderRun, FrameFingerprint, Reservation, Reserved, RunOptions,
@@ -770,6 +772,7 @@ mod tests {
             summary: "s".to_string(),
             segments: vec![],
             main: None,
+            lang: None,
         };
         let result = suggest_tags(
             &description,
