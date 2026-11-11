@@ -888,9 +888,15 @@ pub fn marker_title(title: &str, description: &str) -> String {
         }
         out = candidate;
     }
-    out.trim_end_matches(['.', ',', ';', ':', '!', '?', '…'])
-        .trim_end()
-        .to_string()
+    let out = out
+        .trim_end_matches(['.', ',', ';', ':', '!', '?', '…'])
+        .trim_end();
+    // A title is never empty: one made only of mentions or punctuation becomes "Part".
+    if out.is_empty() {
+        "Part".to_string()
+    } else {
+        out.to_string()
+    }
 }
 
 /// A language code the model reported: 2 or 3 ASCII letters, lower-cased.

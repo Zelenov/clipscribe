@@ -97,7 +97,7 @@ UTF-8 JSON, `application/json`. Next to the video it is `<video stem>.describe.j
 
 | Field | Means |
 |---|---|
-| `id` | 6 random characters of Crockford base32 (`0-9 a-z` without `i l o u`), like CAPT block ids: unique in the file, never changed. Never a UUID: a marker that came from Premiere gets a new short id the first time it is read, and its Premiere GUID stays in Premiere's own fields |
+| `id` | 6 random lower-case characters of Crockford base32 (`0-9 a-z` without `i l o u`), like CAPT block ids: unique in the file, never changed. Never a UUID: a marker that came from Premiere gets a new short id the first time it is read, and its Premiere GUID stays in Premiere's own fields |
 | `by` | `ai`: made by a description run, which a new run replaces. `user`: made by a person, or an AI item a person changed (renamed, moved, resized, recoloured, described) |
 | `start_s` | where it starts |
 | `end_s` | where it ends. Parts always have one; a moment without one is a point in time. Never equal to `start_s` |

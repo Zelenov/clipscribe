@@ -646,11 +646,27 @@ impl DescribeFile {
         }
 
         // An id that is not a short one (a Premiere GUID from an older file) gets a short one.
-        let mut ids = out.ids();
+        // An id used twice (a marker copied with its id) gets a new one after its first use; an
+        // upper-case short id is lower-cased, so it stays the same id.
+        let mut ids: HashSet<String> = out
+            .people
+            .iter()
+            .flatten()
+            .map(|p| p.id.clone())
+            .chain(
+                out.faces
+                    .iter()
+                    .chain(&out.texts)
+                    .flatten()
+                    .map(|t| t.id.clone()),
+            )
+            .collect();
         for marker in out.parts.iter_mut().chain(out.moments.iter_mut()).flatten() {
-            if !is_short_id(&marker.id) {
-                fresh_id(&mut marker.id, &mut ids);
+            let lower = marker.id.to_ascii_lowercase();
+            if is_short_id(&lower) {
+                marker.id = lower;
             }
+            fresh_id(&mut marker.id, &mut ids);
         }
         out.fit_to_duration();
 
@@ -687,8 +703,10 @@ impl DescribeFile {
             cuts.retain(|t| *t < d);
         }
         if let Some(moments) = &mut self.moments {
-            moments.retain(|m| m.start_s < d);
+            // An AI moment past the end goes; a user one moves back to the end.
+            moments.retain(|m| m.start_s <= d || m.by == By::User);
             for m in moments.iter_mut() {
+                m.start_s = m.start_s.min(d);
                 m.end_s = m.end_s.map(|e| e.min(d)).filter(|e| *e > m.start_s);
             }
         }
@@ -1029,6 +1047,10 @@ pub fn save_run(
 /// old AI parts there (cut to the gap), else by one AI part named after the part before it.
 /// User parts are never moved.
 fn cover(parts: Vec<Marker>, duration_s: f64, old_ai: &[&Marker]) -> Vec<Marker> {
+    // "Looked for parts, found none" stays so: nothing to fill around.
+    if parts.is_empty() && old_ai.is_empty() {
+        return parts;
+    }
     let mut covered = parts.clone();
     let mut gaps = Vec::new();
     let mut at = 0.0;

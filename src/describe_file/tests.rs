@@ -937,3 +937,42 @@ fn marker_ids_are_short_never_uuids() {
     let merged = file.merge_run(new);
     assert!(merged.moments.iter().flatten().all(|m| is_short_id(&m.id)));
 }
+
+#[test]
+fn round_4_edge_cases_keep_the_file_valid() {
+    // A user point moment on the last frame stays, even when the video is measured shorter.
+    let mut old = base(30.0);
+    old.moments = Some(vec![marker("w00000", By::User, 30.0, None, "Last")]);
+    let merged = old.merge_run(base(30.0));
+    assert_eq!(merged.moments.as_ref().unwrap().len(), 1);
+    let merged = old.merge_run(base(29.96));
+    assert_eq!(merged.moments.as_ref().unwrap()[0].start_s, 29.96);
+    assert_eq!(merged.problems(), Vec::<String>::new());
+
+    // A copied id gets a new one; an upper-case short id is the same id.
+    let mut old = base(30.0);
+    old.moments = Some(vec![
+        marker("w00000", By::User, 1.0, None, "One"),
+        marker("w00000", By::User, 2.0, None, "Copy"),
+        marker("1QC62F", By::User, 3.0, None, "Upper"),
+    ]);
+    let merged = old.merge_run(base(30.0));
+    assert_eq!(merged.problems(), Vec::<String>::new());
+    let ids: Vec<&str> = merged
+        .moments
+        .iter()
+        .flatten()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(ids[0], "w00000");
+    assert_ne!(ids[1], "w00000");
+    assert_eq!(ids[2], "1qc62f");
+
+    // Parts looked for and none found stay none.
+    let mut old = base(30.0);
+    old.parts = Some(vec![]);
+    assert_eq!(old.merge_run(base(30.0)).parts, Some(vec![]));
+
+    // A title made only of mentions is never empty.
+    assert_eq!(marker_title("@p1", "@p1"), "Part");
+}
