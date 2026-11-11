@@ -645,6 +645,13 @@ impl DescribeFile {
                 .or_insert_with(|| value.clone());
         }
 
+        // An id that is not a short one (a Premiere GUID from an older file) gets a short one.
+        let mut ids = out.ids();
+        for marker in out.parts.iter_mut().chain(out.moments.iter_mut()).flatten() {
+            if !is_short_id(&marker.id) {
+                fresh_id(&mut marker.id, &mut ids);
+            }
+        }
         out.fit_to_duration();
 
         // Text kept from the old file may name an AI person this run replaced: such mentions
@@ -697,8 +704,8 @@ impl DescribeFile {
             }
             self.parts = Some(parts);
         }
-        for list in [&mut self.faces, &mut self.texts] {
-            if let Some(tracks) = list {
+        for tracks in [&mut self.faces, &mut self.texts].into_iter().flatten() {
+            {
                 tracks.retain(|t| t.start_s < d);
                 for t in tracks.iter_mut() {
                     t.end_s = t.end_s.min(d);
@@ -809,6 +816,12 @@ impl DescribeFile {
             .map(|p| p.id.as_str())
             .collect();
         let check_marker = |m: &Marker, kind: &str, bad: &mut dyn FnMut(String)| {
+            if !is_short_id(&m.id) {
+                bad(format!(
+                    "{kind} id {:?} is not 6 Crockford base32 characters",
+                    m.id
+                ));
+            }
             if !in_video(m.start_s) {
                 bad(format!("{kind} {} starts outside the video", m.id));
             }
@@ -1308,9 +1321,14 @@ pub fn new_id(taken: &HashSet<String>) -> String {
     }
 }
 
-/// Keep `id` if it is free, else give it a new one; either way it is taken afterwards.
+/// Whether `id` is a marker id of the format: 6 characters of [`ID_ALPHABET`].
+pub fn is_short_id(id: &str) -> bool {
+    id.len() == 6 && id.bytes().all(|c| ID_ALPHABET.contains(&c))
+}
+
+/// Keep `id` if it is a free short id, else give it a new one; either way it is taken afterwards.
 fn fresh_id(id: &mut String, taken: &mut HashSet<String>) {
-    if id.is_empty() || taken.contains(id) {
+    if !is_short_id(id) || taken.contains(id) {
         *id = new_id(taken);
     }
     taken.insert(id.clone());

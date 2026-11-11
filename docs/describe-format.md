@@ -35,7 +35,7 @@ video's CAPT file (the subtitles) and does not change it. It is for:
     {"id": "p2r6kc", "by": "ai", "start_s": 14.0, "title": "Gate",
      "description": "The gate comes into view."},
     {"id": "1qc62f", "by": "user", "start_s": 30.1, "end_s": 33.4, "title": "Lion", "color": "red"},
-    {"id": "c19c0922-775d-465c-917b-6a7c3a5c0902", "by": "user", "start_s": 38.0, "color": "green"}
+    {"id": "8vzk4d", "by": "user", "start_s": 38.0, "color": "green"}
   ],
   "people": [
     {"id": "p1", "by": "user", "label": "a woman in a red jacket", "speaker": "1",
@@ -97,7 +97,7 @@ UTF-8 JSON, `application/json`. Next to the video it is `<video stem>.describe.j
 
 | Field | Means |
 |---|---|
-| `id` | any string, unique in the file, never changed. frename makes 6 random characters of Crockford base32 (`0-9 a-z` without `i l o u`), like CAPT block ids. A marker that came from Premiere keeps Premiere's GUID as its id |
+| `id` | 6 random characters of Crockford base32 (`0-9 a-z` without `i l o u`), like CAPT block ids: unique in the file, never changed. Never a UUID: a marker that came from Premiere gets a new short id the first time it is read, and its Premiere GUID stays in Premiere's own fields |
 | `by` | `ai`: made by a description run, which a new run replaces. `user`: made by a person, or an AI item a person changed (renamed, moved, resized, recoloured, described) |
 | `start_s` | where it starts |
 | `end_s` | where it ends. Parts always have one; a moment without one is a point in time. Never equal to `start_s` |
@@ -228,7 +228,7 @@ The types live in clipscribe, which both the desktop app and the service already
 | This format | Desktop frename |
 |---|---|
 | part, moment | `Marker`: `start_ms`, `duration_ms` (0 = point), `name`, `comment`, `color` |
-| `id` | a cue-point parameter `frename_id`; `xmpDM:guid` and `marker_guid` are the id when it is a UUID, else a UUID v5 of it. A marker without the parameter (made by Premiere) has its GUID as its id |
+| `id` | a cue-point parameter `frename_id`, always the short id. `xmpDM:guid` and `marker_guid` keep whatever GUID Premiere gave the marker (a UUID v5 of the id for a marker frename made). A marker without the parameter (made by Premiere) gets a new short id, written to `frename_id` |
 | `by` | a cue-point parameter `frename_by:ai`, cleared when the editor changes the marker. A white marker without it (described before) is read as AI |
 | `in_out` | the In/Out points, as an XMP subclip marker or an `In/Out:` line |
 | `usable` | the `Suggested In/Out:` line, applied only by the **AI** pill |

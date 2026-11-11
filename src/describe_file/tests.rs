@@ -23,7 +23,7 @@ const EXAMPLE: &str = r#"{
     {"id": "p2r6kc", "by": "ai", "start_s": 14.0, "title": "Gate",
      "description": "The gate comes into view."},
     {"id": "1qc62f", "by": "user", "start_s": 30.1, "end_s": 33.4, "title": "Lion", "color": "red"},
-    {"id": "c19c0922-775d-465c-917b-6a7c3a5c0902", "by": "user", "start_s": 38.0, "color": "green"}
+    {"id": "8vzk4d", "by": "user", "start_s": 38.0, "color": "green"}
   ],
   "people": [
     {"id": "p1", "by": "user", "label": "a woman in a red jacket", "speaker": "1",
@@ -386,13 +386,13 @@ fn a_new_run_keeps_user_items_and_replaces_ai_ones() {
     old.summary = Some("Old summary.".to_string());
     old.moments = Some(vec![
         marker("aaaaaa", By::Ai, 3.0, None, "Old AI moment"),
-        marker("uuuuuu", By::User, 10.0, None, "Mine"),
+        marker("wwwwww", By::User, 10.0, None, "Mine"),
     ]);
     let mut new = base(30.0);
     new.summary = Some("New summary.".to_string());
     new.moments = Some(vec![
         marker("bbbbbb", By::Ai, 10.3, None, "Snapped away"),
-        marker("uuuuuu", By::Ai, 20.0, Some(22.0), "New AI moment"),
+        marker("wwwwww", By::Ai, 20.0, Some(22.0), "New AI moment"),
     ]);
     let merged = old.merge_run(new);
     assert_eq!(merged.summary.as_deref(), Some("New summary."));
@@ -402,7 +402,7 @@ fn a_new_run_keeps_user_items_and_replaces_ai_ones() {
         spans(moments),
         [("Mine", 10.0, 10.0), ("New AI moment", 20.0, 22.0)]
     );
-    assert_ne!(moments[1].id, "uuuuuu", "a kept id is never reused");
+    assert_ne!(moments[1].id, "wwwwww", "a kept id is never reused");
     assert_eq!(merged.problems(), Vec::<String>::new());
 }
 
@@ -412,7 +412,7 @@ fn new_ai_parts_are_cut_around_user_parts() {
         let mut old = base(30.0);
         old.parts = Some(vec![
             marker("a00000", By::Ai, 0.0, Some(10.0), "Old"),
-            marker("u00000", By::User, 10.0, Some(20.0), "Mine"),
+            marker("w00000", By::User, 10.0, Some(20.0), "Mine"),
             marker("a00001", By::Ai, 20.0, Some(30.0), "Old too"),
         ]);
         old
@@ -653,7 +653,7 @@ fn analysis_a_run_did_not_do_keeps_the_old_one() {
     old.people = Some(vec![person("p1", By::User, "the guide", &["f1"])]);
     old.parts = Some(vec![
         marker("a00000", By::Ai, 0.0, Some(10.0), "Old"),
-        marker("u00000", By::User, 10.0, Some(30.0), "Mine"),
+        marker("w00000", By::User, 10.0, Some(30.0), "Mine"),
     ]);
     old.cuts = Some(vec![10.0]);
     // Today's run: moments only, no faces, people, parts or cuts.
@@ -722,7 +722,7 @@ fn a_short_first_ai_piece_never_moves_the_user_part_after_it() {
     let mut old = base(30.0);
     old.parts = Some(vec![
         marker("a00000", By::Ai, 0.0, Some(0.5), "Old"),
-        marker("u00000", By::User, 0.5, Some(30.0), "Mine"),
+        marker("w00000", By::User, 0.5, Some(30.0), "Mine"),
     ]);
     let mut new = base(30.0);
     new.parts = Some(vec![marker("n00000", By::Ai, 0.0, Some(30.0), "All")]);
@@ -791,7 +791,7 @@ fn unknown_frame_fields_survive_a_new_run() {
 fn empty_or_late_new_parts_still_cover_the_clip() {
     let mut old = base(30.0);
     old.parts = Some(vec![
-        marker("u00000", By::User, 0.0, Some(10.0), "Mine"),
+        marker("w00000", By::User, 0.0, Some(10.0), "Mine"),
         marker("a00000", By::Ai, 10.0, Some(30.0), "Old"),
     ]);
     let mut new = base(30.0);
@@ -834,7 +834,7 @@ fn a_filler_part_never_carries_a_mention_in_its_title() {
     let mut old = base(30.0);
     old.people = Some(vec![person("p1", By::User, "the guide", &[])]);
     old.parts = Some(vec![
-        marker("u00000", By::User, 0.0, Some(10.0), "Talk with @p1"),
+        marker("w00000", By::User, 0.0, Some(10.0), "Talk with @p1"),
         marker("a00000", By::Ai, 10.0, Some(30.0), "Old"),
     ]);
     let mut new = base(30.0);
@@ -921,4 +921,19 @@ fn a_run_rounds_the_end_and_drops_stray_mentions() {
     let file = DescribeFile::from_described(&description, facts);
     assert_eq!(file.problems(), Vec::<String>::new());
     assert_eq!(file.summary.as_deref(), Some("someone walks."));
+}
+
+#[test]
+fn marker_ids_are_short_never_uuids() {
+    assert!(is_short_id("1qc62f"));
+    assert!(!is_short_id("c19c0922-775d-465c-917b-6a7c3a5c0902"));
+    assert!(!is_short_id("1qc62u"), "u is not Crockford");
+    let mut file = example();
+    file.moments.as_mut().unwrap()[2].id = "c19c0922-775d-465c-917b-6a7c3a5c0902".to_string();
+    assert!(file.problems().join("\n").contains("not 6 Crockford"));
+    // A merge gives such a marker a short id.
+    let mut new = base(41.9);
+    new.frame = file.frame.clone();
+    let merged = file.merge_run(new);
+    assert!(merged.moments.iter().flatten().all(|m| is_short_id(&m.id)));
 }
