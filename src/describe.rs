@@ -860,7 +860,7 @@ pub const MAX_TITLE_WORDS: usize = 5;
 
 /// A marker title from the model's `title`, or from `description` when that is empty: at most
 /// [`MAX_TITLE_WORDS`] words and [`MAX_TITLE_CHARS`] characters (cut at a word), one line,
-/// without a full stop or an `@pN` at the end.
+/// without a full stop and without `@pN` mentions.
 pub fn marker_title(title: &str, description: &str) -> String {
     let source = if title.trim().is_empty() {
         description
@@ -868,7 +868,13 @@ pub fn marker_title(title: &str, description: &str) -> String {
         title
     };
     let mut out = String::new();
-    for word in source.split_whitespace().take(MAX_TITLE_WORDS) {
+    let is_mention = |word: &str| {
+        word.trim_end_matches(|c: char| !c.is_alphanumeric())
+            .strip_prefix("@p")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    let words = source.split_whitespace().filter(|w| !is_mention(w));
+    for word in words.take(MAX_TITLE_WORDS) {
         let candidate = if out.is_empty() {
             word.to_string()
         } else {

@@ -828,3 +828,97 @@ fn a_new_person_with_a_kept_persons_speaker_is_that_person() {
     assert_eq!(people.len(), 1);
     assert_eq!(people[0].label.as_deref(), Some("the narrator"));
 }
+
+#[test]
+fn a_filler_part_never_carries_a_mention_in_its_title() {
+    let mut old = base(30.0);
+    old.people = Some(vec![person("p1", By::User, "the guide", &[])]);
+    old.parts = Some(vec![
+        marker("u00000", By::User, 0.0, Some(10.0), "Talk with @p1"),
+        marker("a00000", By::Ai, 10.0, Some(30.0), "Old"),
+    ]);
+    let mut new = base(30.0);
+    new.parts = Some(vec![]);
+    let merged = base(30.0).merge_run(new.clone());
+    assert_eq!(merged.problems(), Vec::<String>::new());
+    let mut user_only = old.clone();
+    user_only.parts.as_mut().unwrap().pop();
+    user_only.parts.as_mut().unwrap()[0].end_s = Some(30.0);
+    user_only.duration_s = 40.0;
+    let mut longer = base(40.0);
+    longer.parts = Some(vec![]);
+    let merged = user_only.merge_run(longer);
+    assert_eq!(merged.problems(), Vec::<String>::new());
+    assert_eq!(
+        spans(merged.parts.as_ref().unwrap()),
+        [("Talk with @p1", 0.0, 30.0), ("Talk with", 30.0, 40.0)]
+    );
+}
+
+#[test]
+fn a_speaker_match_wins_and_an_unsure_person_takes_nothing_kept() {
+    let mut old = base(30.0);
+    old.faces = Some(vec![face("f1", 0.0, 10.0, [0.1, 0.1, 0.2, 0.2])]);
+    let mut p2 = person("p2", By::User, "the narrator", &[]);
+    p2.speaker = Some("2".to_string());
+    old.people = Some(vec![person("p1", By::User, "the guide", &["f1"]), p2]);
+    let mut new = base(30.0);
+    new.faces = Some(vec![face("f1", 0.0, 10.0, [0.1, 0.1, 0.2, 0.2])]);
+    let mut q = person("p1", By::Ai, "someone talking", &["f1"]);
+    q.speaker = Some("2".to_string());
+    new.people = Some(vec![q]);
+    let merged = old.merge_run(new);
+    assert_eq!(merged.problems(), Vec::<String>::new());
+    let people = merged.people.as_ref().unwrap();
+    assert_eq!(people.len(), 2, "the speaker match wins");
+
+    // Two new people on one kept person: only the first is that person.
+    let mut old = base(30.0);
+    let mut p1 = person("p1", By::User, "the guide", &[]);
+    p1.speaker = Some("1".to_string());
+    old.people = Some(vec![p1]);
+    let mut new = base(30.0);
+    let mut q = person("p1", By::Ai, "a voice", &[]);
+    q.speaker = Some("1".to_string());
+    let mut r = person("p2", By::Ai, "a voice too", &[]);
+    r.speaker = Some("1".to_string());
+    new.people = Some(vec![q, r]);
+    new.summary = Some("@p1 talks to @p2.".to_string());
+    let merged = old.merge_run(new);
+    assert_eq!(merged.summary.as_deref(), Some("@p1 talks to @p2."));
+    assert_eq!(merged.problems(), Vec::<String>::new());
+}
+
+#[test]
+fn kept_times_are_fitted_to_a_shorter_video() {
+    let mut old = example();
+    old.duration_s = 41.9;
+    let mut new = base(41.867);
+    new.frame = old.frame.clone();
+    let merged = old.merge_run(new);
+    assert_eq!(merged.problems(), Vec::<String>::new());
+    assert_eq!(
+        merged.parts.as_ref().unwrap().last().unwrap().end_s,
+        Some(41.867)
+    );
+}
+
+#[test]
+fn a_run_rounds_the_end_and_drops_stray_mentions() {
+    let description = Description {
+        summary: "@p1 walks.".to_string(),
+        segments: vec![
+            segment(0.0, 5.0, "Start", "@p1 starts."),
+            segment(10.0003, 10.0004, "Tail", "The end."),
+        ],
+        main: None,
+        lang: None,
+    };
+    let facts = RunFacts {
+        duration_s: 10.0004,
+        ..facts(MomentsMode::Full)
+    };
+    let file = DescribeFile::from_described(&description, facts);
+    assert_eq!(file.problems(), Vec::<String>::new());
+    assert_eq!(file.summary.as_deref(), Some("someone walks."));
+}

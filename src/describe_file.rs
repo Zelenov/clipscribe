@@ -292,7 +292,10 @@ impl DescribeFile {
     /// cuts and tags as far as the run made them. People, faces and texts are left absent (not
     /// done): this run does not look for them.
     pub fn from_described(description: &Description, facts: RunFacts) -> Self {
-        let duration_s = facts.duration_s;
+        // Compared with the rounded times below, so no part ends up zero-long at the end.
+        let duration_s = round_ms(facts.duration_s);
+        // This run names no people, so a stray `@pN` from the model names no one.
+        let plain = |text: &str| drop_unknown_mentions(text, &[]);
         let mut taken = HashSet::new();
         let marker =
             |taken: &mut HashSet<String>, start_s: f64, end_s: f64, title: &str, text: &str| {
@@ -305,7 +308,7 @@ impl DescribeFile {
                     start_s: round_ms(start_s),
                     end_s: Some(round_ms(end_s)),
                     description: (!text.trim().is_empty() && text.trim() != title)
-                        .then(|| text.trim().to_string()),
+                        .then(|| plain(text.trim())),
                     title: Some(title),
                     color: None,
                     extra: Extra::new(),
@@ -393,7 +396,7 @@ impl DescribeFile {
                 .lang
                 .clone()
                 .unwrap_or_else(|| facts.fallback_lang.to_string()),
-            summary: Some(description.summary.clone()).filter(|s| !s.trim().is_empty()),
+            summary: Some(plain(&description.summary)).filter(|s| !s.trim().is_empty()),
             usable: description.main.map(|m| Span {
                 start_s: round_ms(m.start_s.clamp(0.0, duration_s)),
                 end_s: round_ms(m.end_s.clamp(0.0, duration_s)),
@@ -509,20 +512,26 @@ impl DescribeFile {
         let mut next_person = max_person_number(self.people.iter().flatten())
             .max(max_person_number(people.iter()))
             + 1;
-        for person in new_people.iter().cloned() {
-            // A new AI person is a kept one when its faces meet exactly one kept person's.
-            let candidates: Vec<usize> = people
-                .iter()
-                .enumerate()
-                .filter(|(_, kept)| {
-                    kept.by == By::User
-                        && (person.faces.iter().any(|f| kept.faces.contains(f))
-                            || (person.speaker.is_some() && person.speaker == kept.speaker))
-                })
-                .map(|(n, _)| n)
+        // Kept people that already took in a person of this run: one each, since a wrong merge
+        // is worse than a wrong split.
+        let mut absorbed: HashSet<usize> = HashSet::new();
+        for mut person in new_people.iter().cloned() {
+            // A new AI person is a kept one when it shares exactly one kept person's speaker,
+            // or else when its faces meet exactly one kept person's.
+            let free = |n: &usize| !absorbed.contains(n) && people[*n].by == By::User;
+            let by_speaker: Vec<usize> = (0..people.len())
+                .filter(|n| person.speaker.is_some() && people[*n].speaker == person.speaker)
                 .collect();
+            let by_face: Vec<usize> = (0..people.len())
+                .filter(|n| person.faces.iter().any(|f| people[*n].faces.contains(f)))
+                .collect();
+            let candidates: Vec<usize> = match by_speaker.as_slice() {
+                [] => by_face.iter().copied().filter(free).collect(),
+                some => some.iter().copied().filter(free).collect(),
+            };
             match candidates.as_slice() {
                 [only] => {
+                    absorbed.insert(*only);
                     let kept = &mut people[*only];
                     for face in &person.faces {
                         if !kept.faces.contains(face) {
@@ -536,6 +545,13 @@ impl DescribeFile {
                     rename.insert(person.id.clone(), kept.id.clone());
                 }
                 _ => {
+                    // Unsure: a person of its own, without what a kept person already has.
+                    if people.iter().any(|kept| kept.speaker == person.speaker) {
+                        person.speaker = None;
+                    }
+                    person
+                        .faces
+                        .retain(|f| !people.iter().any(|kept| kept.faces.contains(f)));
                     let id = format!("p{next_person}");
                     next_person += 1;
                     rename.insert(person.id.clone(), id.clone());
@@ -629,6 +645,8 @@ impl DescribeFile {
                 .or_insert_with(|| value.clone());
         }
 
+        out.fit_to_duration();
+
         // Text kept from the old file may name an AI person this run replaced: such mentions
         // become "someone", as any mention of no one does.
         let people = out.people.clone().unwrap_or_default();
@@ -642,6 +660,71 @@ impl DescribeFile {
             fix(&mut marker.description);
         }
         out
+    }
+
+    /// Bring everything kept from an older file inside `duration_s` (a new probe can measure a
+    /// few frames less or more): times past the end are cut to it, items that start past it are
+    /// dropped, and parts are made to cover the clip again.
+    fn fit_to_duration(&mut self) {
+        let d = self.duration_s;
+        if let Some(io) = &mut self.in_out {
+            io.start_s = io.start_s.filter(|t| *t < d);
+            io.end_s = io.end_s.map(|t| t.min(d));
+            if let (Some(a), Some(b)) = (io.start_s, io.end_s) {
+                if b <= a {
+                    io.end_s = None;
+                }
+            }
+        }
+        if let Some(cuts) = &mut self.cuts {
+            cuts.retain(|t| *t < d);
+        }
+        if let Some(moments) = &mut self.moments {
+            moments.retain(|m| m.start_s < d);
+            for m in moments.iter_mut() {
+                m.end_s = m.end_s.map(|e| e.min(d)).filter(|e| *e > m.start_s);
+            }
+        }
+        if let Some(parts) = self.parts.take() {
+            let mut parts: Vec<Marker> = parts.into_iter().filter(|p| p.start_s < d).collect();
+            for p in &mut parts {
+                p.end_s = Some(p.end_or_start().min(d));
+            }
+            let mut taken = self.ids();
+            let mut parts = absorb_short_parts(cover(parts, d, &[]));
+            for p in parts.iter_mut().filter(|p| p.id.is_empty()) {
+                fresh_id(&mut p.id, &mut taken);
+            }
+            self.parts = Some(parts);
+        }
+        for list in [&mut self.faces, &mut self.texts] {
+            if let Some(tracks) = list {
+                tracks.retain(|t| t.start_s < d);
+                for t in tracks.iter_mut() {
+                    t.end_s = t.end_s.min(d);
+                    let first = t.track.first().cloned();
+                    t.track.retain(|s| s.t_s <= d);
+                    if let (true, Some(mut first)) = (t.track.is_empty(), first) {
+                        first.t_s = t.start_s;
+                        t.track.push(first);
+                    }
+                }
+            }
+        }
+        if let Some(faces) = &self.faces {
+            let ids: HashSet<&str> = faces.iter().map(|f| f.id.as_str()).collect();
+            for p in self.people.iter_mut().flatten() {
+                p.faces.retain(|f| ids.contains(f.as_str()));
+            }
+        }
+        for tag in self.tags.iter_mut().flatten() {
+            if let Some(ranges) = &mut tag.ranges {
+                ranges.retain(|r| r.start_s < d);
+                for r in ranges.iter_mut() {
+                    r.end_s = r.end_s.min(d);
+                }
+            }
+        }
     }
 
     /// Every rule of the format this file breaks, one line each; empty when it is valid.
@@ -922,6 +1005,9 @@ pub fn save_run(
         Some(old) => old.merge_run(new),
         None => new,
     };
+    for problem in file.problems() {
+        log::warn!("clipscribe: {}: {problem}", path.display());
+    }
     file.write(&path).map_err(SaveError::Io)?;
     Ok(path)
 }
