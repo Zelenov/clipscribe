@@ -224,6 +224,14 @@ impl SummaryLanguage {
         }
     }
 
+    /// The ISO 639-1 code of the language, or `None` for [`Self::SameAsSubtitles`].
+    pub fn code(self) -> Option<&'static str> {
+        match self {
+            Self::SameAsSubtitles => None,
+            other => Some(other.as_str()),
+        }
+    }
+
     /// Read a stored name; unknown names fall back to the default.
     pub fn from_name(name: &str) -> Self {
         Self::ALL
@@ -289,6 +297,9 @@ pub struct MainRange {
 pub struct Segment {
     pub start_s: f64,
     pub end_s: f64,
+    /// A marker name: 1–5 words, at most [`MAX_TITLE_CHARS`] characters, no full stop. Made from
+    /// the description when the model gives none (an answer cached before titles existed).
+    pub title: String,
     pub description: String,
 }
 
@@ -301,6 +312,9 @@ pub struct Description {
     /// The suggested In/Out: `None` when the whole clip is usable (and always in
     /// [`MomentsMode::Full`]).
     pub main: Option<MainRange>,
+    /// The language the summary, titles and descriptions are written in, as the model reports
+    /// it (an ISO 639-1 code such as `en`); `None` when it gave none or something else.
+    pub lang: Option<String>,
 }
 
 /// Where to take frames in a clip `duration_s` long: one every 2 s, at most 60 (a longer clip
@@ -548,14 +562,16 @@ pub fn schema_for(moments: MomentsMode) -> Value {
                     "properties": {
                         "start_s": {"type": "number"},
                         "end_s": {"type": "number"},
+                        "title": {"type": "string"},
                         "description": {"type": "string"}
                     },
-                    "required": ["start_s", "end_s", "description"],
+                    "required": ["start_s", "end_s", "title", "description"],
                     "additionalProperties": false
                 }
-            }
+            },
+            "lang": {"type": "string"}
         },
-        "required": ["summary", "segments"],
+        "required": ["summary", "segments", "lang"],
         "additionalProperties": false
     });
     if moments == MomentsMode::Important {
@@ -699,8 +715,8 @@ pub fn build_request(
             max_segments(duration_s),
             duration_s,
         ),
-        // Byte-for-byte the original wording (before this mode existed): every existing caller
-        // that asks for `Full` gets exactly the same request it always did.
+        // The original wording (before this mode existed); only the title and language sentence
+        // that every request ends its answer instructions with comes after it.
         MomentsMode::Full => format!(
             "Answer with a one-sentence summary of the whole clip, then at most {} segments: \
              consecutive stretches of the clip (start_s and end_s in seconds, inside 0–{:.0}) \
@@ -714,7 +730,7 @@ pub fn build_request(
     let mut instructions = format!(
         "You describe a video clip for a video editor who has not watched it. It is {} long. \
          You get frames sampled from it, each preceded by its time as t=m:ss{}.\n\
-         {moments_instruction}\n\
+         {moments_instruction} {TITLE_INSTRUCTION}\n\
          Stay factual: describe only what is seen and said. Do not guess who people are.\n{}",
         format_time(duration_s),
         if has_subtitles {
@@ -788,9 +804,13 @@ pub fn parse_answer(
                         && end_s > start_s
                         && start_s < end
                         && !description.is_empty();
-                    valid.then_some(Segment {
+                    valid.then(|| Segment {
                         start_s,
                         end_s,
+                        title: marker_title(
+                            item["title"].as_str().unwrap_or_default(),
+                            &description,
+                        ),
                         description,
                     })
                 })
@@ -823,7 +843,66 @@ pub fn parse_answer(
         summary: summary.to_string(),
         segments,
         main,
+        lang: parse_lang(&response.json["lang"]),
     })
+}
+
+/// What the request asks of every segment's title and of `lang`.
+const TITLE_INSTRUCTION: &str = "Give each segment a title for a marker: 1–5 words, at most 40 \
+     characters, a noun phrase with no full stop. Set lang to the ISO 639-1 code of the language \
+     you write in.";
+
+/// The longest [`Segment::title`], in characters.
+pub const MAX_TITLE_CHARS: usize = 40;
+
+/// The most words in a [`Segment::title`].
+pub const MAX_TITLE_WORDS: usize = 5;
+
+/// A marker title from the model's `title`, or from `description` when that is empty: at most
+/// [`MAX_TITLE_WORDS`] words and [`MAX_TITLE_CHARS`] characters (cut at a word), one line,
+/// without a full stop and without `@pN` mentions.
+pub fn marker_title(title: &str, description: &str) -> String {
+    let source = if title.trim().is_empty() {
+        description
+    } else {
+        title
+    };
+    let mut out = String::new();
+    let is_mention = |word: &str| {
+        word.trim_end_matches(|c: char| !c.is_alphanumeric())
+            .strip_prefix("@p")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    let words = source.split_whitespace().filter(|w| !is_mention(w));
+    for word in words.take(MAX_TITLE_WORDS) {
+        let candidate = if out.is_empty() {
+            word.to_string()
+        } else {
+            format!("{out} {word}")
+        };
+        if candidate.chars().count() > MAX_TITLE_CHARS {
+            if out.is_empty() {
+                out = word.chars().take(MAX_TITLE_CHARS).collect();
+            }
+            break;
+        }
+        out = candidate;
+    }
+    let out = out
+        .trim_end_matches(['.', ',', ';', ':', '!', '?', '…'])
+        .trim_end();
+    // A title is never empty: one made only of mentions or punctuation becomes "Part".
+    if out.is_empty() {
+        "Part".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+/// A language code the model reported: 2 or 3 ASCII letters, lower-cased.
+fn parse_lang(value: &Value) -> Option<String> {
+    let code = value.as_str()?.trim().to_ascii_lowercase();
+    (matches!(code.len(), 2 | 3) && code.chars().all(|c| c.is_ascii_lowercase())).then_some(code)
 }
 
 /// A description shorter than this is never taken for a repeat of the summary: "A dog" is in
@@ -1188,7 +1267,7 @@ mod tests {
     /// comparison (not `.contains`) so a future edit to the shared preamble can't silently
     /// reword it, as an earlier draft of this mode did.
     #[test]
-    fn full_mode_is_byte_for_byte_the_original_wording() {
+    fn full_mode_is_the_original_wording_plus_titles() {
         let request = build_request(
             MODELS[0],
             &[],
@@ -1207,7 +1286,10 @@ mod tests {
              Answer with a one-sentence summary of the whole clip, then at most 3 segments: \
              consecutive stretches of the clip (start_s and end_s in seconds, inside 0–30) with \
              what happens in each, in one short sentence with the key details (place, action, \
-             camera, people, objects, on-screen text). Merge stretches where nothing changes.\n\
+             camera, people, objects, on-screen text). Merge stretches where nothing changes. \
+             Give each segment a title for a marker: 1–5 words, at most 40 characters, a noun \
+             phrase with no full stop. Set lang to the ISO 639-1 code of the language you write \
+             in.\n\
              Stay factual: describe only what is seen and said. Do not guess who people are.\n\
              Write in English."
         );

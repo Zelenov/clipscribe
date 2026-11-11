@@ -341,9 +341,11 @@ fn record_to_json(record: &ClipRecord) -> Value {
         },
         "summary": clip.description.summary,
         "main": clip.description.main.map(|m| json!({"start_s": m.start_s, "end_s": m.end_s})),
+        "lang": clip.description.lang,
         "segments": clip.description.segments.iter().map(|s| json!({
             "start_s": s.start_s,
             "end_s": s.end_s,
+            "title": s.title,
             "description": s.description,
         })).collect::<Vec<_>>(),
         "tags": clip.tags.as_ref().map(|tags| json!({
@@ -377,10 +379,14 @@ fn record_from_json(value: &Value) -> Option<ClipRecord> {
         .as_array()?
         .iter()
         .map(|s| {
+            let description = string(&s["description"])?;
+            // Absent in lines written before titles existed: made from the description.
+            let title = crate::marker_title(s["title"].as_str().unwrap_or_default(), &description);
             Some(Segment {
                 start_s: f64_of(&s["start_s"])?,
                 end_s: f64_of(&s["end_s"])?,
-                description: string(&s["description"])?,
+                title,
+                description,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -446,6 +452,8 @@ fn record_from_json(value: &Value) -> Option<ClipRecord> {
                 summary: string(&value["summary"])?,
                 segments,
                 main,
+                // Absent in lines written before the language was asked for.
+                lang: string(&value["lang"]),
             },
             tags,
             usage: AiUsage {
@@ -497,12 +505,14 @@ mod tests {
                     segments: vec![Segment {
                         start_s: 1.0,
                         end_s: 2.5,
+                        title: "Title".to_string(),
                         description: "Привет — a goat looks up.".to_string(),
                     }],
                     main: Some(MainRange {
                         start_s: 0.5,
                         end_s: 2.75,
                     }),
+                    lang: None,
                 },
                 tags: Some(TagSuggestions {
                     tags: vec![TagSuggestion {

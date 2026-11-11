@@ -202,6 +202,50 @@ impl Clip {
             .filter(|d| *d > 0.0)
     }
 
+    /// The picture as the clip shows it, for the description file: the decoded size with its
+    /// pixel aspect applied and turned by the rotation tag, and the frame rate. The rate is the
+    /// container's nominal one; a variable-rate clip that has none gives its `max-framerate`
+    /// (not yet the average the format asks for), and 30 when neither is known.
+    pub fn source_frame(&self) -> Option<crate::describe_file::FrameInfo> {
+        let scale = self
+            .pipeline
+            .iterate_elements()
+            .into_iter()
+            .flatten()
+            .find(|e| e.factory().is_some_and(|f| f.name() == "videoscale"))?;
+        let caps = scale.static_pad("sink")?.current_caps()?;
+        let s = caps.structure(0)?;
+        let width = s.get::<i32>("width").ok()?;
+        let height = s.get::<i32>("height").ok()?;
+        let par = s
+            .get::<gst::Fraction>("pixel-aspect-ratio")
+            .ok()
+            .filter(|f| f.numer() > 0 && f.denom() > 0)
+            .map_or(1.0, |f| f.numer() as f64 / f.denom() as f64);
+        let fps = [
+            s.get::<gst::Fraction>("framerate"),
+            s.get::<gst::Fraction>("max-framerate"),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|f| f.numer() > 0 && f.denom() > 0)
+        .map_or(30.0, |f| f.numer() as f64 / f.denom() as f64);
+        let (w, h) = (
+            (width as f64 * par).round().max(1.0) as u32,
+            height.max(1) as u32,
+        );
+        let turned = self
+            .orientation()
+            .is_some_and(|o| o.ends_with("-90") || o.ends_with("-270"));
+        let (width, height) = if turned { (h, w) } else { (w, h) };
+        Some(crate::describe_file::FrameInfo {
+            width,
+            height,
+            fps: (fps * 1000.0).round() / 1000.0,
+            extra: Default::default(),
+        })
+    }
+
     /// The clip's `image-orientation` tag (`rotate-90`, `flip-rotate-0`, …), from the tag
     /// events that reached the sink.
     fn orientation(&self) -> Option<String> {
@@ -653,6 +697,19 @@ pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
     Ok(find_shots(&frames, &times, last_end))
 }
 
+/// The picture of the video at `path` as the description file records it (see
+/// [`Clip::source_frame`]), and its length in seconds.
+pub fn probe_frame(path: &Path) -> Result<(crate::describe_file::FrameInfo, f64), Error> {
+    let clip = Clip::open(path, OPEN_TIMEOUT).map_err(Error::Unreadable)?;
+    let frame = clip
+        .source_frame()
+        .ok_or_else(|| Error::Unreadable("no video size".to_string()))?;
+    let duration_s = clip
+        .duration_s()
+        .ok_or_else(|| Error::Unreadable("no duration".to_string()))?;
+    Ok((frame, duration_s))
+}
+
 /// The length in seconds of the clip at `path`, for an estimate before describing it; `None`
 /// when it could not be read within [`OPEN_TIMEOUT`].
 pub fn clip_duration_s(path: &Path) -> Option<f64> {
@@ -683,6 +740,19 @@ mod tests {
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(|l| repo().join(l))
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_frame_gives_the_picture_as_shown() {
+        let (frame, duration_s) =
+            probe_frame(&repo().join("tests/clips/file_example_MP4_480_1_5MG.mp4")).expect("probe");
+        assert_eq!((frame.width, frame.height), (480, 270));
+        assert_eq!(frame.fps, 30.0);
+        assert!(duration_s > 1.0);
+        // A 90° rotation tag turns the picture: portrait as a phone shows it.
+        let (rotated, _) = probe_frame(&repo().join("tests/clips/rotated-90.mp4")).expect("probe");
+        assert_eq!((rotated.width, rotated.height), (270, 480));
     }
 
     fn jpeg_size(jpeg: &[u8]) -> (u32, u32) {

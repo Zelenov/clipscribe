@@ -1,6 +1,6 @@
 [package]
 name = "clipscribe"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 description = "Describe what happens in video clips, and when, with Claude: a video file (and its subtitles) in, a summary and time-ranged key moments out."
 repository = "https://github.com/Zelenov/clipscribe"
@@ -38,6 +38,8 @@ required-features = ["cli"]
 [dependencies]
 log = "0.4"
 serde_json = "1"
+# The description file (`describe_file`): its types read and write themselves.
+serde = { version = "1", features = ["derive"] }
 # HTTP to the Anthropic API, trusting the OS certificate store (corporate TLS-inspecting
 # proxies need it).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
