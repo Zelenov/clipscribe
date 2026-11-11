@@ -93,18 +93,22 @@ pub struct DescribeFile {
 }
 
 /// The picture as shown: size after rotation and pixel aspect, and the nominal frame rate.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FrameInfo {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// A stretch of the video, seconds.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Span {
     pub start_s: f64,
     pub end_s: f64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// The In and Out a person set; a missing one is the video's own start or end.
@@ -228,7 +232,7 @@ impl std::fmt::Display for ReadError {
 impl std::error::Error for ReadError {}
 
 /// What a run knows beyond its [`Description`], for [`DescribeFile::from_described`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RunFacts<'a> {
     pub duration_s: f64,
     pub frame: FrameInfo,
@@ -269,7 +273,10 @@ impl DescribeFile {
 
     /// The file as pretty JSON, ending with a newline. Never writes `null`.
     pub fn to_json(&self) -> String {
-        let mut text = serde_json::to_string_pretty(self).unwrap_or_default();
+        // An unknown field kept as `null` is left out: the format never uses `null`.
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        drop_nulls(&mut value);
+        let mut text = serde_json::to_string_pretty(&value).unwrap_or_default();
         text.push('\n');
         text
     }
@@ -369,6 +376,7 @@ impl DescribeFile {
                             .map(|r| Span {
                                 start_s: round_ms(r.start_s.clamp(0.0, duration_s)),
                                 end_s: round_ms(r.end_s.clamp(0.0, duration_s)),
+                                extra: Extra::new(),
                             })
                             .filter(|r| r.end_s > r.start_s)
                             .collect()
@@ -389,6 +397,7 @@ impl DescribeFile {
             usable: description.main.map(|m| Span {
                 start_s: round_ms(m.start_s.clamp(0.0, duration_s)),
                 end_s: round_ms(m.end_s.clamp(0.0, duration_s)),
+                extra: Extra::new(),
             }),
             in_out: None,
             cuts,
@@ -425,7 +434,9 @@ impl DescribeFile {
     /// - Everything `by: user` here is kept, everything `by: ai` here is replaced by `new`'s.
     /// - A new AI moment within [`MOMENT_SNAP_S`] of a user point moment is dropped.
     /// - New AI parts are cut back where a user part is; one left shorter than [`MIN_PART_S`]
-    ///   is dropped, its time going to the part before it.
+    ///   is dropped, its time going to the AI part before it (or after it). A user part is never
+    ///   moved: a short AI part between two user parts stays.
+    /// - A new AI person matches a kept person only when its faces meet exactly one.
     /// - A new AI person whose faces overlap a kept person's faces (in time and place) is that
     ///   person: the kept person gets the new faces, and `@pN` in new text is rewritten.
     /// - Faces, texts, cuts, tags, `summary`, `usable`, `duration_s`, `frame` and `lang` come
@@ -439,59 +450,78 @@ impl DescribeFile {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        // Analysis the new run did not do (absent) is not "found nothing": what the old file has
+        // stays, so a run without faces never loses the faces a person linked to someone.
+        let faces_redone = out.faces.is_some();
+        if !faces_redone {
+            out.faces = self.faces.clone();
+        }
+        if out.texts.is_none() {
+            out.texts = self.texts.clone();
+        }
+        if out.cuts.is_none() {
+            out.cuts = self.cuts.clone();
+        }
+        if out.tags.is_none() {
+            out.tags = self.tags.clone();
+        }
+        if out.summary.is_none() {
+            out.summary = self.summary.clone();
+        }
 
-        // People first: matching renames new people, which their text refers to.
-        let kept_people: Vec<Person> = self
+        // People first: matching renames new people, which their text refers to. Mentions in
+        // the new run's text that name no one in its own people are dropped first.
+        let new_people_given = out.people.is_some();
+        let new_people: Vec<Person> = out.people.take().unwrap_or_default();
+        let mut people: Vec<Person> = self
             .people
             .iter()
             .flatten()
-            .filter(|p| p.by == By::User)
+            .filter(|p| p.by == By::User || !new_people_given)
             .cloned()
             .collect();
-        let old_faces: HashMap<&str, &Track> = self
-            .faces
-            .iter()
-            .flatten()
-            .map(|t| (t.id.as_str(), t))
-            .collect();
-        let new_faces: HashMap<String, Track> = out
-            .faces
-            .iter()
-            .flatten()
-            .map(|t| (t.id.clone(), t.clone()))
-            .collect();
-        let mut rename: BTreeMap<String, String> = BTreeMap::new();
-        let mut people = kept_people.clone();
-        // A kept person's old face ids are gone with the old run: give them the new faces that
-        // lie where theirs were.
-        for person in &mut people {
-            let theirs: Vec<&Track> = person
+        if faces_redone {
+            // A kept person's old face ids are gone with the old run: give them the new faces
+            // that lie where theirs were, each new face to one person only.
+            let old_faces: HashMap<&str, &Track> = self
                 .faces
                 .iter()
-                .filter_map(|f| old_faces.get(f.as_str()).copied())
+                .flatten()
+                .map(|t| (t.id.as_str(), t))
                 .collect();
-            let mut faces: Vec<String> = new_faces
-                .values()
-                .filter(|new| theirs.iter().any(|old| same_place(old, new)))
-                .map(|t| t.id.clone())
-                .collect();
-            faces.sort();
-            person.faces = faces;
+            let mut new_faces: Vec<&Track> = out.faces.iter().flatten().collect();
+            for person in people.iter_mut().filter(|p| p.by == By::User) {
+                let theirs: Vec<&Track> = person
+                    .faces
+                    .iter()
+                    .filter_map(|f| old_faces.get(f.as_str()).copied())
+                    .collect();
+                let (mine, rest): (Vec<&Track>, Vec<&Track>) = new_faces
+                    .into_iter()
+                    .partition(|new| theirs.iter().any(|old| same_place(old, new)));
+                new_faces = rest;
+                let mut faces: Vec<String> = mine.iter().map(|t| t.id.clone()).collect();
+                faces.sort();
+                person.faces = faces;
+            }
         }
+        let mut rename: BTreeMap<String, String> = BTreeMap::new();
         let mut next_person = max_person_number(self.people.iter().flatten())
             .max(max_person_number(people.iter()))
             + 1;
-        for person in out.people.take().into_iter().flatten() {
-            if person.by == By::User {
-                // A person of the new run is the run's own: it can only be `ai`. Kept as is.
-                people.push(person);
-                continue;
-            }
-            let matched = people.iter_mut().find(|kept| {
-                kept.by == By::User && person.faces.iter().any(|f| kept.faces.contains(f))
-            });
-            match matched {
-                Some(kept) => {
+        for person in new_people.iter().cloned() {
+            // A new AI person is a kept one when its faces meet exactly one kept person's.
+            let candidates: Vec<usize> = people
+                .iter()
+                .enumerate()
+                .filter(|(_, kept)| {
+                    kept.by == By::User && person.faces.iter().any(|f| kept.faces.contains(f))
+                })
+                .map(|(n, _)| n)
+                .collect();
+            match candidates.as_slice() {
+                [only] => {
+                    let kept = &mut people[*only];
                     for face in &person.faces {
                         if !kept.faces.contains(face) {
                             kept.faces.push(face.clone());
@@ -500,7 +530,7 @@ impl DescribeFile {
                     kept.faces.sort();
                     rename.insert(person.id.clone(), kept.id.clone());
                 }
-                None => {
+                _ => {
                     let id = format!("p{next_person}");
                     next_person += 1;
                     rename.insert(person.id.clone(), id.clone());
@@ -508,85 +538,71 @@ impl DescribeFile {
                 }
             }
         }
-        let had_people = self.people.is_some() || out.people.is_some() || !people.is_empty();
-        out.people = had_people.then_some(people);
+        out.people = (self.people.is_some() || new_people_given).then_some(people);
+        let renamed = |text: &Option<String>| {
+            text.as_deref()
+                .map(|t| rewrite_mentions(&drop_unknown_mentions(t, &new_people), &rename))
+        };
 
         // Ids kept from here must not be reused by the new run.
         let mut taken: HashSet<String> = self.ids();
-        let renamed = |text: &Option<String>| text.as_deref().map(|t| rewrite_mentions(t, &rename));
 
-        // Moments.
-        let user_moments: Vec<Marker> = self
-            .moments
-            .iter()
-            .flatten()
-            .filter(|m| m.by == By::User)
-            .cloned()
-            .collect();
-        if self.moments.is_some() || out.moments.is_some() {
-            let mut moments = user_moments.clone();
-            for mut moment in out.moments.take().into_iter().flatten() {
-                let snapped = user_moments.iter().any(|u| {
-                    u.end_s.is_none() && (u.start_s - moment.start_s).abs() < MOMENT_SNAP_S
-                });
-                if snapped {
-                    continue;
+        // Moments: a run that did not look for them leaves the old ones.
+        match out.moments.take() {
+            None => out.moments = self.moments.clone(),
+            Some(new_moments) => {
+                let user_moments: Vec<Marker> = self
+                    .moments
+                    .iter()
+                    .flatten()
+                    .filter(|m| m.by == By::User)
+                    .cloned()
+                    .collect();
+                let mut moments = user_moments.clone();
+                for mut moment in new_moments {
+                    let snapped = user_moments.iter().any(|u| {
+                        u.end_s.is_none() && (u.start_s - moment.start_s).abs() <= MOMENT_SNAP_S
+                    });
+                    if snapped {
+                        continue;
+                    }
+                    moment.description = renamed(&moment.description);
+                    fresh_id(&mut moment.id, &mut taken);
+                    moments.push(moment);
                 }
-                moment.description = renamed(&moment.description);
-                fresh_id(&mut moment.id, &mut taken);
-                moments.push(moment);
+                sort_markers(&mut moments);
+                out.moments = Some(moments);
             }
-            sort_markers(&mut moments);
-            out.moments = Some(moments);
         }
 
-        // Parts.
-        let user_parts: Vec<Marker> = self
-            .parts
-            .iter()
-            .flatten()
-            .filter(|p| p.by == By::User)
-            .cloned()
-            .collect();
-        if self.parts.is_some() || out.parts.is_some() {
-            let mut parts = user_parts.clone();
-            let new_parts = out.parts.take().unwrap_or_default();
-            let mut ai: Vec<Marker> = Vec::new();
-            for part in new_parts {
-                for (start, end) in subtract(part.start_s, part.end_or_start(), &user_parts) {
-                    let mut piece = part.clone();
-                    piece.start_s = start;
-                    piece.end_s = Some(end);
-                    piece.description = renamed(&part.description);
-                    ai.push(piece);
+        // Parts: a run that did not make them leaves the old ones (which cover the clip).
+        match out.parts.take() {
+            None => out.parts = self.parts.clone(),
+            Some(new_parts) => {
+                let user_parts: Vec<Marker> = self
+                    .parts
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.by == By::User)
+                    .cloned()
+                    .collect();
+                let mut all = user_parts.clone();
+                for part in new_parts {
+                    for (start, end) in subtract(part.start_s, part.end_or_start(), &user_parts) {
+                        let mut piece = part.clone();
+                        piece.start_s = start;
+                        piece.end_s = Some(end);
+                        piece.description = renamed(&part.description);
+                        all.push(piece);
+                    }
                 }
-            }
-            // A short AI leftover gives its time to the part before it (the one after it, when it
-            // is first), so the parts still cover the clip.
-            let mut all: Vec<Marker> = parts.drain(..).chain(ai).collect();
-            sort_markers(&mut all);
-            let mut merged: Vec<Marker> = Vec::new();
-            for part in all {
-                let short = part.by == By::Ai && part.end_or_start() - part.start_s < MIN_PART_S;
-                if let Some(prev) = merged.last_mut().filter(|_| short) {
-                    prev.end_s = part.end_s;
-                    continue;
-                }
-                merged.push(part);
-            }
-            let first_short = merged
-                .first()
-                .is_some_and(|p| p.by == By::Ai && p.end_or_start() - p.start_s < MIN_PART_S);
-            if first_short && merged.len() > 1 {
-                let first = merged.remove(0);
-                merged[0].start_s = first.start_s;
-            }
-            for part in &mut merged {
-                if part.by == By::Ai {
+                sort_markers(&mut all);
+                let mut parts = absorb_short_parts(all);
+                for part in parts.iter_mut().filter(|p| p.by == By::Ai) {
                     fresh_id(&mut part.id, &mut taken);
                 }
+                out.parts = Some(parts);
             }
-            out.parts = Some(merged);
         }
 
         // New text may name a person by an id the merge changed.
@@ -618,7 +634,7 @@ impl DescribeFile {
             bad("lang is empty".to_string());
         }
         let in_video = |t: f64| t.is_finite() && (0.0..=d).contains(&t);
-        if let Some(u) = self.usable {
+        if let Some(u) = &self.usable {
             if !(in_video(u.start_s) && in_video(u.end_s) && u.end_s > u.start_s) {
                 bad(format!(
                     "usable {}–{} is not a stretch of the video",
@@ -866,6 +882,47 @@ pub fn save_run(
     };
     file.write(&path).map_err(SaveError::Io)?;
     Ok(path)
+}
+
+/// `value` without object members that are `null`, at every depth.
+fn drop_nulls(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            map.values_mut().for_each(drop_nulls);
+        }
+        Value::Array(items) => items.iter_mut().for_each(drop_nulls),
+        _ => {}
+    }
+}
+
+/// `parts` (sorted, covering the clip) with each AI part shorter than [`MIN_PART_S`] given to
+/// the AI part before it, or after it when there is none before; a user part is never moved,
+/// so a short AI part between two user parts stays.
+fn absorb_short_parts(parts: Vec<Marker>) -> Vec<Marker> {
+    let short = |p: &Marker| p.by == By::Ai && p.end_or_start() - p.start_s < MIN_PART_S;
+    let mut out: Vec<Marker> = Vec::new();
+    let mut pending: Option<Marker> = None; // a short part waiting for an AI part after it
+    for mut part in parts {
+        if let Some(waiting) = pending.take() {
+            if part.by == By::Ai {
+                part.start_s = waiting.start_s;
+            } else {
+                out.push(waiting);
+            }
+        }
+        if short(&part) {
+            if let Some(prev) = out.last_mut().filter(|p| p.by == By::Ai) {
+                prev.end_s = part.end_s;
+                continue;
+            }
+            pending = Some(part);
+            continue;
+        }
+        out.push(part);
+    }
+    out.extend(pending);
+    out
 }
 
 fn check_track(t: &Track, prefix: char, d: f64, bad: &mut dyn FnMut(String)) {

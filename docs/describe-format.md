@@ -166,7 +166,12 @@ where they keep them (the desktop app's file names and tag store), not here.
     1 s is dropped, its time going to the part before it.
   - **People:** a new AI person whose faces overlap a kept person's faces in time and place is
     that person. Their faces are added and no new id is made.
-  - **Faces, texts, cuts, tags, `summary`, `usable`:** all from the new run.
+  - **Faces, texts, cuts, tags, `summary`, `usable`:** all from the new run. Analysis the new
+    run did not do (absent) stays as it was, so a run without face tracking keeps the faces a
+    person linked to someone; `usable` absent means the whole video, so it is always the new
+    run's.
+  - A short AI part's time never goes to a user part: it goes to the AI part next to it, or the
+    short part stays.
 - **Ids are never reused** within a file, even after their item is deleted.
 
 ## Who makes it

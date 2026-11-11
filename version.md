@@ -14,7 +14,9 @@
 ## Changed
 - `Segment` has a new field `title` and `Description` a new field `lang`: code that builds them
   needs the fields (frename: tests that build a `Description`). Requests ask for both, a few
-  output tokens more per moment.
+  output tokens more per moment, in every moments mode.
+- The text output shows each moment as `0:10–0:14  Title: description` (was
+  `0:10–0:14  description`).
 
 # 0.17.0
 ## Added

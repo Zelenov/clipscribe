@@ -203,8 +203,9 @@ impl Clip {
     }
 
     /// The picture as the clip shows it, for the description file: the decoded size with its
-    /// pixel aspect applied and turned by the rotation tag, and the frame rate (the nominal one,
-    /// or `max-framerate` for a variable-rate clip; 30 when neither is known).
+    /// pixel aspect applied and turned by the rotation tag, and the frame rate. The rate is the
+    /// container's nominal one; a variable-rate clip that has none gives its `max-framerate`
+    /// (not yet the average the format asks for), and 30 when neither is known.
     pub fn source_frame(&self) -> Option<crate::describe_file::FrameInfo> {
         let scale = self
             .pipeline
@@ -241,6 +242,7 @@ impl Clip {
             width,
             height,
             fps: (fps * 1000.0).round() / 1000.0,
+            extra: Default::default(),
         })
     }
 
@@ -695,8 +697,6 @@ pub fn detect_shots(video: &Path, cancel: &AtomicBool) -> Result<Shots, Error> {
     Ok(find_shots(&frames, &times, last_end))
 }
 
-/// The length in seconds of the clip at `path`, for an estimate before describing it; `None`
-/// when it could not be read within [`OPEN_TIMEOUT`].
 /// The picture of the video at `path` as the description file records it (see
 /// [`Clip::source_frame`]), and its length in seconds.
 pub fn probe_frame(path: &Path) -> Result<(crate::describe_file::FrameInfo, f64), Error> {
@@ -710,6 +710,8 @@ pub fn probe_frame(path: &Path) -> Result<(crate::describe_file::FrameInfo, f64)
     Ok((frame, duration_s))
 }
 
+/// The length in seconds of the clip at `path`, for an estimate before describing it; `None`
+/// when it could not be read within [`OPEN_TIMEOUT`].
 pub fn clip_duration_s(path: &Path) -> Option<f64> {
     Clip::open(path, OPEN_TIMEOUT)
         .map_err(|e| log::info!("clipscribe: cannot read {}: {e}", path.display()))

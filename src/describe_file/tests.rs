@@ -65,6 +65,7 @@ fn frame() -> FrameInfo {
         width: 1920,
         height: 1080,
         fps: 25.0,
+        extra: Extra::new(),
     }
 }
 
@@ -353,7 +354,8 @@ fn an_important_run_becomes_moments_with_usable_cuts_and_tags() {
         file.usable,
         Some(Span {
             start_s: 2.0,
-            end_s: 28.0
+            end_s: 28.0,
+            extra: Extra::new(),
         })
     );
     assert_eq!(file.cuts, Some(vec![9.0]));
@@ -431,7 +433,7 @@ fn new_ai_parts_are_cut_around_user_parts() {
     );
     assert_eq!(merged.problems(), Vec::<String>::new());
 
-    // A leftover shorter than a second goes to the part before it.
+    // A leftover shorter than a second goes to an AI part next to it, never to a user part.
     let mut new = base(30.0);
     new.parts = Some(vec![
         marker("n00000", By::Ai, 0.0, Some(20.5), "Start"),
@@ -442,8 +444,8 @@ fn new_ai_parts_are_cut_around_user_parts() {
         spans(merged.parts.as_ref().unwrap()),
         [
             ("Start", 0.0, 10.0),
-            ("Mine", 10.0, 20.5),
-            ("Rest", 20.5, 30.0)
+            ("Mine", 10.0, 20.0),
+            ("Rest", 20.0, 30.0)
         ]
     );
     assert_eq!(merged.problems(), Vec::<String>::new());
@@ -642,4 +644,91 @@ fn save_run_writes_next_to_the_video_and_keeps_user_edits() {
     ));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"version\": 9}");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn analysis_a_run_did_not_do_keeps_the_old_one() {
+    let mut old = base(30.0);
+    old.faces = Some(vec![face("f1", 0.0, 10.0, [0.1, 0.1, 0.2, 0.2])]);
+    old.people = Some(vec![person("p1", By::User, "the guide", &["f1"])]);
+    old.parts = Some(vec![
+        marker("a00000", By::Ai, 0.0, Some(10.0), "Old"),
+        marker("u00000", By::User, 10.0, Some(30.0), "Mine"),
+    ]);
+    old.cuts = Some(vec![10.0]);
+    // Today's run: moments only, no faces, people, parts or cuts.
+    let mut new = base(30.0);
+    new.moments = Some(vec![marker("m00000", By::Ai, 5.0, None, "Wave")]);
+    let merged = old.merge_run(new);
+    assert_eq!(merged.faces, old.faces);
+    assert_eq!(merged.people, old.people, "the user's face links stay");
+    assert_eq!(merged.parts, old.parts, "parts still cover the clip");
+    assert_eq!(merged.cuts, old.cuts);
+    assert_eq!(merged.problems(), Vec::<String>::new());
+
+    // Done and found nothing stays "done".
+    let mut new = base(30.0);
+    new.people = Some(vec![]);
+    assert_eq!(base(30.0).merge_run(new).people, Some(vec![]));
+}
+
+#[test]
+fn a_new_person_on_two_kept_peoples_faces_is_neither() {
+    let mut old = base(30.0);
+    old.faces = Some(vec![
+        face("f1", 0.0, 10.0, [0.1, 0.1, 0.2, 0.2]),
+        face("f2", 0.0, 10.0, [0.6, 0.1, 0.2, 0.2]),
+    ]);
+    old.people = Some(vec![
+        person("p1", By::User, "the guide", &["f1"]),
+        person("p2", By::User, "the driver", &["f2"]),
+    ]);
+    let mut new = base(30.0);
+    new.faces = Some(vec![
+        face("f1", 0.0, 10.0, [0.1, 0.1, 0.2, 0.2]),
+        face("f2", 0.0, 10.0, [0.6, 0.1, 0.2, 0.2]),
+    ]);
+    new.people = Some(vec![person("p1", By::Ai, "two people", &["f1", "f2"])]);
+    new.moments = Some(vec![Marker {
+        description: Some("@p1 waves at @p5.".to_string()),
+        ..marker("m00000", By::Ai, 5.0, None, "Wave")
+    }]);
+    let merged = old.merge_run(new);
+    let people = merged.people.as_ref().unwrap();
+    assert_eq!(people.len(), 3, "an unsure match makes a new person");
+    assert_eq!(people[0].faces, ["f1"]);
+    assert_eq!(people[1].faces, ["f2"]);
+    let text = merged.moments.as_ref().unwrap()[0]
+        .description
+        .clone()
+        .unwrap();
+    assert_eq!(text, "@p3 waves at someone.", "@p5 names no one in the run");
+}
+
+#[test]
+fn unknown_fields_in_small_objects_are_kept_and_null_is_never_written() {
+    let text = EXAMPLE
+        .replacen("\"fps\": 29.97}", "\"fps\": 29.97, \"dar\": 1}", 1)
+        .replacen("\"end_s\": 41.5}", "\"end_s\": 41.5, \"why\": \"x\"}", 1)
+        .replacen("\"version\": 1,", "\"version\": 1, \"gone\": null,", 1);
+    let written = DescribeFile::parse(&text).unwrap().to_json();
+    assert!(written.contains("\"dar\": 1"));
+    assert!(written.contains("\"why\": \"x\""));
+    assert!(!written.contains("null"));
+}
+
+#[test]
+fn a_short_first_ai_piece_never_moves_the_user_part_after_it() {
+    let mut old = base(30.0);
+    old.parts = Some(vec![
+        marker("a00000", By::Ai, 0.0, Some(0.5), "Old"),
+        marker("u00000", By::User, 0.5, Some(30.0), "Mine"),
+    ]);
+    let mut new = base(30.0);
+    new.parts = Some(vec![marker("n00000", By::Ai, 0.0, Some(30.0), "All")]);
+    let merged = old.merge_run(new);
+    assert_eq!(
+        spans(merged.parts.as_ref().unwrap()),
+        [("All", 0.0, 0.5), ("Mine", 0.5, 30.0)]
+    );
 }
