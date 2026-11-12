@@ -15,11 +15,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::describe::{
-    candidate_times, frame_count, frame_size, sample_times, select_key_frames, shot_times, Frame,
-    FrameSampling, FRAME_LONG_SIDE, MAX_DURATION_S,
+    candidate_times, cue_candidates, frame_count, frame_size, sample_times,
+    select_key_frames_with_extras, shot_times_with_cues, CueMoment, Frame, FrameSampling, KeyPick,
+    FRAME_LONG_SIDE, MAX_DURATION_S,
 };
 use crate::shots::{find_shots, Shots, FRAME_HEIGHT, FRAME_WIDTH};
-use crate::Error;
+use crate::{Cue, Error};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -39,41 +40,52 @@ pub(crate) struct Sampled {
     pub(crate) fingerprints: Vec<crate::FrameFingerprint>,
     /// The shots the frames were chosen by ([`FrameSampling::Shots`] with at least one found).
     pub(crate) shots: Option<Shots>,
+    /// For each frame, the subtitle moment it was taken for, if any (same order as `frames`).
+    pub(crate) cue_moments: Vec<Option<CueMoment>>,
 }
 
 /// The frames of the clip at `video` (open as `clip`, `duration_s` long) for `sampling`. With
 /// [`FrameSampling::Shots`] this reads the clip once to find its shots ([`detect_shots`]) and
-/// takes a frame from the middle of each ([`shot_times`]); with no shots found it falls back to
-/// key frames.
+/// takes a frame from the middle of each ([`shot_times`](crate::shot_times)); with no shots
+/// found it falls back to key frames. `cues` (the clip's subtitles, empty when it has none)
+/// move key frames and shot frames to pauses and line changes, never adding a frame.
 pub(crate) fn sample_clip(
     video: &Path,
     clip: &Clip,
     duration_s: f64,
     sampling: FrameSampling,
+    cues: &[Cue],
     cancel: &AtomicBool,
     mut on_frame: impl FnMut(usize, usize),
 ) -> Result<Option<Sampled>, String> {
     if sampling != FrameSampling::Shots {
-        return clip.sample_with_fingerprints(duration_s, sampling, cancel, on_frame);
+        return clip.sample_with_fingerprints(duration_s, sampling, cues, cancel, on_frame);
     }
     let shots = match detect_shots(video, cancel) {
         Ok(shots) => shots,
         Err(Error::Cancelled) => return Ok(None),
         Err(e) => return Err(e.to_string()),
     };
-    let times = shot_times(&shots, duration_s);
-    if times.is_empty() {
+    let planned = shot_times_with_cues(&shots, duration_s, cues);
+    if planned.is_empty() {
         return clip.sample_with_fingerprints(
             duration_s,
             FrameSampling::KeyFrames,
+            cues,
             cancel,
             on_frame,
         );
     }
+    let times: Vec<f64> = planned.iter().map(|(t, _)| *t).collect();
     Ok(clip
         .sample_at(&times, cancel, &mut on_frame)?
         .map(|sampled| Sampled {
             shots: Some(shots),
+            cue_moments: planned
+                .iter()
+                .map(|(_, moment)| *moment)
+                .take(sampled.frames.len())
+                .collect(),
             ..sampled
         }))
 }
@@ -258,16 +270,21 @@ impl Clip {
         on_frame: impl FnMut(usize, usize),
     ) -> Result<Option<Vec<Frame>>, String> {
         Ok(self
-            .sample_with_fingerprints(duration_s, sampling, cancel, on_frame)?
+            .sample_with_fingerprints(duration_s, sampling, &[], cancel, on_frame)?
             .map(|sampled| sampled.frames))
     }
 
     /// [`Self::sample`], with each frame's fingerprint (an 8×8 grid of average luma of the upright
-    /// frame, see [`crate::FrameFingerprint`]) for grouping similar footage.
+    /// frame, see [`crate::FrameFingerprint`]) for grouping similar footage. With `KeyFrames`
+    /// and `cues`, the subtitles' pauses and line changes ([`cue_candidates`]) are decoded too
+    /// (exact seeks, after the grid) and can replace a window's pick when they score higher
+    /// ([`select_key_frames_with_extras`]); the number of frames stays the same. Without cues,
+    /// or with `Interval`, the cues change nothing.
     pub(crate) fn sample_with_fingerprints(
         &self,
         duration_s: f64,
         sampling: FrameSampling,
+        cues: &[Cue],
         cancel: &AtomicBool,
         mut on_frame: impl FnMut(usize, usize),
     ) -> Result<Option<Sampled>, String> {
@@ -289,7 +306,12 @@ impl Clip {
         // is `i` scaled down proportionally from the candidate loop's range into the budget's,
         // so it still counts up smoothly to `total` over the (denser) loop instead of jumping.
         let frame_budget = frame_count(duration_s).max(1);
-        let candidate_total = times.len().max(1);
+        let cue_times = if key_frames {
+            cue_candidates(cues, duration_s, Some(frame_budget))
+        } else {
+            Vec::new()
+        };
+        let candidate_total = (times.len() + cue_times.len()).max(1);
         let mut candidates: Vec<(f64, image::RgbImage)> = Vec::new();
         for (i, time_s) in times.into_iter().enumerate() {
             let done = i * frame_budget / candidate_total;
@@ -319,19 +341,61 @@ impl Clip {
             }
             candidates.push((pts, image));
         }
-        let chosen: Vec<usize> = if key_frames {
-            let fingerprints: Vec<(f64, Vec<u8>)> = candidates
+        // The subtitle moments, each at its own time; one past the end of the picture is
+        // dropped, like the rest of the grid there.
+        let picture_end = candidates.last().map_or(0.0, |(t, _)| *t);
+        let mut extras: Vec<(f64, image::RgbImage, CueMoment)> = Vec::new();
+        // With no more grid candidates than frames every one is sent: nothing to choose.
+        let usable = if candidates.len() > frame_budget {
+            cue_times.as_slice()
+        } else {
+            &[]
+        };
+        for (k, (time_s, moment)) in usable.iter().enumerate() {
+            let done = (candidate_total - cue_times.len() + k) * frame_budget / candidate_total;
+            on_frame(done, frame_budget);
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            if *time_s > picture_end + interval {
+                break;
+            }
+            if let Ok((pts, image)) = self.frame_at(*time_s, gst::SeekFlags::ACCURATE) {
+                extras.push((pts, image, *moment));
+            }
+        }
+        let chosen: Vec<(f64, image::RgbImage, Option<CueMoment>)> = if key_frames {
+            let grid: Vec<(f64, Vec<u8>)> = candidates
                 .iter()
                 .map(|(t, image)| (*t, fingerprint(image)))
                 .collect();
-            select_key_frames(&fingerprints, frame_budget)
+            let scored: Vec<(f64, Vec<u8>, f64)> = extras
+                .iter()
+                .map(|(t, image, moment)| (*t, fingerprint(image), moment.bonus()))
+                .collect();
+            let mut picks: Vec<(f64, image::RgbImage, Option<CueMoment>)> =
+                select_key_frames_with_extras(&grid, &scored, frame_budget)
+                    .into_iter()
+                    .map(|pick| match pick {
+                        KeyPick::Grid(i) => (candidates[i].0, candidates[i].1.clone(), None),
+                        KeyPick::Extra(e) => (extras[e].0, extras[e].1.clone(), Some(extras[e].2)),
+                    })
+                    .collect();
+            // An extra can sit a little before or after its window's other candidates: keep
+            // time order, and one frame per time.
+            picks.sort_by(|a, b| a.0.total_cmp(&b.0));
+            picks.dedup_by(|b, a| b.0 <= a.0 + 1e-3);
+            picks
         } else {
-            (0..candidates.len()).collect()
+            candidates
+                .into_iter()
+                .map(|(t, image)| (t, image, None))
+                .collect()
         };
         let mut frames = Vec::with_capacity(chosen.len());
         let mut fingerprints = Vec::with_capacity(chosen.len());
-        for i in chosen {
-            let (time_s, image) = candidates[i].clone();
+        let mut cue_moments = Vec::with_capacity(chosen.len());
+        for (time_s, image, moment) in chosen {
             let upright = orient(image, orientation.as_deref());
             fingerprints.push(crate::FrameFingerprint {
                 time_s,
@@ -341,11 +405,13 @@ impl Clip {
                 time_s,
                 jpeg: to_jpeg(upright)?,
             });
+            cue_moments.push(moment);
         }
         Ok(Some(Sampled {
             frames,
             fingerprints,
             shots: None,
+            cue_moments,
         }))
     }
 
@@ -381,6 +447,7 @@ impl Clip {
             });
         }
         Ok(Some(Sampled {
+            cue_moments: vec![None; frames.len()],
             frames,
             fingerprints,
             shots: None,
@@ -1188,6 +1255,7 @@ mod tests {
             &clip,
             duration,
             FrameSampling::Shots,
+            &[],
             &cancel,
             |_, _| {},
         )
@@ -1211,6 +1279,7 @@ mod tests {
             &clip,
             duration,
             FrameSampling::Shots,
+            &[],
             &stop,
             |_, _| {}
         )
@@ -1319,5 +1388,69 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(matches!(result, Err(Error::Unreadable(_))), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[cfg(target_os = "linux")]
+    use crate::test_cue as cue_at;
+
+    /// Lines of speech with pauses between them, every `period` seconds: speech for
+    /// `period - pause`, then `pause` of silence.
+    #[cfg(target_os = "linux")]
+    fn speech(duration: f64, period: f64, pause: f64) -> Vec<Cue> {
+        (0..)
+            .map(|i| i as f64 * period)
+            .take_while(|start| start + period - pause < duration)
+            .map(|start| cue_at(start, start + period - pause))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subtitles_move_key_frames_into_their_pauses_within_the_same_budget() {
+        let path = repo().join("tests/clips/file_example_MP4_480_1_5MG.mp4");
+        let clip = Clip::open(&path, Duration::from_secs(20)).expect("opens");
+        let duration = clip.duration_s().expect("duration");
+        let cancel = AtomicBool::new(false);
+        let run = |cues: &[Cue]| {
+            clip.sample_with_fingerprints(
+                duration,
+                FrameSampling::KeyFrames,
+                cues,
+                &cancel,
+                |_, _| {},
+            )
+            .expect("frames")
+            .expect("not cancelled")
+        };
+        let plain = run(&[]);
+        // No subtitles: exactly what `sample` gives, as before.
+        let before: Vec<f64> = clip
+            .sample(duration, FrameSampling::KeyFrames, &cancel, |_, _| {})
+            .expect("frames")
+            .expect("not cancelled")
+            .iter()
+            .map(|f| f.time_s)
+            .collect();
+        let plain_times: Vec<f64> = plain.frames.iter().map(|f| f.time_s).collect();
+        assert_eq!(plain_times, before);
+        assert!(plain.cue_moments.iter().all(Option::is_none));
+        // A 1.2 s pause every 6 s.
+        let cues = speech(duration, 6.0, 1.2);
+        let pauses: Vec<(f64, f64)> = cues
+            .windows(2)
+            .map(|w| (w[0].end.as_secs_f64(), w[1].start.as_secs_f64()))
+            .collect();
+        let with = run(&cues);
+        let times: Vec<f64> = with.frames.iter().map(|f| f.time_s).collect();
+        assert_eq!(with.frames.len(), plain.frames.len());
+        assert_eq!(with.cue_moments.len(), with.frames.len());
+        // Every pause has a frame in it or right after it (within 0.5 s of its end).
+        for (from, to) in &pauses {
+            assert!(
+                times.iter().any(|t| *t >= from - 0.05 && *t <= to + 0.5),
+                "no frame in the pause {from:.2}–{to:.2}: {times:.2?}"
+            );
+        }
+        assert!(with.cue_moments.contains(&Some(CueMoment::Pause)));
     }
 }

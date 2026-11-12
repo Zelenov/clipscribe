@@ -57,10 +57,12 @@ struct Cli {
     #[arg(long, default_value = "subtitles", value_parser = parse_language)]
     language: SummaryLanguage,
 
-    /// How frames are chosen: keyframes (where the picture changes the most, at most 60),
-    /// interval (one every 2 s, at most 60, spread evenly over a longer clip) or shots (EXPERIMENTAL
-    /// — for an edited video: one frame from the middle of every shot, more for the longest, at
-    /// most 60; reads the clip one more time to find the shots; --estimate assumes 60 frames).
+    /// How frames are chosen: keyframes (where the picture changes the most, at most 60; with
+    /// subtitles, pauses, line starts and long lines' middles count too), interval (one every
+    /// 2 s, at most 60, spread evenly over a longer clip; ignores the subtitles) or shots
+    /// (EXPERIMENTAL — for an edited video: one frame from every shot, more for the longest, at
+    /// most 60; with subtitles at a pause or line start inside the shot, else its middle; reads
+    /// the clip one more time to find the shots; --estimate assumes 60 frames).
     #[arg(long, value_enum, default_value_t = FramesArg::Keyframes)]
     frames: FramesArg,
 
@@ -84,7 +86,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = MomentsArg::Important)]
     moments: MomentsArg,
 
-    /// Do not send the `.srt` next to each video.
+    /// Do not use the `.srt` next to each video: neither sent nor used to choose frames.
     #[arg(long)]
     no_subtitles: bool,
 
@@ -1138,7 +1140,17 @@ fn estimate(
             model.cost_usd(usage)
         );
         if let Some((dir, sampling)) = dump {
-            match clipscribe::dump_clip_frames(video, dir, sampling, &CANCEL) {
+            let subtitles = if no_subtitles {
+                Vec::new()
+            } else {
+                srt::load_for(video).unwrap_or_else(|e| {
+                    eprintln!("warning: {}: subtitles not read: {e}", video.display());
+                    Vec::new()
+                })
+            };
+            match clipscribe::dump_clip_frames_with_subtitles(
+                video, &subtitles, dir, sampling, &CANCEL,
+            ) {
                 Ok(count) => println!("  {count} frames written to {}", dir.display()),
                 Err(e) => eprintln!("error: {}: frames not written: {e}", video.display()),
             }

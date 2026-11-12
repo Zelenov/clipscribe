@@ -252,10 +252,24 @@ fn picked(duration_s: f64, sampling: FrameSampling) -> &'static str {
 /// Sample the frames [`describe`] would send for `video` and write them as
 /// [`set_debug_frames_dir`] does, into `dir`, without sending anything: for looking at the
 /// frames without paying for a request. Returns how many were written (a write error is only
-/// logged).
+/// logged). See [`dump_clip_frames_with_subtitles`] for a clip with subtitles.
 #[cfg(feature = "frames")]
 pub fn dump_clip_frames(
     video: &std::path::Path,
+    dir: &std::path::Path,
+    sampling: FrameSampling,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<usize, Error> {
+    dump_clip_frames_with_subtitles(video, &[], dir, sampling, cancel)
+}
+
+/// [`dump_clip_frames`] for a clip with `subtitles`: the frames [`describe`] would send with
+/// them, since subtitles move frames to pauses and line changes. `frames.json` says why each
+/// frame was picked.
+#[cfg(feature = "frames")]
+pub fn dump_clip_frames_with_subtitles(
+    video: &std::path::Path,
+    subtitles: &[Cue],
     dir: &std::path::Path,
     sampling: FrameSampling,
     cancel: &std::sync::atomic::AtomicBool,
@@ -267,20 +281,48 @@ pub fn dump_clip_frames(
     if duration_s > MAX_DURATION_S {
         return Err(Error::TooLong(duration_s));
     }
-    let sampled = frames::sample_clip(video, &clip, duration_s, sampling, cancel, |_, _| {});
-    let frames = match sampled.map(|s| s.map(|s| s.frames)) {
-        Ok(Some(frames)) if !frames.is_empty() => frames,
+    let sampled = match frames::sample_clip(
+        video,
+        &clip,
+        duration_s,
+        sampling,
+        subtitles,
+        cancel,
+        |_, _| {},
+    ) {
+        Ok(Some(sampled)) if !sampled.frames.is_empty() => sampled,
         Ok(Some(_)) => return Err(Error::Unreadable("no frames".to_string())),
         Ok(None) => return Err(Error::Cancelled),
         Err(e) => return Err(Error::Unreadable(e)),
     };
-    debug_frames::dump_frames(
+    debug_frames::dump_frames_picked(
         dir,
         &debug_frames::name_of(video),
-        &frames,
-        picked(duration_s, sampling),
+        &sampled.frames,
+        &picked_each(&sampled, duration_s, sampling),
     );
-    Ok(frames.len())
+    Ok(sampled.frames.len())
+}
+
+/// Why each frame of `sampled` was picked, for `frames.json`: its subtitle moment, or how
+/// `sampling` picks ([`picked`]).
+#[cfg(feature = "frames")]
+fn picked_each(
+    sampled: &frames::Sampled,
+    duration_s: f64,
+    sampling: FrameSampling,
+) -> Vec<&'static str> {
+    let default = picked(duration_s, sampling);
+    (0..sampled.frames.len())
+        .map(|i| {
+            sampled
+                .cue_moments
+                .get(i)
+                .copied()
+                .flatten()
+                .map_or(default, |moment| moment.label())
+        })
+        .collect()
 }
 
 /// Describe the video at `video`, with its `subtitles` (empty when it has none). `cancel` is
@@ -473,7 +515,7 @@ fn describe_moment_with<'p>(
     debug_frames::dump_if_on(
         &format!("{}-at-{at_s:.2}s", debug_frames::name_of(video)),
         &frames,
-        "moment",
+        &vec!["moment"; frames.len()],
     );
     let mut request = build_moment_request(
         options.model,
@@ -504,6 +546,16 @@ fn describe_moment_with<'p>(
         moment,
         usage: response.usage,
     })
+}
+
+/// A subtitle line from `start` to `end` seconds, for tests.
+#[cfg(all(test, feature = "frames"))]
+pub(crate) fn test_cue(start: f64, end: f64) -> Cue {
+    Cue {
+        start: Duration::from_secs_f64(start),
+        end: Duration::from_secs_f64(end),
+        text: "line".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -843,6 +895,42 @@ mod tests {
             assert_eq!(jpeg.len() as u64, entry["bytes"].as_u64().expect("bytes"));
             assert_eq!(&jpeg[..2], &[0xff, 0xd8], "a JPEG");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(feature = "frames", target_os = "linux"))]
+    #[test]
+    fn frames_json_says_which_frames_the_subtitles_picked() {
+        let dir = std::env::temp_dir().join(format!("clipscribe-lib-cues-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let video = std::path::Path::new("tests/clips/file_example_MP4_480_1_5MG.mp4");
+        let line = test_cue;
+        // A pause from 3 to 5 s.
+        let cues = [line(0.5, 3.0), line(5.0, 7.0)];
+        let count = dump_clip_frames_with_subtitles(
+            video,
+            &cues,
+            &dir,
+            FrameSampling::KeyFrames,
+            &AtomicBool::new(false),
+        )
+        .expect("frames");
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("file_example_MP4_480_1_5MG/frames.json")).expect("index"),
+        )
+        .expect("json");
+        let entries = index.as_array().expect("array");
+        assert_eq!(entries.len(), count);
+        let picked: Vec<&str> = entries
+            .iter()
+            .map(|e| e["picked"].as_str().expect("picked"))
+            .collect();
+        let pause = entries
+            .iter()
+            .find(|e| e["picked"] == "pause")
+            .unwrap_or_else(|| panic!("a frame for the pause: {picked:?}"));
+        assert!((pause["time_s"].as_f64().expect("time") - 4.0).abs() < 0.1);
+        assert!(picked.contains(&"key_frame"), "{picked:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

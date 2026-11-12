@@ -1,3 +1,13 @@
+# NEXT
+## Added
+- `dump_clip_frames_with_subtitles`: `dump_clip_frames` for a clip with subtitles; `--estimate
+  --dump-frames` uses the `.srt` unless `--no-subtitles`.
+
+## Changed
+- With subtitles, key frames and `FrameSampling::Shots` frames move to pauses, line starts and
+  long lines' middles; the same number of frames, and nothing changes without subtitles.
+- `frames.json` labels the frames the subtitles picked `pause`, `cue_start` or `long_cue`.
+
 # 0.17.0
 ## Added
 - Google Gemini as a third provider: `Provider::Gemini`, the models `gemini-3.1-flash-lite` (the
