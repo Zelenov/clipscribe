@@ -1390,10 +1390,12 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(20));
     }
 
+    #[cfg(target_os = "linux")]
     use crate::test_cue as cue_at;
 
     /// Lines of speech with pauses between them, every `period` seconds: speech for
     /// `period - pause`, then `pause` of silence.
+    #[cfg(target_os = "linux")]
     fn speech(duration: f64, period: f64, pause: f64) -> Vec<Cue> {
         (0..)
             .map(|i| i as f64 * period)

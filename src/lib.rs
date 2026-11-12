@@ -549,7 +549,7 @@ fn describe_moment_with<'p>(
 }
 
 /// A subtitle line from `start` to `end` seconds, for tests.
-#[cfg(test)]
+#[cfg(all(test, feature = "frames"))]
 pub(crate) fn test_cue(start: f64, end: f64) -> Cue {
     Cue {
         start: Duration::from_secs_f64(start),
