@@ -28,6 +28,9 @@ use gstreamer_video::prelude::*;
 
 /// How long opening a clip may take before it counts as unreadable.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long [`Clip::open`] waits, after its timeout, for GStreamer to say why a file cannot be
+/// read.
+const ERROR_GRACE: Duration = Duration::from_secs(2);
 /// How long one seek may take to deliver its frame.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const JPEG_QUALITY: u8 = 80;
@@ -170,8 +173,11 @@ impl Clip {
             .pipeline
             .state(gst::ClockTime::from_mseconds(timeout.as_millis() as u64));
         if result.is_err() || state != gst::State::Paused {
+            // A file GStreamer cannot read posts its error a moment after the state change
+            // starts; under load that can be after `timeout`. Waiting a little for it gives the
+            // same reason every time instead of one that depends on timing.
             return Err(clip
-                .bus_error()
+                .bus_error_within(ERROR_GRACE)
                 .unwrap_or_else(|| "no frame in time".to_string()));
         }
         // Prerolled without a video frame: no video stream, or no decoder for it.
@@ -184,6 +190,19 @@ impl Clip {
             return Err("no video stream".to_string());
         }
         Ok(clip)
+    }
+
+    /// The first error on the bus, waiting up to `wait` for one to be posted.
+    fn bus_error_within(&self, wait: Duration) -> Option<String> {
+        let bus = self.pipeline.bus()?;
+        bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(wait.as_millis() as u64),
+            &[gst::MessageType::Error],
+        )
+        .and_then(|message| match message.view() {
+            gst::MessageView::Error(e) => Some(e.error().to_string()),
+            _ => None,
+        })
     }
 
     fn bus_error(&self) -> Option<String> {
@@ -1067,6 +1086,26 @@ mod tests {
         let fake = dir.join("fake.mp4");
         std::fs::write(&fake, b"not a movie").expect("write");
         assert_eq!(clip_duration_s(&fake), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_file_gives_gstreamers_reason_even_after_a_timeout() {
+        // A zero timeout runs out before GStreamer has looked at the file: the reason must still
+        // be GStreamer's own, the same as with time to spare, not "no frame in time".
+        let dir = std::env::temp_dir().join(format!("clipscribe-grace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("not-a-video.mp4");
+        std::fs::write(&path, b"this is not a video").expect("file");
+        let reason = |timeout: Duration| match Clip::open(&path, timeout) {
+            Ok(_) => panic!("opened a file that is not a video"),
+            Err(e) => e,
+        };
+        let with_time = reason(OPEN_TIMEOUT);
+        assert_ne!(with_time, "no frame in time");
+        for _ in 0..3 {
+            assert_eq!(reason(Duration::ZERO), with_time);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
