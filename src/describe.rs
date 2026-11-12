@@ -665,8 +665,10 @@ pub(crate) enum KeyPick {
 /// of their own, such as a pause in the subtitles. The windows and the grid's scores are exactly
 /// those of [`select_key_frames`]. Each extra joins the window of the last grid candidate at or
 /// before its time, scored by how much it differs from that candidate plus its bonus, and
-/// replaces the window's pick only when it scores higher. A window without extras keeps the frame
-/// it had without them, and the number of frames never changes. Picks come in window order.
+/// replaces the window's pick only when it scores higher, unless it would sit closer than one
+/// grid step to a neighbouring window's pick (the same moment twice). A window without extras
+/// keeps the frame it had without them, and the number of frames never changes. Picks come in
+/// window order.
 #[cfg(feature = "frames")]
 pub(crate) fn select_key_frames_with_extras(
     grid: &[(f64, Vec<u8>)],
@@ -694,7 +696,29 @@ pub(crate) fn select_key_frames_with_extras(
             best[window] = (KeyPick::Extra(e), score);
         }
     }
-    best.into_iter().map(|(pick, _)| pick).collect()
+    // An extra closer than one grid step to a neighbouring window's pick would show the same
+    // moment twice: that window goes back to its own grid pick. Repeated until nothing changes,
+    // since a neighbour can itself be an extra that gave way.
+    let step = (grid[total - 1].0 - grid[0].0) / (total - 1) as f64;
+    let time_of = |pick: KeyPick| match pick {
+        KeyPick::Grid(i) => grid[i].0,
+        KeyPick::Extra(e) => extras[e].0,
+    };
+    let mut picks: Vec<KeyPick> = best.into_iter().map(|(pick, _)| pick).collect();
+    loop {
+        let crowded = (0..max_frames).find(|w| {
+            matches!(picks[*w], KeyPick::Extra(_))
+                && [w.checked_sub(1), Some(w + 1)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|n| *n < max_frames)
+                    .any(|n| (time_of(picks[*w]) - time_of(picks[n])).abs() < step)
+        });
+        match crowded {
+            Some(w) => picks[w] = KeyPick::Grid(plain[w]),
+            None => return picks,
+        }
+    }
 }
 
 /// Mean absolute difference between two same-length byte fingerprints, normalised to 0.0–1.0.
@@ -2265,6 +2289,34 @@ mod tests {
         assert_eq!(
             select_key_frames_with_extras(&grid[..2], &extras, 3),
             vec![KeyPick::Grid(0), KeyPick::Grid(1)]
+        );
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn an_extra_next_to_the_neighbouring_pick_gives_way() {
+        // Windows of two candidates, 1 s apart: picks at 1 s (movement) and 2 s (a cut). A line
+        // start at 1.95 s scores higher than the movement but would show the cut's moment twice.
+        let still = vec![0u8; 4];
+        let moving = vec![10u8; 4];
+        let cut = vec![200u8; 4];
+        let grid = vec![
+            (0.0, still.clone()),
+            (1.0, moving.clone()),
+            (2.0, cut.clone()),
+            (3.0, cut.clone()),
+        ];
+        assert_eq!(select_key_frames(&grid, 2), vec![1, 2]);
+        let near = vec![(1.95, cut.clone(), CueMoment::CueStart.bonus())];
+        assert_eq!(
+            select_key_frames_with_extras(&grid, &near, 2),
+            vec![KeyPick::Grid(1), KeyPick::Grid(2)]
+        );
+        // A step away from it, it is taken.
+        let apart = vec![(0.5, moving.clone(), CueMoment::Pause.bonus())];
+        assert_eq!(
+            select_key_frames_with_extras(&grid, &apart, 2),
+            vec![KeyPick::Extra(0), KeyPick::Grid(2)]
         );
     }
 

@@ -26,10 +26,8 @@ out, even for clips with no speech.
   Each frame is sent with the shot it is from (`shot 3 of 10, 3.6–9.7 s`), so the model can put
   the start or end of a moment on a cut; a clip of one shot is sent as before.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
-  description knows what is said. Its timing also moves frames, never adding one: key frames
-  may move to pauses, line starts and long lines' middles where the picture changes little, and
-  shot frames to one of those inside their shot (never near a cut; only `Shots` knows the
-  transitions). Only cue times are used, so any `Cue`s work.
+  description knows what is said. Its timing also moves frames (never adds one) to pauses, line
+  starts and long lines' middles; only cue times are used, so any `Cue`s work.
 - One request goes to Claude (Anthropic), ChatGPT (OpenAI) or Gemini (Google); the answer is
   structured JSON, and moments outside the clip are dropped. Clips over 30 minutes are refused.
 - Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a

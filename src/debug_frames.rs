@@ -85,7 +85,7 @@ fn try_dump(folder: &Path, frames: &[Frame], picked: &[&str]) -> std::io::Result
     }
     let mut names: Vec<String> = Vec::new();
     let mut entries = Vec::new();
-    for (i, frame) in frames.iter().enumerate() {
+    for (frame, picked) in frames.iter().zip(picked) {
         let mut file = format!("{:07.2}s.jpg", frame.time_s);
         let mut n = 1;
         while names.contains(&file) {
@@ -96,7 +96,7 @@ fn try_dump(folder: &Path, frames: &[Frame], picked: &[&str]) -> std::io::Result
         entries.push(json!({
             "file": file,
             "time_s": frame.time_s,
-            "picked": picked.get(i).copied().unwrap_or("interval"),
+            "picked": picked,
             "bytes": frame.jpeg.len(),
         }));
         names.push(file);

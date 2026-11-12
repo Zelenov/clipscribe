@@ -345,7 +345,13 @@ impl Clip {
         // dropped, like the rest of the grid there.
         let picture_end = candidates.last().map_or(0.0, |(t, _)| *t);
         let mut extras: Vec<(f64, image::RgbImage, CueMoment)> = Vec::new();
-        for (k, (time_s, moment)) in cue_times.iter().enumerate() {
+        // With no more grid candidates than frames every one is sent: nothing to choose.
+        let usable = if candidates.len() > frame_budget {
+            cue_times.as_slice()
+        } else {
+            &[]
+        };
+        for (k, (time_s, moment)) in usable.iter().enumerate() {
             let done = (candidate_total - cue_times.len() + k) * frame_budget / candidate_total;
             on_frame(done, frame_budget);
             if cancel.load(Ordering::Relaxed) {

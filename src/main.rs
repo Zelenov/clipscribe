@@ -58,9 +58,11 @@ struct Cli {
     language: SummaryLanguage,
 
     /// How frames are chosen: keyframes (where the picture changes the most, at most 60; with
-    /// subtitles, pauses and line starts count too), interval (one every 2 s, at most 60, spread evenly over a longer clip) or shots (EXPERIMENTAL
-    /// — for an edited video: one frame from every shot, more for the longest, at most 60; with
-    /// subtitles at a pause or line start inside the shot, else its middle; reads the clip one more time to find the shots; --estimate assumes 60 frames).
+    /// subtitles, pauses, line starts and long lines' middles count too), interval (one every
+    /// 2 s, at most 60, spread evenly over a longer clip; ignores the subtitles) or shots
+    /// (EXPERIMENTAL — for an edited video: one frame from every shot, more for the longest, at
+    /// most 60; with subtitles at a pause or line start inside the shot, else its middle; reads
+    /// the clip one more time to find the shots; --estimate assumes 60 frames).
     #[arg(long, value_enum, default_value_t = FramesArg::Keyframes)]
     frames: FramesArg,
 
