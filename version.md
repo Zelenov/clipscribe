@@ -1,13 +1,12 @@
 # NEXT
 ## Added
-- Subtitles choose frames: with subtitles, `describe` and the folder run take key frames at pauses
-  between lines, line starts and the middles of long lines when nothing in the picture changes
-  more (a cut still wins), and `FrameSampling::Shots` moves each shot's frame to a pause or line
-  start inside the shot. The number of frames, and so the price, stays the same; without
-  subtitles nothing changes. `frames.json` says which frames the subtitles picked (`pause`,
-  `cue start`, `long cue`).
-- `dump_clip_frames_with_subtitles`: `dump_clip_frames` for a clip with subtitles. The command
-  line's `--estimate --dump-frames` uses the `.srt` next to the video unless `--no-subtitles`.
+- `dump_clip_frames_with_subtitles`: `dump_clip_frames` for a clip with subtitles; `--estimate
+  --dump-frames` uses the `.srt` unless `--no-subtitles`.
+
+## Changed
+- With subtitles, key frames and `FrameSampling::Shots` frames move to pauses, line starts and
+  long lines' middles; the same number of frames, and nothing changes without subtitles.
+- `frames.json` labels the frames the subtitles picked `pause`, `cue_start` or `long_cue`.
 
 # 0.17.0
 ## Added

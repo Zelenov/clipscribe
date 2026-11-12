@@ -396,9 +396,9 @@ pub(crate) fn shot_slots(shots: &crate::shots::Shots, duration_s: f64) -> Vec<Sh
         .collect()
 }
 
-#[cfg(feature = "frames")]
 /// A moment the subtitles point at, a frame candidate when a clip has subtitles (see
 /// [`cue_candidates`]).
+#[cfg(feature = "frames")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CueMoment {
     /// The middle of a gap of at least [`PAUSE_S`] between two lines.
@@ -415,14 +415,14 @@ impl CueMoment {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Pause => "pause",
-            Self::CueStart => "cue start",
-            Self::LongCue => "long cue",
+            Self::CueStart => "cue_start",
+            Self::LongCue => "long_cue",
         }
     }
 
     /// Added to a candidate's picture change when key frames are chosen: enough to win over
     /// ordinary movement, not over a cut or a flash.
-    fn bonus(self) -> f64 {
+    pub(crate) fn bonus(self) -> f64 {
         match self {
             Self::Pause => 0.10,
             Self::CueStart => 0.08,
@@ -440,37 +440,37 @@ impl CueMoment {
     }
 }
 
-#[cfg(feature = "frames")]
 /// A gap between two lines at least this long is a pause.
+#[cfg(feature = "frames")]
 pub(crate) const PAUSE_S: f64 = 0.7;
-#[cfg(feature = "frames")]
 /// A line at least this long gets a candidate in its middle.
+#[cfg(feature = "frames")]
 pub(crate) const LONG_CUE_S: f64 = 4.0;
-#[cfg(feature = "frames")]
 /// Subtitle candidates closer than this are one candidate.
-const CUE_MERGE_S: f64 = 0.1;
 #[cfg(feature = "frames")]
+const CUE_MERGE_S: f64 = 0.1;
 /// At most this many subtitle candidates per frame of the budget, so a clip full of short lines
 /// does not add hundreds of seeks.
-const CUES_PER_WINDOW: usize = 2;
 #[cfg(feature = "frames")]
+const CUES_PER_WINDOW: usize = 2;
 /// A subtitle frame is kept at least this far from a shot's edge, so it never shows the shot
 /// before or after a cut.
+#[cfg(feature = "frames")]
 const SHOT_EDGE_S: f64 = 0.15;
 
-#[cfg(feature = "frames")]
 /// The frame candidates `cues` give in a clip `duration_s` long, in time order: the middle of
 /// every pause ([`PAUSE_S`] or longer) between two lines, every line's start and the middle of
 /// every line [`LONG_CUE_S`] or longer. Only the cues' times are used, so every subtitle format
 /// works. Of candidates closer than 0.1 s the higher ranked is kept (pause, cue start, long
-/// cue), and of each of `windows` equal stretches of the clip at most the best two. Empty with
-/// no cues.
+/// cue), and, with `Some(windows)`, of each of that many equal stretches of the clip at most the
+/// best two (each is an extra seek). Empty with no cues.
+#[cfg(feature = "frames")]
 pub(crate) fn cue_candidates(
     cues: &[Cue],
     duration_s: f64,
-    windows: usize,
+    windows: Option<usize>,
 ) -> Vec<(f64, CueMoment)> {
-    if duration_s <= 0.0 || windows == 0 {
+    if duration_s <= 0.0 || windows == Some(0) {
         return Vec::new();
     }
     let mut spans: Vec<(f64, f64)> = cues
@@ -510,6 +510,9 @@ pub(crate) fn cue_candidates(
             _ => merged.push((t, moment)),
         }
     }
+    let Some(windows) = windows else {
+        return merged;
+    };
     let window_s = duration_s / windows as f64;
     let window_of = |t: f64| ((t / window_s) as usize).min(windows - 1);
     let mut kept: Vec<(f64, CueMoment)> = Vec::new();
@@ -529,18 +532,19 @@ pub(crate) fn cue_candidates(
     kept
 }
 
-#[cfg(feature = "frames")]
 /// [`shot_times`] with subtitles: each frame moves within its share of the shot to the best
 /// subtitle candidate there (a pause first, then a line's start, then a long line's middle;
 /// of equals the one nearest the share's middle), never closer than 0.15 s to the shot's edge,
 /// so never into a transition. A share without one keeps its middle. Same number of frames.
+#[cfg(feature = "frames")]
 pub(crate) fn shot_times_with_cues(
     shots: &crate::shots::Shots,
     duration_s: f64,
     cues: &[Cue],
 ) -> Vec<(f64, Option<CueMoment>)> {
     let slots = shot_slots(shots, duration_s);
-    let candidates = cue_candidates(cues, duration_s, slots.len().max(1));
+    // No cap: these candidates cost no seek, they only move frames already planned.
+    let candidates = cue_candidates(cues, duration_s, None);
     slots
         .iter()
         .map(|slot| {
@@ -649,41 +653,48 @@ fn change_scores(candidates: &[(f64, Vec<u8>)]) -> Vec<f64> {
         .collect()
 }
 
-/// [`select_key_frames`] for a clip `duration_s` long with subtitle candidates among the
-/// `candidates` (time, fingerprint, the subtitle moment a candidate was taken for): the clip is
-/// split into `max_frames` equal stretches of time and, in each, the candidate with the highest
-/// picture change plus its subtitle bonus (see `CueMoment::bonus`) is kept; of equals, the
-/// earliest. A stretch without candidates keeps none. Strictly increasing indices.
+/// One frame [`select_key_frames_with_extras`] keeps: a candidate of the grid, or an extra one.
 #[cfg(feature = "frames")]
-pub(crate) fn select_key_frames_with_cues(
-    candidates: &[(f64, Vec<u8>, Option<CueMoment>)],
-    duration_s: f64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyPick {
+    Grid(usize),
+    Extra(usize),
+}
+
+/// [`select_key_frames`] with `extras` (time, fingerprint, bonus): candidates taken for a reason
+/// of their own, such as a pause in the subtitles. The windows and the grid's scores are exactly
+/// those of [`select_key_frames`]. Each extra joins the window of the last grid candidate at or
+/// before its time, scored by how much it differs from that candidate plus its bonus, and
+/// replaces the window's pick only when it scores higher. A window without extras keeps the frame
+/// it had without them, and the number of frames never changes. Picks come in window order.
+#[cfg(feature = "frames")]
+pub(crate) fn select_key_frames_with_extras(
+    grid: &[(f64, Vec<u8>)],
+    extras: &[(f64, Vec<u8>, f64)],
     max_frames: usize,
-) -> Vec<usize> {
-    let total = candidates.len();
-    if total == 0 || max_frames == 0 {
-        return Vec::new();
+) -> Vec<KeyPick> {
+    let total = grid.len();
+    let plain = select_key_frames(grid, max_frames);
+    if total <= max_frames || extras.is_empty() {
+        return plain.into_iter().map(KeyPick::Grid).collect();
     }
-    if total <= max_frames {
-        return (0..total).collect();
-    }
-    let plain: Vec<(f64, Vec<u8>)> = candidates.iter().map(|(t, f, _)| (*t, f.clone())).collect();
-    let scores: Vec<f64> = change_scores(&plain)
-        .into_iter()
-        .zip(candidates)
-        .map(|(change, (_, _, moment))| change + moment.map_or(0.0, CueMoment::bonus))
+    let scores = change_scores(grid);
+    let mut best: Vec<(KeyPick, f64)> = plain
+        .iter()
+        .map(|i| (KeyPick::Grid(*i), scores[*i]))
         .collect();
-    let window_s = duration_s.max(f64::MIN_POSITIVE) / max_frames as f64;
-    let mut best: Vec<Option<usize>> = vec![None; max_frames];
-    for (k, (t, _, _)) in candidates.iter().enumerate() {
-        let window = ((t.max(0.0) / window_s) as usize).min(max_frames - 1);
-        if best[window].is_none_or(|b| scores[k] > scores[b]) {
-            best[window] = Some(k);
+    for (e, (time_s, fingerprint, bonus)) in extras.iter().enumerate() {
+        let before = grid.iter().rposition(|(t, _)| *t <= *time_s).unwrap_or(0);
+        // The window `select_key_frames` put `before` in: the last one starting at or before it.
+        let window = (0..max_frames)
+            .rposition(|w| w * total / max_frames <= before)
+            .unwrap_or(0);
+        let score = fingerprint_diff(&grid[before].1, fingerprint) + bonus;
+        if score > best[window].1 {
+            best[window] = (KeyPick::Extra(e), score);
         }
     }
-    let mut chosen: Vec<usize> = best.into_iter().flatten().collect();
-    chosen.sort_unstable();
-    chosen
+    best.into_iter().map(|(pick, _)| pick).collect()
 }
 
 /// Mean absolute difference between two same-length byte fingerprints, normalised to 0.0–1.0.
@@ -2159,20 +2170,14 @@ mod tests {
     }
 
     #[cfg(feature = "frames")]
-    fn cue(start: f64, end: f64) -> Cue {
-        Cue {
-            start: std::time::Duration::from_secs_f64(start),
-            end: std::time::Duration::from_secs_f64(end),
-            text: "line".to_string(),
-        }
-    }
+    use crate::test_cue as cue;
 
     #[cfg(feature = "frames")]
     #[test]
     fn cue_candidates_are_pauses_line_starts_and_long_lines() {
         // A pause of 1 s between 2 and 3 s; a short gap (0.5 s) between 5 and 5.5 s; a 5 s line.
         let cues = [cue(3.0, 5.0), cue(0.5, 2.0), cue(5.5, 10.5)];
-        let found = cue_candidates(&cues, 20.0, 10);
+        let found = cue_candidates(&cues, 20.0, Some(10));
         assert_eq!(
             found,
             vec![
@@ -2183,8 +2188,8 @@ mod tests {
                 (8.0, CueMoment::LongCue),
             ]
         );
-        assert!(cue_candidates(&[], 20.0, 10).is_empty());
-        assert!(cue_candidates(&cues, 0.0, 10).is_empty());
+        assert!(cue_candidates(&[], 20.0, Some(10)).is_empty());
+        assert!(cue_candidates(&cues, 0.0, Some(10)).is_empty());
     }
 
     #[cfg(feature = "frames")]
@@ -2200,7 +2205,7 @@ mod tests {
             cue(30.0, 31.0),
         ];
         assert_eq!(
-            cue_candidates(&cues, 12.0, 6),
+            cue_candidates(&cues, 12.0, Some(6)),
             vec![
                 (0.0, CueMoment::CueStart),
                 (1.0, CueMoment::CueStart),
@@ -2216,14 +2221,15 @@ mod tests {
     fn cue_candidates_keep_at_most_two_per_window_pauses_first() {
         // Ten short lines with pauses in a 10 s clip with one window: two pauses are kept.
         let cues: Vec<Cue> = (0..10).map(|i| cue(i as f64, i as f64 + 0.2)).collect();
-        let found = cue_candidates(&cues, 10.0, 1);
+        let found = cue_candidates(&cues, 10.0, Some(1));
         assert_eq!(found.len(), 2);
         assert!(
             found.iter().all(|(_, m)| *m == CueMoment::Pause),
             "{found:?}"
         );
-        // With ten windows each keeps its own.
-        assert!(cue_candidates(&cues, 10.0, 10).len() > 10);
+        // With ten windows each keeps its own; without a cap all 19 stay.
+        assert!(cue_candidates(&cues, 10.0, Some(10)).len() > 10);
+        assert_eq!(cue_candidates(&cues, 10.0, None).len(), 19);
     }
 
     #[cfg(feature = "frames")]
@@ -2232,24 +2238,49 @@ mod tests {
         let still = vec![0u8; 4];
         let moving = vec![10u8; 4]; // a change of about 0.04 from `still`
         let cut = vec![200u8; 4]; // a change of about 0.78
-                                  // Window 0 (0–2 s): movement at 0.5, a pause at 1.0. Window 1 (2–4 s): a cut at 3.0, a
-                                  // line start at 3.5.
-        let candidates = vec![
-            (0.0, still.clone(), None),
-            (0.5, moving.clone(), None),
-            (1.0, moving.clone(), Some(CueMoment::Pause)),
-            (2.0, moving.clone(), None),
-            (3.0, cut.clone(), None),
-            (3.5, cut.clone(), Some(CueMoment::CueStart)),
+                                  // Three windows of two grid candidates: movement at 1 s, a cut at 3 s, nothing at 4–5 s.
+        let grid = vec![
+            (0.0, still.clone()),
+            (1.0, moving.clone()),
+            (2.0, moving.clone()),
+            (3.0, cut.clone()),
+            (4.0, cut.clone()),
+            (5.0, cut.clone()),
         ];
-        assert_eq!(select_key_frames_with_cues(&candidates, 4.0, 2), vec![2, 4]);
-        // The budget holds and a window without candidates keeps none.
-        assert_eq!(select_key_frames_with_cues(&candidates, 40.0, 2), vec![4]);
+        let plain = select_key_frames(&grid, 3);
+        assert_eq!(plain, vec![1, 3, 4]);
+        // A pause at 0.5 s beats the movement; a line start at 3.5 s does not beat the cut.
+        let extras = vec![
+            (0.5, moving.clone(), CueMoment::Pause.bonus()),
+            (3.5, cut.clone(), CueMoment::CueStart.bonus()),
+        ];
         assert_eq!(
-            select_key_frames_with_cues(&candidates[..1], 4.0, 2),
-            vec![0]
+            select_key_frames_with_extras(&grid, &extras, 3),
+            vec![KeyPick::Extra(0), KeyPick::Grid(3), KeyPick::Grid(4)],
+            "the window without a subtitle candidate keeps its frame"
         );
-        assert!(select_key_frames_with_cues(&[], 4.0, 2).is_empty());
+        // No extras, or no more candidates than the budget: exactly `select_key_frames`.
+        let grid_only: Vec<KeyPick> = plain.iter().map(|i| KeyPick::Grid(*i)).collect();
+        assert_eq!(select_key_frames_with_extras(&grid, &[], 3), grid_only);
+        assert_eq!(
+            select_key_frames_with_extras(&grid[..2], &extras, 3),
+            vec![KeyPick::Grid(0), KeyPick::Grid(1)]
+        );
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn extras_join_the_same_windows_as_select_key_frames() {
+        // 9 candidates into 2 windows: indices 0–3 and 4–8. An extra after index 4 belongs to
+        // the second window, even though 4 * 2 / 9 rounds down to the first.
+        let flat = vec![0u8; 4];
+        let grid: Vec<(f64, Vec<u8>)> = (0..9).map(|i| (i as f64, flat.clone())).collect();
+        assert_eq!(select_key_frames(&grid, 2), vec![0, 4]);
+        let extras = vec![(4.5, flat.clone(), 0.1)];
+        assert_eq!(
+            select_key_frames_with_extras(&grid, &extras, 2),
+            vec![KeyPick::Grid(0), KeyPick::Extra(0)]
+        );
     }
 
     #[cfg(feature = "frames")]

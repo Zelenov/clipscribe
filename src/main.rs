@@ -57,10 +57,10 @@ struct Cli {
     #[arg(long, default_value = "subtitles", value_parser = parse_language)]
     language: SummaryLanguage,
 
-    /// How frames are chosen: keyframes (where the picture changes the most, at most 60),
-    /// interval (one every 2 s, at most 60, spread evenly over a longer clip) or shots (EXPERIMENTAL
-    /// — for an edited video: one frame from the middle of every shot, more for the longest, at
-    /// most 60; reads the clip one more time to find the shots; --estimate assumes 60 frames).
+    /// How frames are chosen: keyframes (where the picture changes the most, at most 60; with
+    /// subtitles, pauses and line starts count too), interval (one every 2 s, at most 60, spread evenly over a longer clip) or shots (EXPERIMENTAL
+    /// — for an edited video: one frame from every shot, more for the longest, at most 60; with
+    /// subtitles at a pause or line start inside the shot, else its middle; reads the clip one more time to find the shots; --estimate assumes 60 frames).
     #[arg(long, value_enum, default_value_t = FramesArg::Keyframes)]
     frames: FramesArg,
 
@@ -84,7 +84,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = MomentsArg::Important)]
     moments: MomentsArg,
 
-    /// Do not send the `.srt` next to each video.
+    /// Do not use the `.srt` next to each video: neither sent nor used to choose frames.
     #[arg(long)]
     no_subtitles: bool,
 

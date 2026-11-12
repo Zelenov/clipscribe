@@ -548,6 +548,16 @@ fn describe_moment_with<'p>(
     })
 }
 
+/// A subtitle line from `start` to `end` seconds, for tests.
+#[cfg(test)]
+pub(crate) fn test_cue(start: f64, end: f64) -> Cue {
+    Cue {
+        start: Duration::from_secs_f64(start),
+        end: Duration::from_secs_f64(end),
+        text: "line".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,11 +904,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("clipscribe-lib-cues-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let video = std::path::Path::new("tests/clips/file_example_MP4_480_1_5MG.mp4");
-        let line = |start: f64, end: f64| Cue {
-            start: Duration::from_secs_f64(start),
-            end: Duration::from_secs_f64(end),
-            text: "line".to_string(),
-        };
+        let line = test_cue;
         // A pause from 3 to 5 s.
         let cues = [line(0.5, 3.0), line(5.0, 7.0)];
         let count = dump_clip_frames_with_subtitles(

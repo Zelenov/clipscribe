@@ -23,7 +23,7 @@ static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// (`<name>-at-<seconds>s` for a moment): the frames as the same JPEG bytes that were sent,
 /// named by time (`0012.40s.jpg`), and a `frames.json` with each frame's time, how it was
 /// picked (`key_frame`, `interval`, `shot` or `moment`; with subtitles also `pause`,
-/// `cue start` or `long cue`) and its size. A run over the same video replaces
+/// `cue_start` or `long_cue`) and its size. A run over the same video replaces
 /// the previous files. A write error is only logged: it never fails the description.
 pub fn set_debug_frames_dir(dir: Option<PathBuf>) {
     *DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
@@ -62,8 +62,9 @@ pub fn dump_frames(dir: &Path, name: &str, frames: &[Frame], picked: &str) {
 }
 
 /// [`dump_frames`] with how each frame was picked: `picked[i]` for frame `i` (`key_frame`,
-/// `interval`, `shot`, `moment`, or a subtitle moment: `pause`, `cue start`, `long cue`).
+/// `interval`, `shot`, `moment`, or a subtitle moment: `pause`, `cue_start`, `long_cue`).
 pub(crate) fn dump_frames_picked(dir: &Path, name: &str, frames: &[Frame], picked: &[&str]) {
+    debug_assert_eq!(picked.len(), frames.len(), "one label per frame");
     if let Err(e) = try_dump(&dir.join(name), frames, picked) {
         log::warn!(
             "clipscribe: frames not saved to {}: {e}",
