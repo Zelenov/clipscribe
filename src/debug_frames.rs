@@ -22,7 +22,8 @@ static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// `describe_with_tags` and `describe_moment` call writes `<dir>/<video name without extension>`
 /// (`<name>-at-<seconds>s` for a moment): the frames as the same JPEG bytes that were sent,
 /// named by time (`0012.40s.jpg`), and a `frames.json` with each frame's time, how it was
-/// picked (`key_frame`, `interval` or `moment`) and its size. A run over the same video replaces
+/// picked (`key_frame`, `interval`, `shot` or `moment`; with subtitles also `pause`,
+/// `cue start` or `long cue`) and its size. A run over the same video replaces
 /// the previous files. A write error is only logged: it never fails the description.
 pub fn set_debug_frames_dir(dir: Option<PathBuf>) {
     *DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
@@ -38,11 +39,12 @@ pub fn debug_frames_dir() -> Option<PathBuf> {
     })
 }
 
-/// Write `frames` for the request about `name` when dumping is on.
+/// Write `frames` for the request about `name` when dumping is on; `picked[i]` says why frame
+/// `i` was taken.
 #[cfg(feature = "frames")]
-pub(crate) fn dump_if_on(name: &str, frames: &[Frame], picked: &str) {
+pub(crate) fn dump_if_on(name: &str, frames: &[Frame], picked: &[&str]) {
     if let Some(dir) = debug_frames_dir() {
-        dump_frames(&dir, name, frames, picked);
+        dump_frames_picked(&dir, name, frames, picked);
     }
 }
 
@@ -56,6 +58,12 @@ pub(crate) fn name_of(video: &Path) -> String {
 
 /// Write `frames` and `frames.json` to `<dir>/<name>`; errors are logged, never returned.
 pub fn dump_frames(dir: &Path, name: &str, frames: &[Frame], picked: &str) {
+    dump_frames_picked(dir, name, frames, &vec![picked; frames.len()]);
+}
+
+/// [`dump_frames`] with how each frame was picked: `picked[i]` for frame `i` (`key_frame`,
+/// `interval`, `shot`, `moment`, or a subtitle moment: `pause`, `cue start`, `long cue`).
+pub(crate) fn dump_frames_picked(dir: &Path, name: &str, frames: &[Frame], picked: &[&str]) {
     if let Err(e) = try_dump(&dir.join(name), frames, picked) {
         log::warn!(
             "clipscribe: frames not saved to {}: {e}",
@@ -64,7 +72,7 @@ pub fn dump_frames(dir: &Path, name: &str, frames: &[Frame], picked: &str) {
     }
 }
 
-fn try_dump(folder: &Path, frames: &[Frame], picked: &str) -> std::io::Result<()> {
+fn try_dump(folder: &Path, frames: &[Frame], picked: &[&str]) -> std::io::Result<()> {
     std::fs::create_dir_all(folder)?;
     // A run over the same video replaces the last one, so old frames do not mix in.
     for entry in std::fs::read_dir(folder)?.flatten() {
@@ -76,7 +84,7 @@ fn try_dump(folder: &Path, frames: &[Frame], picked: &str) -> std::io::Result<()
     }
     let mut names: Vec<String> = Vec::new();
     let mut entries = Vec::new();
-    for frame in frames {
+    for (i, frame) in frames.iter().enumerate() {
         let mut file = format!("{:07.2}s.jpg", frame.time_s);
         let mut n = 1;
         while names.contains(&file) {
@@ -87,7 +95,7 @@ fn try_dump(folder: &Path, frames: &[Frame], picked: &str) -> std::io::Result<()
         entries.push(json!({
             "file": file,
             "time_s": frame.time_s,
-            "picked": picked,
+            "picked": picked.get(i).copied().unwrap_or("interval"),
             "bytes": frame.jpeg.len(),
         }));
         names.push(file);
@@ -189,7 +197,7 @@ mod tests {
         let dir = temp("setter");
         set_debug_frames_dir(Some(dir.clone()));
         assert_eq!(debug_frames_dir(), Some(dir.clone()));
-        dump_if_on("clip", &frames(), "interval");
+        dump_if_on("clip", &frames(), &["interval", "pause"]);
         assert!(dir.join("clip/frames.json").exists());
         set_debug_frames_dir(None);
         let _ = std::fs::remove_dir_all(&dir);

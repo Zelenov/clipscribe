@@ -1,3 +1,14 @@
+# NEXT
+## Added
+- Subtitles choose frames: with subtitles, `describe` and the folder run take key frames at pauses
+  between lines, line starts and the middles of long lines when nothing in the picture changes
+  more (a cut still wins), and `FrameSampling::Shots` moves each shot's frame to a pause or line
+  start inside the shot. The number of frames, and so the price, stays the same; without
+  subtitles nothing changes. `frames.json` says which frames the subtitles picked (`pause`,
+  `cue start`, `long cue`).
+- `dump_clip_frames_with_subtitles`: `dump_clip_frames` for a clip with subtitles. The command
+  line's `--estimate --dump-frames` uses the `.srt` next to the video unless `--no-subtitles`.
+
 # 0.17.0
 ## Added
 - Google Gemini as a third provider: `Provider::Gemini`, the models `gemini-3.1-flash-lite` (the

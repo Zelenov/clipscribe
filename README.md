@@ -26,7 +26,11 @@ out, even for clips with no speech.
   Each frame is sent with the shot it is from (`shot 3 of 10, 3.6–9.7 s`), so the model can put
   the start or end of a moment on a cut; a clip of one shot is sent as before.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
-  description knows what is said.
+  description knows what is said. The subtitles' timing also moves frames, never adding one: with
+  key frames, pauses between lines, line starts and the middles of long lines compete with
+  picture changes in each window (a pause beats ordinary movement, a cut beats a pause); with
+  shots, a frame moves within its shot to a pause or line start, never near a cut. Only cue times
+  are used, so any `Cue`s work.
 - One request goes to Claude (Anthropic), ChatGPT (OpenAI) or Gemini (Google); the answer is
   structured JSON, and moments outside the clip are dropped. Clips over 30 minutes are refused.
 - Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a
@@ -213,9 +217,10 @@ To check which images the model got, call `set_debug_frames_dir(Some(dir))` (or 
 `CLIPSCRIBE_DEBUG_FRAMES=<dir>`). `describe`, `describe_with_tags` and `describe_moment` then write
 `<dir>/<video name>/`: every frame as the same JPEG bytes that were sent, named by time
 (`0012.40s.jpg`), and a `frames.json` with each frame's time, how it was picked (`key_frame`,
-`interval` or `moment`) and its size. A setter and a variable, not an `Options` field, so nothing
-that builds `Options` changes. A write error is only logged. `dump_clip_frames` writes the frames
-without sending anything.
+`interval`, `shot` or `moment`; for the subtitles `pause`, `cue start` or `long cue`) and its
+size. A setter and a variable, not an `Options` field, so nothing that builds `Options` changes.
+A write error is only logged. `dump_clip_frames` (`dump_clip_frames_with_subtitles` for a clip
+with subtitles) writes the frames without sending anything.
 
 ### Features
 

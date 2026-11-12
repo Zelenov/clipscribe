@@ -1138,7 +1138,17 @@ fn estimate(
             model.cost_usd(usage)
         );
         if let Some((dir, sampling)) = dump {
-            match clipscribe::dump_clip_frames(video, dir, sampling, &CANCEL) {
+            let subtitles = if no_subtitles {
+                Vec::new()
+            } else {
+                srt::load_for(video).unwrap_or_else(|e| {
+                    eprintln!("warning: {}: subtitles not read: {e}", video.display());
+                    Vec::new()
+                })
+            };
+            match clipscribe::dump_clip_frames_with_subtitles(
+                video, &subtitles, dir, sampling, &CANCEL,
+            ) {
                 Ok(count) => println!("  {count} frames written to {}", dir.display()),
                 Err(e) => eprintln!("error: {}: frames not written: {e}", video.display()),
             }

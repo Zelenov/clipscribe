@@ -328,6 +328,30 @@ pub fn frame_budget(duration_s: f64, sampling: FrameSampling) -> usize {
 /// (`max(frame_count, shots)`, at most [`MAX_FRAMES`]), more frames go into the longest shots, at
 /// most one per [`FRAME_INTERVAL_S`] of shot. Empty when there are no shots.
 pub fn shot_times(shots: &crate::shots::Shots, duration_s: f64) -> Vec<f64> {
+    shot_slots(shots, duration_s)
+        .iter()
+        .map(|slot| slot.middle())
+        .collect()
+}
+
+/// One frame's place in a shot for [`shot_times`]: its share of the shot, `from_s` to `to_s`,
+/// inside the shot `shot_start_s` to `shot_end_s`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ShotSlot {
+    pub(crate) from_s: f64,
+    pub(crate) to_s: f64,
+    pub(crate) shot_start_s: f64,
+    pub(crate) shot_end_s: f64,
+}
+
+impl ShotSlot {
+    fn middle(&self) -> f64 {
+        (self.from_s + self.to_s) / 2.0
+    }
+}
+
+/// The slots [`shot_times`] takes the middle of, in time order.
+pub(crate) fn shot_slots(shots: &crate::shots::Shots, duration_s: f64) -> Vec<ShotSlot> {
     let mut spans: Vec<(f64, f64)> = shots
         .shots
         .iter()
@@ -361,7 +385,179 @@ pub fn shot_times(shots: &crate::shots::Shots, duration_s: f64) -> Vec<f64> {
     spans
         .iter()
         .zip(&counts)
-        .flat_map(|((a, b), c)| (0..*c).map(move |k| a + (b - a) * (k as f64 + 0.5) / *c as f64))
+        .flat_map(|((a, b), c)| {
+            (0..*c).map(move |k| ShotSlot {
+                from_s: a + (b - a) * k as f64 / *c as f64,
+                to_s: a + (b - a) * (k + 1) as f64 / *c as f64,
+                shot_start_s: *a,
+                shot_end_s: *b,
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "frames")]
+/// A moment the subtitles point at, a frame candidate when a clip has subtitles (see
+/// [`cue_candidates`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CueMoment {
+    /// The middle of a gap of at least [`PAUSE_S`] between two lines.
+    Pause,
+    /// A line starts.
+    CueStart,
+    /// The middle of a line at least [`LONG_CUE_S`] long.
+    LongCue,
+}
+
+#[cfg(feature = "frames")]
+impl CueMoment {
+    /// How the frame was picked, in `frames.json`.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::CueStart => "cue start",
+            Self::LongCue => "long cue",
+        }
+    }
+
+    /// Added to a candidate's picture change when key frames are chosen: enough to win over
+    /// ordinary movement, not over a cut or a flash.
+    fn bonus(self) -> f64 {
+        match self {
+            Self::Pause => 0.10,
+            Self::CueStart => 0.08,
+            Self::LongCue => 0.06,
+        }
+    }
+
+    /// Which of two candidates near each other is kept: a pause first.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Pause => 3,
+            Self::CueStart => 2,
+            Self::LongCue => 1,
+        }
+    }
+}
+
+#[cfg(feature = "frames")]
+/// A gap between two lines at least this long is a pause.
+pub(crate) const PAUSE_S: f64 = 0.7;
+#[cfg(feature = "frames")]
+/// A line at least this long gets a candidate in its middle.
+pub(crate) const LONG_CUE_S: f64 = 4.0;
+#[cfg(feature = "frames")]
+/// Subtitle candidates closer than this are one candidate.
+const CUE_MERGE_S: f64 = 0.1;
+#[cfg(feature = "frames")]
+/// At most this many subtitle candidates per frame of the budget, so a clip full of short lines
+/// does not add hundreds of seeks.
+const CUES_PER_WINDOW: usize = 2;
+#[cfg(feature = "frames")]
+/// A subtitle frame is kept at least this far from a shot's edge, so it never shows the shot
+/// before or after a cut.
+const SHOT_EDGE_S: f64 = 0.15;
+
+#[cfg(feature = "frames")]
+/// The frame candidates `cues` give in a clip `duration_s` long, in time order: the middle of
+/// every pause ([`PAUSE_S`] or longer) between two lines, every line's start and the middle of
+/// every line [`LONG_CUE_S`] or longer. Only the cues' times are used, so every subtitle format
+/// works. Of candidates closer than 0.1 s the higher ranked is kept (pause, cue start, long
+/// cue), and of each of `windows` equal stretches of the clip at most the best two. Empty with
+/// no cues.
+pub(crate) fn cue_candidates(
+    cues: &[Cue],
+    duration_s: f64,
+    windows: usize,
+) -> Vec<(f64, CueMoment)> {
+    if duration_s <= 0.0 || windows == 0 {
+        return Vec::new();
+    }
+    let mut spans: Vec<(f64, f64)> = cues
+        .iter()
+        .map(|c| {
+            (
+                c.start.as_secs_f64(),
+                c.end.as_secs_f64().max(c.start.as_secs_f64()),
+            )
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut all: Vec<(f64, CueMoment)> = Vec::new();
+    let mut spoken_until: Option<f64> = None;
+    for (start, end) in &spans {
+        if let Some(until) = spoken_until {
+            if start - until >= PAUSE_S {
+                all.push(((until + start) / 2.0, CueMoment::Pause));
+            }
+        }
+        all.push((*start, CueMoment::CueStart));
+        if end - start >= LONG_CUE_S {
+            all.push(((start + end) / 2.0, CueMoment::LongCue));
+        }
+        spoken_until = Some(spoken_until.map_or(*end, |u: f64| u.max(*end)));
+    }
+    all.retain(|(t, _)| *t >= 0.0 && *t < duration_s);
+    all.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, CueMoment)> = Vec::new();
+    for (t, moment) in all {
+        match merged.last_mut() {
+            Some(last) if t - last.0 < CUE_MERGE_S => {
+                if moment.rank() > last.1.rank() {
+                    *last = (t, moment);
+                }
+            }
+            _ => merged.push((t, moment)),
+        }
+    }
+    let window_s = duration_s / windows as f64;
+    let window_of = |t: f64| ((t / window_s) as usize).min(windows - 1);
+    let mut kept: Vec<(f64, CueMoment)> = Vec::new();
+    let mut i = 0;
+    while i < merged.len() {
+        let window = window_of(merged[i].0);
+        let end = (i..merged.len())
+            .find(|k| window_of(merged[*k].0) != window)
+            .unwrap_or(merged.len());
+        let mut best: Vec<usize> = (i..end).collect();
+        best.sort_by(|a, b| merged[*b].1.rank().cmp(&merged[*a].1.rank()).then(a.cmp(b)));
+        best.truncate(CUES_PER_WINDOW);
+        best.sort_unstable();
+        kept.extend(best.into_iter().map(|k| merged[k]));
+        i = end;
+    }
+    kept
+}
+
+#[cfg(feature = "frames")]
+/// [`shot_times`] with subtitles: each frame moves within its share of the shot to the best
+/// subtitle candidate there (a pause first, then a line's start, then a long line's middle;
+/// of equals the one nearest the share's middle), never closer than 0.15 s to the shot's edge,
+/// so never into a transition. A share without one keeps its middle. Same number of frames.
+pub(crate) fn shot_times_with_cues(
+    shots: &crate::shots::Shots,
+    duration_s: f64,
+    cues: &[Cue],
+) -> Vec<(f64, Option<CueMoment>)> {
+    let slots = shot_slots(shots, duration_s);
+    let candidates = cue_candidates(cues, duration_s, slots.len().max(1));
+    slots
+        .iter()
+        .map(|slot| {
+            let low = slot.from_s.max(slot.shot_start_s + SHOT_EDGE_S);
+            let high = slot.to_s.min(slot.shot_end_s - SHOT_EDGE_S);
+            candidates
+                .iter()
+                .filter(|(t, _)| *t >= low && *t < high)
+                .max_by(|a, b| {
+                    a.1.rank().cmp(&b.1.rank()).then(
+                        (b.0 - slot.middle())
+                            .abs()
+                            .total_cmp(&(a.0 - slot.middle()).abs()),
+                    )
+                })
+                .map_or((slot.middle(), None), |(t, moment)| (*t, Some(*moment)))
+        })
         .collect()
 }
 
@@ -451,6 +647,43 @@ fn change_scores(candidates: &[(f64, Vec<u8>)]) -> Vec<f64> {
                 .map(|pair| fingerprint_diff(&pair[0].1, &pair[1].1)),
         )
         .collect()
+}
+
+/// [`select_key_frames`] for a clip `duration_s` long with subtitle candidates among the
+/// `candidates` (time, fingerprint, the subtitle moment a candidate was taken for): the clip is
+/// split into `max_frames` equal stretches of time and, in each, the candidate with the highest
+/// picture change plus its subtitle bonus (see `CueMoment::bonus`) is kept; of equals, the
+/// earliest. A stretch without candidates keeps none. Strictly increasing indices.
+#[cfg(feature = "frames")]
+pub(crate) fn select_key_frames_with_cues(
+    candidates: &[(f64, Vec<u8>, Option<CueMoment>)],
+    duration_s: f64,
+    max_frames: usize,
+) -> Vec<usize> {
+    let total = candidates.len();
+    if total == 0 || max_frames == 0 {
+        return Vec::new();
+    }
+    if total <= max_frames {
+        return (0..total).collect();
+    }
+    let plain: Vec<(f64, Vec<u8>)> = candidates.iter().map(|(t, f, _)| (*t, f.clone())).collect();
+    let scores: Vec<f64> = change_scores(&plain)
+        .into_iter()
+        .zip(candidates)
+        .map(|(change, (_, _, moment))| change + moment.map_or(0.0, CueMoment::bonus))
+        .collect();
+    let window_s = duration_s.max(f64::MIN_POSITIVE) / max_frames as f64;
+    let mut best: Vec<Option<usize>> = vec![None; max_frames];
+    for (k, (t, _, _)) in candidates.iter().enumerate() {
+        let window = ((t.max(0.0) / window_s) as usize).min(max_frames - 1);
+        if best[window].is_none_or(|b| scores[k] > scores[b]) {
+            best[window] = Some(k);
+        }
+    }
+    let mut chosen: Vec<usize> = best.into_iter().flatten().collect();
+    chosen.sort_unstable();
+    chosen
 }
 
 /// Mean absolute difference between two same-length byte fingerprints, normalised to 0.0–1.0.
@@ -1923,5 +2156,131 @@ mod tests {
         assert_eq!(format_time(3599.0), "59:59");
         assert_eq!(format_time(3600.0), "1:00:00");
         assert_eq!(format_time(3725.0), "1:02:05");
+    }
+
+    #[cfg(feature = "frames")]
+    fn cue(start: f64, end: f64) -> Cue {
+        Cue {
+            start: std::time::Duration::from_secs_f64(start),
+            end: std::time::Duration::from_secs_f64(end),
+            text: "line".to_string(),
+        }
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn cue_candidates_are_pauses_line_starts_and_long_lines() {
+        // A pause of 1 s between 2 and 3 s; a short gap (0.5 s) between 5 and 5.5 s; a 5 s line.
+        let cues = [cue(3.0, 5.0), cue(0.5, 2.0), cue(5.5, 10.5)];
+        let found = cue_candidates(&cues, 20.0, 10);
+        assert_eq!(
+            found,
+            vec![
+                (0.5, CueMoment::CueStart),
+                (2.5, CueMoment::Pause),
+                (3.0, CueMoment::CueStart),
+                (5.5, CueMoment::CueStart),
+                (8.0, CueMoment::LongCue),
+            ]
+        );
+        assert!(cue_candidates(&[], 20.0, 10).is_empty());
+        assert!(cue_candidates(&cues, 0.0, 10).is_empty());
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn cue_candidates_merge_near_ones_and_drop_those_outside_the_clip() {
+        // Overlapping lines make no pause; a line starting 0.05 s after a long line's middle
+        // (7.5 s) merges with it and wins; a line past the end gives nothing.
+        let cues = [
+            cue(0.0, 3.0),
+            cue(1.0, 2.0),
+            cue(5.0, 10.0),
+            cue(7.55, 8.0),
+            cue(30.0, 31.0),
+        ];
+        assert_eq!(
+            cue_candidates(&cues, 12.0, 6),
+            vec![
+                (0.0, CueMoment::CueStart),
+                (1.0, CueMoment::CueStart),
+                (4.0, CueMoment::Pause),
+                (5.0, CueMoment::CueStart),
+                (7.55, CueMoment::CueStart),
+            ]
+        );
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn cue_candidates_keep_at_most_two_per_window_pauses_first() {
+        // Ten short lines with pauses in a 10 s clip with one window: two pauses are kept.
+        let cues: Vec<Cue> = (0..10).map(|i| cue(i as f64, i as f64 + 0.2)).collect();
+        let found = cue_candidates(&cues, 10.0, 1);
+        assert_eq!(found.len(), 2);
+        assert!(
+            found.iter().all(|(_, m)| *m == CueMoment::Pause),
+            "{found:?}"
+        );
+        // With ten windows each keeps its own.
+        assert!(cue_candidates(&cues, 10.0, 10).len() > 10);
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn subtitle_moments_win_over_movement_but_not_over_a_cut() {
+        let still = vec![0u8; 4];
+        let moving = vec![10u8; 4]; // a change of about 0.04 from `still`
+        let cut = vec![200u8; 4]; // a change of about 0.78
+                                  // Window 0 (0–2 s): movement at 0.5, a pause at 1.0. Window 1 (2–4 s): a cut at 3.0, a
+                                  // line start at 3.5.
+        let candidates = vec![
+            (0.0, still.clone(), None),
+            (0.5, moving.clone(), None),
+            (1.0, moving.clone(), Some(CueMoment::Pause)),
+            (2.0, moving.clone(), None),
+            (3.0, cut.clone(), None),
+            (3.5, cut.clone(), Some(CueMoment::CueStart)),
+        ];
+        assert_eq!(select_key_frames_with_cues(&candidates, 4.0, 2), vec![2, 4]);
+        // The budget holds and a window without candidates keeps none.
+        assert_eq!(select_key_frames_with_cues(&candidates, 40.0, 2), vec![4]);
+        assert_eq!(
+            select_key_frames_with_cues(&candidates[..1], 4.0, 2),
+            vec![0]
+        );
+        assert!(select_key_frames_with_cues(&[], 4.0, 2).is_empty());
+    }
+
+    #[cfg(feature = "frames")]
+    #[test]
+    fn shot_frames_move_to_a_pause_inside_their_shot() {
+        let shots = shots_of(&[(0.0, 4.0), (4.0, 8.0)]);
+        // A pause around 1.0 s in the first shot; a line starting right at the cut (4.05 s,
+        // too close to the shot's edge) and a long line's middle at 6.4 s in the second.
+        let cues = [cue(0.0, 0.6), cue(1.4, 2.0), cue(4.05, 8.75)];
+        let planned = shot_times_with_cues(&shots, 8.0, &cues);
+        // Two frames per shot (the 8 s budget is four); the pause from 2.0 to 4.05 s has its
+        // middle in the first shot's second half.
+        assert_eq!(planned.len(), shot_times(&shots, 8.0).len(), "same budget");
+        assert_eq!(planned[0], (1.0, Some(CueMoment::Pause)));
+        assert_eq!(planned[1].1, Some(CueMoment::Pause));
+        assert!((planned[1].0 - 3.025).abs() < 1e-9);
+        assert_eq!(
+            planned[2],
+            (5.0, None),
+            "the line start at 4.05 s is too near the cut"
+        );
+        assert_eq!(planned[3].1, Some(CueMoment::LongCue));
+        assert!((planned[3].0 - 6.4).abs() < 1e-9);
+        // Without cues: the middles, as before.
+        let plain: Vec<f64> = shot_times_with_cues(&shots, 8.0, &[])
+            .into_iter()
+            .map(|(t, m)| {
+                assert_eq!(m, None);
+                t
+            })
+            .collect();
+        assert_eq!(plain, shot_times(&shots, 8.0));
     }
 }
