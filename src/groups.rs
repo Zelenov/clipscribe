@@ -807,6 +807,7 @@ mod tests {
                 main: None,
                 summary: summary.to_string(),
                 segments: Vec::new(),
+                lang: None,
             },
             tags: None,
             usage: AiUsage::default(),
@@ -873,14 +874,17 @@ mod tests {
                     Segment {
                         start_s: 0.5,
                         end_s: 5.0,
+                        title: "Title".to_string(),
                         description: "The lamp is switched on.".to_string(),
                     },
                     Segment {
                         start_s: 7.0,
                         end_s: 9.5,
+                        title: "Title".to_string(),
                         description: "A gradient fills the screen.".to_string(),
                     },
                 ],
+                lang: None,
             },
             ..clip(
                 "",
@@ -1183,15 +1187,18 @@ mod tests {
                     Segment {
                         start_s: 0.0,
                         end_s: 3.0,
+                        title: "Title".to_string(),
                         description: text.to_string(),
                     },
                     Segment {
                         start_s: 5.0,
                         end_s: 8.0,
+                        title: "Title".to_string(),
                         description: "The hiker in the red jacket walks on along the rocky ridge."
                             .to_string(),
                     },
                 ],
+                lang: None,
             },
             ..cut.clone()
         };

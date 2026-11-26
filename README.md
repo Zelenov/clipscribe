@@ -137,6 +137,28 @@ without cuts is one shot. A clip over 30 minutes is refused, as for `describe`.
 `shots::find_shots` does the same on frames you decoded yourself, and works without the `frames`
 feature.
 
+### Description file
+
+A described clip can be saved as `clip.describe.json` next to the video, in the format of
+[docs/describe-format.md](docs/describe-format.md): parts or moments with marker titles, the
+suggested In/Out, cuts, tags, and the picture's size and frame rate. Premiere and Resolve markers,
+people's names and caption placement all read this one file.
+
+```rust
+use clipscribe::describe_file::{save_run, DescribeFile};
+
+let path = save_run(video, &described_clip, MomentsMode::Important, "en", &cancel)?;
+let file = DescribeFile::read(&path)?.expect("just written")?;
+assert!(file.problems().is_empty());
+```
+
+`save_run` reads the frame size and cuts from the video (nothing more is sent) and merges with
+a file already there: what a person made or changed (`"by": "user"`, the In/Out) stays, the old
+run's items are replaced. `DescribeFile` parses and writes the file (keeping fields it does not
+know), `problems` lists the rules a file breaks, `merge_run` merges two runs, and
+`render_mentions` shows `@p1` as the person's name. Every `Segment` now has a `title` for its
+marker, and `Description::lang` says what language the text is in.
+
 ### Whole folders
 
 `describe_folder` describes many clips in one call, several at once, and can resume a stopped

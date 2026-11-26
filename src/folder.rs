@@ -2033,6 +2033,7 @@ mod tests {
                     main: None,
                     summary: summary.to_string(),
                     segments: Vec::new(),
+                    lang: None,
                 },
                 ..clip.clone()
             }
@@ -2156,6 +2157,7 @@ mod tests {
                             main: None,
                             summary: description_of(name).to_string(),
                             segments: Vec::new(),
+                            lang: None,
                         },
                         tags: None,
                         usage: AiUsage::default(),
