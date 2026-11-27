@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Zelenov/clipscribe/blob/main/docs/describe-format.schema.json",
+  "title": "Video description file, version 1",
+  "description": "See describe-format.md. Rules a schema cannot say (parts cover the video, times inside duration_s, sorted lists, unique ids, @pN names a person) are checked by clipscribe::describe_file::DescribeFile::problems.",
+  "type": "object",
+  "required": ["version", "duration_s", "frame", "lang"],
+  "properties": {
+    "version": {"const": 1},
+    "duration_s": {"type": "number", "exclusiveMinimum": 0},
+    "frame": {
+      "type": "object",
+      "required": ["width", "height", "fps"],
+      "properties": {
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "fps": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "lang": {"type": "string", "minLength": 1},
+    "summary": {"type": "string"},
+    "usable": {"$ref": "#/$defs/span"},
+    "in_out": {
+      "type": "object",
+      "properties": {
+        "start_s": {"$ref": "#/$defs/time"},
+        "end_s": {"$ref": "#/$defs/time"}
+      }
+    },
+    "cuts": {"type": "array", "items": {"$ref": "#/$defs/time"}},
+    "parts": {"type": "array", "items": {"$ref": "#/$defs/part"}},
+    "moments": {"type": "array", "items": {"$ref": "#/$defs/marker"}},
+    "people": {"type": "array", "items": {"$ref": "#/$defs/person"}},
+    "faces": {"type": "array", "items": {"$ref": "#/$defs/track"}},
+    "texts": {"type": "array", "items": {"$ref": "#/$defs/text"}},
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "ranges": {"type": "array", "items": {"$ref": "#/$defs/span"}}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "time": {"type": "number", "minimum": 0},
+    "span": {
+      "type": "object",
+      "required": ["start_s", "end_s"],
+      "properties": {
+        "start_s": {"$ref": "#/$defs/time"},
+        "end_s": {"$ref": "#/$defs/time"}
+      }
+    },
+    "by": {"enum": ["ai", "user"]},
+    "color": {
+      "oneOf": [
+        {"enum": ["green", "red", "orange", "yellow", "white", "blue", "cyan", "lavender", "magenta"]},
+        {"type": "string", "pattern": "^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$"}
+      ]
+    },
+    "marker": {
+      "type": "object",
+      "required": ["id", "by", "start_s"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "by": {"$ref": "#/$defs/by"},
+        "start_s": {"$ref": "#/$defs/time"},
+        "end_s": {"$ref": "#/$defs/time"},
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "color": {"$ref": "#/$defs/color"}
+      },
+      "if": {"properties": {"by": {"const": "ai"}}},
+      "then": {
+        "required": ["title"],
+        "properties": {
+          "title": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[^\\n@]*[^.\\n@ ]$"}
+        }
+      }
+    },
+    "part": {"allOf": [{"$ref": "#/$defs/marker"}, {"required": ["end_s"]}]},
+    "person": {
+      "type": "object",
+      "required": ["id", "by"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^p[0-9]+$"},
+        "by": {"$ref": "#/$defs/by"},
+        "label": {"type": "string"},
+        "speaker": {"type": "string"},
+        "faces": {"type": "array", "items": {"type": "string", "pattern": "^f[0-9]+$"}}
+      }
+    },
+    "sample": {
+      "type": "object",
+      "required": ["t_s", "box"],
+      "properties": {
+        "t_s": {"$ref": "#/$defs/time"},
+        "box": {
+          "type": "array",
+          "items": {"type": "number", "minimum": 0, "maximum": 1},
+          "minItems": 4,
+          "maxItems": 4
+        }
+      }
+    },
+    "track": {
+      "type": "object",
+      "required": ["id", "start_s", "end_s", "track"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^f[0-9]+$"},
+        "start_s": {"$ref": "#/$defs/time"},
+        "end_s": {"$ref": "#/$defs/time"},
+        "track": {"type": "array", "items": {"$ref": "#/$defs/sample"}, "minItems": 1}
+      }
+    },
+    "text": {
+      "type": "object",
+      "required": ["id", "start_s", "end_s", "track"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^x[0-9]+$"},
+        "start_s": {"$ref": "#/$defs/time"},
+        "end_s": {"$ref": "#/$defs/time"},
+        "track": {"type": "array", "items": {"$ref": "#/$defs/sample"}, "minItems": 1},
+        "text": {"type": "string", "maxLength": 200}
+      }
+    }
+  }
+}

@@ -522,9 +522,11 @@ mod tests {
             segments: vec![Segment {
                 start_s: 0.0,
                 end_s: 5.0,
+                title: "Title".to_string(),
                 description: "A dog runs past.".to_string(),
             }],
             main: None,
+            lang: None,
         };
         let request =
             build_tags_only_request(describe::MODELS[0], &description, &[], &vocabulary(), 10.0);
@@ -628,6 +630,7 @@ mod tests {
             summary: "x".repeat(200),
             segments: vec![],
             main: None,
+            lang: None,
         };
         let from_frames = estimate_tags_usage(describe::MODELS[0], 60.0, 0, &vocabulary(), None);
         let from_description = estimate_tags_usage(
@@ -683,6 +686,7 @@ mod tests {
             summary: "A farm.".to_string(),
             segments: vec![],
             main: None,
+            lang: None,
         };
         let request =
             build_tags_only_request(describe::MODELS[0], &description, &[], &vocabulary(), 10.0);

@@ -100,7 +100,7 @@ jobs:
           - os: ubuntu-24.04
             platform: linux-x64
             exe: clipscribe
-          - os: macos-14
+          - os: macos-15
             platform: macos-arm64
             exe: clipscribe
     runs-on: ${{ matrix.os }}
