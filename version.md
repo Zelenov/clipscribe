@@ -1,4 +1,4 @@
-# NEXT
+# 0.19.0
 ## Added
 - `dump_clip_frames_with_subtitles`: `dump_clip_frames` for a clip with subtitles; `--estimate
   --dump-frames` uses the `.srt` unless `--no-subtitles`.
