@@ -1,3 +1,8 @@
+# 0.19.1
+## Fixed
+- A file that is not a video now always fails with GStreamer's reason (for example "Could not
+  determine type of stream."), not sometimes "no frame in time" when the machine is busy.
+
 # 0.19.0
 ## Added
 - `dump_clip_frames_with_subtitles`: `dump_clip_frames` for a clip with subtitles; `--estimate
