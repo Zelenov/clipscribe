@@ -57,10 +57,12 @@ struct Cli {
     #[arg(long, default_value = "subtitles", value_parser = parse_language)]
     language: SummaryLanguage,
 
-    /// How frames are chosen: keyframes (where the picture changes the most, at most 60),
-    /// interval (one every 2 s, at most 60, spread evenly over a longer clip) or shots (EXPERIMENTAL
-    /// — for an edited video: one frame from the middle of every shot, more for the longest, at
-    /// most 60; reads the clip one more time to find the shots; --estimate assumes 60 frames).
+    /// How frames are chosen: keyframes (where the picture changes the most, at most 60; with
+    /// subtitles, pauses, line starts and long lines' middles count too), interval (one every
+    /// 2 s, at most 60, spread evenly over a longer clip; ignores the subtitles) or shots
+    /// (EXPERIMENTAL — for an edited video: one frame from every shot, more for the longest, at
+    /// most 60; with subtitles at a pause or line start inside the shot, else its middle; reads
+    /// the clip one more time to find the shots; --estimate assumes 60 frames).
     #[arg(long, value_enum, default_value_t = FramesArg::Keyframes)]
     frames: FramesArg,
 
@@ -84,7 +86,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = MomentsArg::Important)]
     moments: MomentsArg,
 
-    /// Do not send the `.srt` next to each video.
+    /// Do not use the `.srt` next to each video: neither sent nor used to choose frames.
     #[arg(long)]
     no_subtitles: bool,
 
@@ -175,10 +177,20 @@ struct Cli {
     /// stderr and the exit code is 1; the others are still listed.
     #[arg(long, conflicts_with_all = SHOTS_CONFLICTS)]
     shots: bool,
+
+    /// Also write each described video's description file next to it (`clip.mp4` →
+    /// `clip.describe.json`, the format of docs/describe-format.md): parts or moments with
+    /// titles, the suggested In/Out, tags, and the picture's size, frame rate and cuts (read
+    /// from the video here, nothing more is sent). A file already there keeps everything a
+    /// person made or changed (`"by": "user"`, the In/Out); the run's own items replace the old
+    /// run's. A file there that cannot be read is left as it is.
+    #[arg(long, conflicts_with_all = ["estimate", "at"])]
+    describe_file: bool,
 }
 
 /// The options that describe or price a video, which `--shots` (local, nothing sent) does not take.
-const SHOTS_CONFLICTS: [&str; 18] = [
+const SHOTS_CONFLICTS: [&str; 19] = [
+    "describe_file",
     "provider",
     "api_key",
     "model",
@@ -662,6 +674,28 @@ fn main() -> ExitCode {
         print_groups(&videos, grouping);
     }
 
+    let mut not_saved = 0;
+    if cli.describe_file {
+        let fallback_lang = cli.language.code().unwrap_or("en");
+        for (i, record) in &described {
+            let video = &videos[*i];
+            match clipscribe::describe_file::save_run(
+                video,
+                &record.clip,
+                options.moments,
+                fallback_lang,
+                &CANCEL,
+            ) {
+                Ok(path) if !cli.quiet => eprintln!("wrote {}", path.display()),
+                Ok(_) => {}
+                Err(e) => {
+                    not_saved += 1;
+                    eprintln!("error: no description file for {}: {e}", video.display());
+                }
+            }
+        }
+    }
+
     if total != AiUsage::default() && !cli.quiet {
         print_usage(total, model);
     }
@@ -672,7 +706,7 @@ fn main() -> ExitCode {
     if cached > 0 {
         eprintln!("{cached} from the cache, nothing sent for them");
     }
-    if not_done > 0 || CANCEL.load(Ordering::Relaxed) {
+    if not_done > 0 || not_saved > 0 || CANCEL.load(Ordering::Relaxed) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -1138,7 +1172,17 @@ fn estimate(
             model.cost_usd(usage)
         );
         if let Some((dir, sampling)) = dump {
-            match clipscribe::dump_clip_frames(video, dir, sampling, &CANCEL) {
+            let subtitles = if no_subtitles {
+                Vec::new()
+            } else {
+                srt::load_for(video).unwrap_or_else(|e| {
+                    eprintln!("warning: {}: subtitles not read: {e}", video.display());
+                    Vec::new()
+                })
+            };
+            match clipscribe::dump_clip_frames_with_subtitles(
+                video, &subtitles, dir, sampling, &CANCEL,
+            ) {
                 Ok(count) => println!("  {count} frames written to {}", dir.display()),
                 Err(e) => eprintln!("error: {}: frames not written: {e}", video.display()),
             }
@@ -1193,9 +1237,10 @@ fn print_clip(video: &Path, record: &ClipRecord, cached: bool) {
     print_main(&clip.description);
     for moment in &clip.description.segments {
         println!(
-            "  {}–{}  {}",
+            "  {}–{}  {}: {}",
             format_time(moment.start_s),
             format_time(moment.end_s),
+            moment.title,
             moment.description
         );
     }
@@ -1271,6 +1316,7 @@ fn clip_to_json(
             let mut moment = json!({
                 "start_s": m.start_s,
                 "end_s": m.end_s,
+                "title": m.title,
                 "description": m.description,
             });
             if let Some((_, clip_groups)) = groups {
@@ -1539,9 +1585,11 @@ mod tests {
                     segments: vec![Segment {
                         start_s: 12.0,
                         end_s: 20.0,
+                        title: "Title".to_string(),
                         description: "A herd of goats crosses the path in front of the hikers."
                             .to_string(),
                     }],
+                    lang: None,
                 },
                 tags: Some(TagSuggestions {
                     tags: vec![

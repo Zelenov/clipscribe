@@ -26,7 +26,8 @@ out, even for clips with no speech.
   Each frame is sent with the shot it is from (`shot 3 of 10, 3.6–9.7 s`), so the model can put
   the start or end of a moment on a cut; a clip of one shot is sent as before.
 - The `.srt` next to the video (`clip.mp4` → `clip.srt`), if there is one, goes along, so the
-  description knows what is said.
+  description knows what is said. Its timing also moves frames (never adds one) to pauses, line
+  starts and long lines' middles; only cue times are used, so any `Cue`s work.
 - One request goes to Claude (Anthropic), ChatGPT (OpenAI) or Gemini (Google); the answer is
   structured JSON, and moments outside the clip are dropped. Clips over 30 minutes are refused.
 - Moments (segments) default to **important** (`MomentsMode::Important`): none at all for a
@@ -137,6 +138,28 @@ without cuts is one shot. A clip over 30 minutes is refused, as for `describe`.
 `shots::find_shots` does the same on frames you decoded yourself, and works without the `frames`
 feature.
 
+### Description file
+
+A described clip can be saved as `clip.describe.json` next to the video, in the format of
+[docs/describe-format.md](docs/describe-format.md): parts or moments with marker titles, the
+suggested In/Out, cuts, tags, and the picture's size and frame rate. Premiere and Resolve markers,
+people's names and caption placement all read this one file.
+
+```rust
+use clipscribe::describe_file::{save_run, DescribeFile};
+
+let path = save_run(video, &described_clip, MomentsMode::Important, "en", &cancel)?;
+let file = DescribeFile::read(&path)?.expect("just written")?;
+assert!(file.problems().is_empty());
+```
+
+`save_run` reads the frame size and cuts from the video (nothing more is sent) and merges with
+a file already there: what a person made or changed (`"by": "user"`, the In/Out) stays, the old
+run's items are replaced. `DescribeFile` parses and writes the file (keeping fields it does not
+know), `problems` lists the rules a file breaks, `merge_run` merges two runs, and
+`render_mentions` shows `@p1` as the person's name. Every `Segment` now has a `title` for its
+marker, and `Description::lang` says what language the text is in.
+
 ### Whole folders
 
 `describe_folder` describes many clips in one call, several at once, and can resume a stopped
@@ -213,9 +236,10 @@ To check which images the model got, call `set_debug_frames_dir(Some(dir))` (or 
 `CLIPSCRIBE_DEBUG_FRAMES=<dir>`). `describe`, `describe_with_tags` and `describe_moment` then write
 `<dir>/<video name>/`: every frame as the same JPEG bytes that were sent, named by time
 (`0012.40s.jpg`), and a `frames.json` with each frame's time, how it was picked (`key_frame`,
-`interval` or `moment`) and its size. A setter and a variable, not an `Options` field, so nothing
-that builds `Options` changes. A write error is only logged. `dump_clip_frames` writes the frames
-without sending anything.
+`interval`, `shot` or `moment`; for the subtitles `pause`, `cue_start` or `long_cue`) and its
+size. A setter and a variable, not an `Options` field, so nothing that builds `Options` changes.
+A write error is only logged. `dump_clip_frames` (`dump_clip_frames_with_subtitles` for a clip
+with subtitles) writes the frames without sending anything.
 
 ### Features
 
