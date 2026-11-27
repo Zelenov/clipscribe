@@ -1,3 +1,13 @@
+# 0.19.0
+## Added
+- `dump_clip_frames_with_subtitles`: `dump_clip_frames` for a clip with subtitles; `--estimate
+  --dump-frames` uses the `.srt` unless `--no-subtitles`.
+
+## Changed
+- With subtitles, key frames and `FrameSampling::Shots` frames move to pauses, line starts and
+  long lines' middles; the same number of frames, and nothing changes without subtitles.
+- `frames.json` labels the frames the subtitles picked `pause`, `cue_start` or `long_cue`.
+
 # 0.18.0
 ## Added
 - The description file (`clip.describe.json`, docs/describe-format.md): `describe_file::DescribeFile`

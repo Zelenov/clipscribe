@@ -593,8 +593,9 @@ mod run {
                 frames,
                 fingerprints,
                 shots,
+                ..
             },
-        ) = read_frames(video, options.frame_sampling, cancel, on_stage)?;
+        ) = read_frames(video, subtitles, options.frame_sampling, cancel, on_stage)?;
         let mut request = match vocabulary {
             Some(vocabulary) => build_combined_request(
                 options.model,
@@ -633,6 +634,7 @@ mod run {
     /// made from, each with its fingerprint.
     fn read_frames(
         video: &Path,
+        subtitles: &[Cue],
         sampling: FrameSampling,
         cancel: &AtomicBool,
         on_stage: &mut impl FnMut(Stage),
@@ -644,14 +646,20 @@ mod run {
         if duration_s > MAX_DURATION_S {
             return Err(Error::TooLong(duration_s));
         }
-        match frames::sample_clip(video, &clip, duration_s, sampling, cancel, |done, total| {
-            on_stage(Stage::Frame { done, total })
-        }) {
+        match frames::sample_clip(
+            video,
+            &clip,
+            duration_s,
+            sampling,
+            subtitles,
+            cancel,
+            |done, total| on_stage(Stage::Frame { done, total }),
+        ) {
             Ok(Some(sampled)) if !sampled.frames.is_empty() => {
                 crate::debug_frames::dump_if_on(
                     &crate::debug_frames::name_of(video),
                     &sampled.frames,
-                    crate::picked(duration_s, sampling),
+                    &crate::picked_each(&sampled, duration_s, sampling),
                 );
                 Ok((duration_s, sampled))
             }
